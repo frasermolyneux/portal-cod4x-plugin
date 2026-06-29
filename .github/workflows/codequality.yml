@@ -42,7 +42,7 @@ jobs:
         run: ctest --test-dir build --output-on-failure --build-config Release
 
       - name: SonarCloud Scan
-        uses: SonarSource/sonarqube-scan-action@v5
+        uses: SonarSource/sonarqube-scan-action@v6
         with:
           args: >
             -Dsonar.projectKey=frasermolyneux_portal-cod4x-plugin
