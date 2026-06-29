@@ -1,0 +1,226 @@
+name: PR Verify
+
+on:
+  pull_request:
+    branches:
+      - main
+    types: [opened, synchronize, reopened, ready_for_review, labeled, unlabeled]
+
+permissions: {}
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build-and-test:
+    permissions:
+      contents: read
+    if: github.event.pull_request.draft == false && contains(fromJson('["opened","synchronize","reopened","ready_for_review"]'), github.event.action)
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v6
+
+      - name: Read plugin version
+        id: plugin-version
+        shell: bash
+        run: |
+          VERSION=$(grep -oE '"version"[[:space:]]*:[[:space:]]*"[0-9]+\.[0-9]+' version.json | grep -oE '[0-9]+\.[0-9]+')
+          if [ -z "$VERSION" ]; then
+            echo "Failed to parse version from version.json" >&2
+            exit 1
+          fi
+          echo "value=$VERSION" >> "$GITHUB_OUTPUT"
+
+      - name: Configure CMake
+        run: cmake -S . -B build -DCMAKE_BUILD_TYPE=Release -DPORTAL_COD4X_BUILD_PLUGIN_BINARY=OFF
+
+      - name: Build
+        run: cmake --build build --config Release
+
+      - name: Test
+        run: ctest --test-dir build --output-on-failure --build-config Release
+
+  build-plugin-artifacts-linux:
+    permissions:
+      contents: read
+    if: github.event.pull_request.draft == false && contains(fromJson('["opened","synchronize","reopened","ready_for_review"]'), github.event.action)
+    needs:
+      - build-and-test
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v6
+
+      - name: Read plugin version
+        id: plugin-version
+        shell: bash
+        run: |
+          VERSION=$(grep -oE '"version"[[:space:]]*:[[:space:]]*"[0-9]+\.[0-9]+' version.json | grep -oE '[0-9]+\.[0-9]+')
+          if [ -z "$VERSION" ]; then
+            echo "Failed to parse version from version.json" >&2
+            exit 1
+          fi
+          echo "value=$VERSION" >> "$GITHUB_OUTPUT"
+
+      - name: Install Linux x86 toolchain
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y gcc-multilib g++-multilib
+
+      - name: Configure CMake (plugin binary, Linux x86)
+        run: cmake -S . -B build-plugin -DCMAKE_BUILD_TYPE=Release -DPORTAL_COD4X_BUILD_PLUGIN_BINARY=ON -DPORTAL_COD4X_PLUGIN_ARCH=x86
+
+      - name: Build plugin binary
+        run: cmake --build build-plugin --config Release
+
+      - name: Verify exported ABI symbols
+        shell: bash
+        run: |
+          PLUGIN_PATH=$(find build-plugin -type f -name 'portal-cod4x-plugin.so' | head -n 1)
+          if [ -z "$PLUGIN_PATH" ]; then
+            echo "Plugin binary not found after build." >&2
+            exit 1
+          fi
+
+          for symbol in OnInfoRequest OnInit OnTerminate; do
+            if ! nm -D --defined-only "$PLUGIN_PATH" | grep -Eq "[[:space:]]${symbol}$"; then
+              echo "Required export symbol '${symbol}' was not found in ${PLUGIN_PATH}." >&2
+              exit 1
+            fi
+          done
+
+      - name: Upload plugin artifact
+        uses: actions/upload-artifact@v7
+        with:
+          name: portal-cod4x-plugin-v${{ steps.plugin-version.outputs.value }}-linux-x86-${{ github.run_number }}
+          path: build-plugin/**/portal-cod4x-plugin.so
+          if-no-files-found: error
+          retention-days: 14
+
+  build-plugin-artifacts-windows:
+    permissions:
+      contents: read
+    if: github.event.pull_request.draft == false && contains(fromJson('["opened","synchronize","reopened","ready_for_review"]'), github.event.action)
+    needs:
+      - build-and-test
+    runs-on: windows-latest
+    env:
+      COD4X_WINDOWS_HOST_MODULE: cod4x18_dedrun.exe
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v6
+
+      - name: Resolve Windows build tools and host import library
+        id: windows-build-inputs
+        shell: pwsh
+        run: |
+          $hostModuleName = $env:COD4X_WINDOWS_HOST_MODULE
+          if ([string]::IsNullOrWhiteSpace($hostModuleName)) {
+            throw "COD4X_WINDOWS_HOST_MODULE must be set to the CoD4x host module name (for example cod4x18_dedrun.exe)."
+          }
+
+          $vsWherePath = Join-Path ${env:ProgramFiles(x86)} "Microsoft Visual Studio\Installer\vswhere.exe"
+          if (-not (Test-Path $vsWherePath)) {
+            throw "vswhere.exe was not found."
+          }
+
+          $installationPath = & $vsWherePath -latest -products * -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 -property installationPath
+          if (-not $installationPath) {
+            throw "No Visual Studio installation with VC tools was found."
+          }
+
+          $toolsRoot = Join-Path $installationPath "VC\Tools\MSVC"
+          $dumpbinPath = Get-ChildItem -Path $toolsRoot -Filter "dumpbin.exe" -Recurse | Select-Object -First 1 -ExpandProperty FullName
+          $libPath = Get-ChildItem -Path $toolsRoot -Filter "lib.exe" -Recurse | Select-Object -First 1 -ExpandProperty FullName
+
+          if (-not $dumpbinPath) {
+            throw "dumpbin.exe was not found under $toolsRoot."
+          }
+
+          if (-not $libPath) {
+            throw "lib.exe was not found under $toolsRoot."
+          }
+
+          $repoImportLib = Join-Path $PWD "windows-sdk/com_plugin.lib"
+          if (Test-Path $repoImportLib) {
+            $hostImportLib = $repoImportLib
+          }
+          else {
+            $generatedSdkPath = Join-Path $PWD "build-plugin/windows-sdk"
+            New-Item -Path $generatedSdkPath -ItemType Directory -Force | Out-Null
+
+            $defPath = Join-Path $generatedSdkPath "com_plugin.def"
+            @(
+              "LIBRARY $hostModuleName",
+              "EXPORTS",
+              "    Plugin_Printf",
+              "    Plugin_ChatPrintf"
+            ) | Set-Content -Path $defPath -Encoding ascii
+
+            $generatedImportLib = Join-Path $generatedSdkPath "com_plugin.lib"
+            & $libPath /nologo /def:$defPath /machine:x86 /out:$generatedImportLib
+            if ($LASTEXITCODE -ne 0 -or -not (Test-Path $generatedImportLib)) {
+              throw "Failed to generate fallback host import library at $generatedImportLib."
+            }
+
+            $hostImportLib = $generatedImportLib
+          }
+
+          Add-Content -Path $env:GITHUB_OUTPUT -Value "dumpbin_path=$dumpbinPath"
+          Add-Content -Path $env:GITHUB_OUTPUT -Value "host_import_lib=$hostImportLib"
+
+      - name: Read plugin version
+        id: plugin-version
+        shell: bash
+        run: |
+          VERSION=$(grep -oE '"version"[[:space:]]*:[[:space:]]*"[0-9]+\.[0-9]+' version.json | grep -oE '[0-9]+\.[0-9]+')
+          if [ -z "$VERSION" ]; then
+            echo "Failed to parse version from version.json" >&2
+            exit 1
+          fi
+          echo "value=$VERSION" >> "$GITHUB_OUTPUT"
+
+      - name: Configure CMake (plugin binary, Windows x86)
+        run: cmake -S . -B build-plugin -A Win32 -DPORTAL_COD4X_BUILD_PLUGIN_BINARY=ON -DPORTAL_COD4X_PLUGIN_ARCH=x86 -DCOD4X_PLUGIN_HOST_IMPORT_LIB="${{ steps.windows-build-inputs.outputs.host_import_lib }}"
+
+      - name: Build plugin binary
+        run: cmake --build build-plugin --config Release
+
+      - name: Verify exported ABI symbols
+        shell: pwsh
+        run: |
+          $pluginPath = Get-ChildItem -Path "build-plugin" -Filter "portal-cod4x-plugin.dll" -Recurse | Select-Object -First 1 -ExpandProperty FullName
+          if (-not $pluginPath) {
+            throw "Plugin binary not found after build."
+          }
+
+          $exports = & "${{ steps.windows-build-inputs.outputs.dumpbin_path }}" /nologo /exports $pluginPath | Out-String
+          foreach ($symbol in @("OnInfoRequest", "OnInit", "OnTerminate")) {
+            if ($exports -notmatch "\b$symbol\b") {
+              throw "Required export symbol '$symbol' was not found in $pluginPath."
+            }
+          }
+
+      - name: Verify host import provider
+        shell: pwsh
+        run: |
+          $pluginPath = Get-ChildItem -Path "build-plugin" -Filter "portal-cod4x-plugin.dll" -Recurse | Select-Object -First 1 -ExpandProperty FullName
+          if (-not $pluginPath) {
+            throw "Plugin binary not found after build."
+          }
+
+          $imports = & "${{ steps.windows-build-inputs.outputs.dumpbin_path }}" /nologo /imports $pluginPath | Out-String
+          $expectedHostModule = [Regex]::Escape($env:COD4X_WINDOWS_HOST_MODULE)
+          if ($imports -notmatch $expectedHostModule) {
+            throw "Expected host module '$($env:COD4X_WINDOWS_HOST_MODULE)' was not found in import table for $pluginPath."
+          }
+
+      - name: Upload plugin artifact
+        uses: actions/upload-artifact@v7
+        with:
+          name: portal-cod4x-plugin-v${{ steps.plugin-version.outputs.value }}-windows-x86-${{ github.run_number }}
+          path: build-plugin/**/portal-cod4x-plugin.dll
+          if-no-files-found: error
+          retention-days: 14

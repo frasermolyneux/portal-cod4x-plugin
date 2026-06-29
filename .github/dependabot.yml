@@ -1,0 +1,14 @@
+version: 2
+updates:
+  - package-ecosystem: "github-actions"
+    assignees: ["frasermolyneux"]
+    directory: "/"
+    schedule:
+      interval: "weekly"
+      day: "sunday"
+      time: "06:45"
+      timezone: "Etc/UTC"
+    groups:
+      all-updates:
+        patterns:
+          - "*"

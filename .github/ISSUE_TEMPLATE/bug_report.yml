@@ -1,0 +1,51 @@
+name: Bug report
+description: Something is wrong with an existing capability.
+title: "[Bug] <short summary>"
+labels:
+  - bug
+  - needs-triage
+body:
+  - type: input
+    id: summary
+    attributes:
+      label: Summary
+      description: One line — what's wrong?
+    validations:
+      required: true
+
+  - type: textarea
+    id: repro
+    attributes:
+      label: Steps to reproduce
+      placeholder: |
+        1.
+        2.
+        3.
+    validations:
+      required: true
+
+  - type: textarea
+    id: expected
+    attributes:
+      label: Expected vs actual
+      placeholder: |
+        Expected:
+        Actual:
+    validations:
+      required: true
+
+  - type: textarea
+    id: environment
+    attributes:
+      label: Environment
+      description: Affected environment(s), branch, commit, build version (`/v1.0/info` if applicable).
+      placeholder: |
+        - Environment: dev / prd
+        - Branch / commit:
+        - Build version:
+
+  - type: textarea
+    id: logs
+    attributes:
+      label: Logs / screenshots
+      description: Application Insights query, stack trace, screenshot.

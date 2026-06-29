@@ -1,0 +1,97 @@
+{
+    "version": "2.0.0",
+    "tasks": [
+        {
+            "label": "cmake: configure",
+            "type": "process",
+            "command": "cmake",
+            "args": [
+                "-S",
+                "${workspaceFolder}",
+                "-B",
+                "${workspaceFolder}/build",
+                "-DCMAKE_BUILD_TYPE=Release",
+                "-DCMAKE_EXPORT_COMPILE_COMMANDS=ON",
+                "-DPORTAL_COD4X_BUILD_PLUGIN_BINARY=OFF"
+            ],
+            "problemMatcher": "$gcc"
+        },
+        {
+            "label": "cmake: build",
+            "type": "process",
+            "command": "cmake",
+            "args": [
+                "--build",
+                "${workspaceFolder}/build",
+                "--config",
+                "Release"
+            ],
+            "dependsOn": "cmake: configure",
+            "group": {
+                "kind": "build",
+                "isDefault": true
+            },
+            "problemMatcher": "$gcc"
+        },
+        {
+            "label": "cmake: test",
+            "type": "process",
+            "command": "ctest",
+            "args": [
+                "--test-dir",
+                "${workspaceFolder}/build",
+                "--output-on-failure",
+                "--build-config",
+                "Release"
+            ],
+            "dependsOn": "cmake: build",
+            "group": {
+                "kind": "test",
+                "isDefault": true
+            },
+            "problemMatcher": []
+        },
+        {
+            "label": "cmake: clean",
+            "type": "process",
+            "command": "cmake",
+            "args": [
+                "--build",
+                "${workspaceFolder}/build",
+                "--target",
+                "clean",
+                "--config",
+                "Release"
+            ],
+            "problemMatcher": "$gcc"
+        },
+        {
+            "label": "cmake: configure-plugin-binary",
+            "type": "process",
+            "command": "cmake",
+            "args": [
+                "-S",
+                "${workspaceFolder}",
+                "-B",
+                "${workspaceFolder}/build-plugin",
+                "-DCMAKE_BUILD_TYPE=Release",
+                "-DCMAKE_EXPORT_COMPILE_COMMANDS=ON",
+                "-DPORTAL_COD4X_BUILD_PLUGIN_BINARY=ON"
+            ],
+            "problemMatcher": "$gcc"
+        },
+        {
+            "label": "cmake: build-plugin-binary",
+            "type": "process",
+            "command": "cmake",
+            "args": [
+                "--build",
+                "${workspaceFolder}/build-plugin",
+                "--config",
+                "Release"
+            ],
+            "dependsOn": "cmake: configure-plugin-binary",
+            "problemMatcher": "$gcc"
+        }
+    ]
+}

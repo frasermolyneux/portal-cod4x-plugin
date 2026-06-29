@@ -1,0 +1,108 @@
+name: Delegate to coding agent
+description: Hand a well-scoped task to the GitHub Copilot coding agent. Fill every field — vague issues produce vague PRs.
+title: "[Agent] <one-line summary>"
+labels:
+  - coding-agent
+  - needs-triage
+body:
+  - type: markdown
+    attributes:
+      value: |
+        ## Read this before filing
+
+        This form delegates work to the **GitHub Copilot coding agent**. The agent will:
+
+        1. Read `AGENTS.md` and the files it links to.
+        2. Make changes on a feature branch.
+        3. Open a PR using the org PR template.
+
+        Triage-first workflow:
+        - `needs-triage` means a developer reviews and triages this issue before any assignment.
+        - `coding-agent` means this issue is likely suitable for Copilot once triaged.
+        - This form does not auto-assign Copilot.
+
+        Vague issues produce churn. Fill every section.
+
+  - type: checkboxes
+    id: requester-affirmation
+    attributes:
+      label: Requester affirmation
+      description: Confirm before filing.
+      options:
+        - label: I have read `AGENTS.md` in this repo and the task is in scope for this repo (not a different `portal-*` repo).
+          required: true
+        - label: I understand the agent will only load files explicitly listed in `AGENTS.md` — if my task needs more, I have linked to them in **Background and context** below.
+          required: true
+
+  - type: input
+    id: goal
+    attributes:
+      label: Goal (one line)
+      description: What outcome should this PR produce?
+      placeholder: "e.g. Add a /v1.0/players/{id}/notes GET endpoint returning paginated player notes."
+    validations:
+      required: true
+
+  - type: textarea
+    id: context
+    attributes:
+      label: Background and context
+      description: Links to related files, prior PRs, design notes, screenshots. Anything the agent should read before starting.
+      placeholder: |
+        - See `docs/api-design-v2.md` for the response envelope pattern.
+        - Existing `/v1.0/players/{id}` endpoint at `src/.../PlayersController.cs#L120`.
+        - Closes #
+    validations:
+      required: true
+
+  - type: textarea
+    id: acceptance
+    attributes:
+      label: Acceptance criteria
+      description: Checklist of testable outcomes. The agent's PR body must cite each one.
+      placeholder: |
+        - [ ] New endpoint `GET /v1.0/players/{id}/notes` returns `ApiResponse<CollectionResult<PlayerNoteDto>>`
+        - [ ] Pagination supported via `$top` / `$skip` query options
+        - [ ] Unit tests cover empty, one-page, multi-page cases
+        - [ ] Integration test verifies auth (`ServiceAccount` role required)
+        - [ ] OpenAPI spec at `/openapi/v1.0.json` includes the new operation
+    validations:
+      required: true
+
+  - type: textarea
+    id: out-of-scope
+    attributes:
+      label: Out of scope
+      description: Things the agent must NOT do. Be explicit.
+      placeholder: |
+        - Do NOT modify the V2 host
+        - Do NOT regenerate DataLib
+        - Do NOT change the existing /v1.0/players/{id} endpoint
+    validations:
+      required: true
+
+  - type: dropdown
+    id: risk
+    attributes:
+      label: Risk level
+      description: Self-assessed blast radius.
+      options:
+        - low — additive, no infra / auth / data layer changes
+        - medium — touches infra, auth handlers, or data layer
+        - high — multi-service, security-sensitive, or production-affecting
+      default: 0
+    validations:
+      required: true
+
+  - type: textarea
+    id: validation
+    attributes:
+      label: Validation expectations
+      description: Which commands must pass before opening the PR?
+      placeholder: |
+        - `dotnet build src/<Solution>.sln`
+        - `dotnet test src/<Solution>.sln --filter "FullyQualifiedName!~IntegrationTests"`
+        - `dotnet format src/<Solution>.sln --verify-no-changes`
+        - (optional) `terraform fmt -check -recursive`
+    validations:
+      required: true

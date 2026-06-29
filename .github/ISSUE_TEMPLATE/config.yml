@@ -1,0 +1,8 @@
+blank_issues_enabled: false
+contact_links:
+  - name: Engineering Estate dashboard
+    url: https://github.com/frasermolyneux/.github
+    about: Route-to-production status, workload catalog, pipeline badges across the org.
+  - name: Shared Copilot instructions (.github-copilot)
+    url: https://github.com/frasermolyneux/.github-copilot
+    about: Shared instructions, prompts, and agents used across every repo in this org.

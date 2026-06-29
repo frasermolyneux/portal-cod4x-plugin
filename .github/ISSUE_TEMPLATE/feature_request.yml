@@ -1,0 +1,40 @@
+name: Feature request
+description: A new capability or improvement.
+title: "[Feature] <short summary>"
+labels:
+  - enhancement
+  - needs-triage
+body:
+  - type: textarea
+    id: goal
+    attributes:
+      label: Goal
+      description: What outcome do you want? Why?
+    validations:
+      required: true
+
+  - type: textarea
+    id: proposal
+    attributes:
+      label: Proposal
+      description: How might it work? Sketch the shape (API, UI, config, infra) at a high level.
+
+  - type: textarea
+    id: alternatives
+    attributes:
+      label: Alternatives considered
+      description: What else did you think about? Why not those?
+
+  - type: textarea
+    id: scope
+    attributes:
+      label: Out of scope
+      description: Things this issue is not asking for.
+
+  - type: markdown
+    attributes:
+      value: |
+        ---
+        If this is ready to hand to the Copilot coding agent, close this issue
+        and re-file using the **Delegate to coding agent** form, which captures
+        acceptance criteria and validation expectations.

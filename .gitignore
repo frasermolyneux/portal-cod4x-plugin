@@ -1,0 +1,34 @@
+# Build outputs
+/build/
+/build-*/
+/out/
+/.vs/
+/.idea/
+
+# CMake
+CMakeUserPresets.json
+CMakeCache.txt
+CMakeFiles/
+cmake_install.cmake
+compile_commands.json
+CTestTestfile.cmake
+Testing/
+
+# IDE and OS
+*.user
+*.suo
+*.VC.db
+*.VC.opendb
+.DS_Store
+Thumbs.db
+
+# Binaries
+*.dll
+*.so
+*.dylib
+*.lib
+!windows-sdk/com_plugin.lib
+*.a
+*.obj
+*.o
+*.pdb

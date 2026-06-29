@@ -1,0 +1,80 @@
+name: Code Quality
+
+on:
+  schedule:
+    - cron: "45 6 * * 1"
+  push:
+    branches:
+      - main
+  pull_request:
+    branches:
+      - main
+    types: [opened, synchronize, reopened, ready_for_review]
+
+permissions: {}
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  quality:
+    # Temporary exception: this repo uses direct CMake + Sonar steps until
+    # frasermolyneux/actions reusable codequality.yml with build-target=cmake-ci
+    # is published and available for consumer validation.
+    permissions:
+      contents: read
+      actions: read
+      security-events: write
+    if: github.event_name != 'pull_request' || github.event.pull_request.draft == false
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v6
+
+      - name: Configure CMake
+        run: cmake -S . -B build -DCMAKE_BUILD_TYPE=Release -DCMAKE_EXPORT_COMPILE_COMMANDS=ON -DPORTAL_COD4X_BUILD_PLUGIN_BINARY=OFF
+
+      - name: Build
+        run: cmake --build build --config Release
+
+      - name: Test
+        run: ctest --test-dir build --output-on-failure --build-config Release
+
+      - name: SonarCloud Scan
+        uses: SonarSource/sonarqube-scan-action@v5
+        with:
+          args: >
+            -Dsonar.projectKey=frasermolyneux_portal-cod4x-plugin
+            -Dsonar.organization=frasermolyneux
+            -Dsonar.host.url=https://sonarcloud.io
+            -Dsonar.sources=src,include
+            -Dsonar.tests=tests
+            -Dsonar.cfamily.compile-commands=build/compile_commands.json
+            -Dsonar.sourceEncoding=UTF-8
+        env:
+          SONAR_TOKEN: ${{ secrets.SONAR_TOKEN }}
+
+  devops-secure-scanning:
+    permissions:
+      contents: read
+      actions: read
+      id-token: write
+      security-events: write
+    if: github.event_name != 'pull_request' || github.event.pull_request.draft == false
+    uses: frasermolyneux/actions/.github/workflows/devops-secure-scanning.yml@main
+
+  dependency-review:
+    permissions:
+      contents: read
+      pull-requests: write
+    if: github.event_name == 'pull_request' && github.event.pull_request.draft == false
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0
+
+      - name: Dependency Review
+        uses: actions/dependency-review-action@a1d282b36b6f3519aa1f3fc636f609c47dddb294
+        with:
+          comment-summary-in-pr: always
