@@ -1,0 +1,59 @@
+name: Deploy Prd
+
+on:
+  push:
+    branches:
+      - main
+    paths:
+      - 'terraform/**'
+      - '.github/workflows/deploy-prd.yml'
+  workflow_dispatch:
+  schedule:
+    - cron: "0 8 * * 5"
+
+permissions: {}
+
+concurrency:
+  group: ${{ github.workflow }}
+
+jobs:
+  terraform-plan-and-apply-dev:
+    if: github.event_name != 'schedule'
+    permissions:
+      contents: read
+      id-token: write
+    environment: Development
+    runs-on: ubuntu-latest
+    concurrency:
+      group: ${{ github.repository }}-dev
+    steps:
+      - uses: frasermolyneux/actions/terraform-plan-and-apply@terraform-plan-and-apply/v1.4
+        with:
+          terraform-folder: "terraform"
+          terraform-var-file: "tfvars/dev.tfvars"
+          terraform-backend-file: "backends/dev.backend.hcl"
+          AZURE_CLIENT_ID: ${{ vars.AZURE_CLIENT_ID }}
+          AZURE_TENANT_ID: ${{ vars.AZURE_TENANT_ID }}
+          AZURE_SUBSCRIPTION_ID: ${{ vars.AZURE_SUBSCRIPTION_ID }}
+
+  terraform-plan-and-apply-prd:
+    if: |
+      !failure() && !cancelled() &&
+      (needs.terraform-plan-and-apply-dev.result == 'success' || github.event_name == 'schedule')
+    permissions:
+      contents: read
+      id-token: write
+    environment: Production
+    needs: terraform-plan-and-apply-dev
+    runs-on: ubuntu-latest
+    concurrency:
+      group: ${{ github.repository }}-prd
+    steps:
+      - uses: frasermolyneux/actions/terraform-plan-and-apply@terraform-plan-and-apply/v1.4
+        with:
+          terraform-folder: "terraform"
+          terraform-var-file: "tfvars/prd.tfvars"
+          terraform-backend-file: "backends/prd.backend.hcl"
+          AZURE_CLIENT_ID: ${{ vars.AZURE_CLIENT_ID }}
+          AZURE_TENANT_ID: ${{ vars.AZURE_TENANT_ID }}
+          AZURE_SUBSCRIPTION_ID: ${{ vars.AZURE_SUBSCRIPTION_ID }}
