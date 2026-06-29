@@ -50,7 +50,7 @@ jobs:
 
       - name: Download Linux plugin artifact from release workflow
         if: env.HAS_RELEASE_TAG == 'true'
-        uses: actions/download-artifact@v7
+        uses: actions/download-artifact@v8
         with:
           name: portal-cod4x-plugin-v${{ env.RELEASE_SEMVER }}-linux-x86
           run-id: ${{ github.event.workflow_run.id }}
@@ -59,7 +59,7 @@ jobs:
 
       - name: Download Windows plugin artifact from release workflow
         if: env.HAS_RELEASE_TAG == 'true'
-        uses: actions/download-artifact@v7
+        uses: actions/download-artifact@v8
         with:
           name: portal-cod4x-plugin-v${{ env.RELEASE_SEMVER }}-windows-x86
           run-id: ${{ github.event.workflow_run.id }}
