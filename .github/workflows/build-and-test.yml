@@ -16,7 +16,7 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - name: Checkout repository
-        uses: actions/checkout@v6
+        uses: actions/checkout@v7
 
       - name: Read plugin version
         id: plugin-version
@@ -65,7 +65,7 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - name: Checkout repository
-        uses: actions/checkout@v6
+        uses: actions/checkout@v7
 
       - name: Read plugin version
         id: plugin-version
@@ -123,7 +123,7 @@ jobs:
       COD4X_WINDOWS_HOST_MODULE: cod4x18_dedrun.exe
     steps:
       - name: Checkout repository
-        uses: actions/checkout@v6
+        uses: actions/checkout@v7
 
       - name: Resolve Windows build tools and host import library
         id: windows-build-inputs
