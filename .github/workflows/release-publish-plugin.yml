@@ -18,6 +18,8 @@ jobs:
     if: ${{ github.event.workflow_run.conclusion == 'success' }}
     environment: Production
     runs-on: ubuntu-latest
+    concurrency:
+      group: ${{ github.repository }}-prd
     env:
       HAS_RELEASE_TAG: "false"
       RELEASE_TAG: ""
@@ -48,7 +50,7 @@ jobs:
 
       - name: Download Linux plugin artifact from release workflow
         if: env.HAS_RELEASE_TAG == 'true'
-        uses: actions/download-artifact@v8
+        uses: actions/download-artifact@v7
         with:
           name: portal-cod4x-plugin-v${{ env.RELEASE_SEMVER }}-linux-x86
           run-id: ${{ github.event.workflow_run.id }}
@@ -57,7 +59,7 @@ jobs:
 
       - name: Download Windows plugin artifact from release workflow
         if: env.HAS_RELEASE_TAG == 'true'
-        uses: actions/download-artifact@v8
+        uses: actions/download-artifact@v7
         with:
           name: portal-cod4x-plugin-v${{ env.RELEASE_SEMVER }}-windows-x86
           run-id: ${{ github.event.workflow_run.id }}
@@ -81,16 +83,17 @@ jobs:
           tenant-id: ${{ vars.AZURE_TENANT_ID }}
           subscription-id: ${{ vars.AZURE_SUBSCRIPTION_ID }}
 
-      - name: Initialize Terraform backend (Production)
+      - name: Initialize Terraform output context (Production)
         if: env.HAS_RELEASE_TAG == 'true'
-        shell: bash
-        run: terraform -chdir=terraform init -backend-config="backends/prd.backend.hcl"
-        env:
-          ARM_CLIENT_ID: ${{ vars.AZURE_CLIENT_ID }}
-          ARM_SUBSCRIPTION_ID: ${{ vars.AZURE_SUBSCRIPTION_ID }}
-          ARM_TENANT_ID: ${{ vars.AZURE_TENANT_ID }}
-          ARM_USE_AZUREAD: true
-          ARM_USE_OIDC: true
+        uses: frasermolyneux/actions/terraform-output@terraform-output/v1.0
+        with:
+          perform-checkout: "false"
+          terraform-folder: "terraform"
+          terraform-var-file: "tfvars/prd.tfvars"
+          terraform-backend-file: "backends/prd.backend.hcl"
+          AZURE_CLIENT_ID: ${{ vars.AZURE_CLIENT_ID }}
+          AZURE_TENANT_ID: ${{ vars.AZURE_TENANT_ID }}
+          AZURE_SUBSCRIPTION_ID: ${{ vars.AZURE_SUBSCRIPTION_ID }}
 
       - name: Resolve artifact storage details
         if: env.HAS_RELEASE_TAG == 'true'
