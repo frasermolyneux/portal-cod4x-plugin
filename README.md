@@ -4,6 +4,8 @@
 [![Copilot Setup Steps](https://github.com/frasermolyneux/portal-cod4x-plugin/actions/workflows/copilot-setup-steps.yml/badge.svg)](https://github.com/frasermolyneux/portal-cod4x-plugin/actions/workflows/copilot-setup-steps.yml)
 [![Dependabot Auto-Merge](https://github.com/frasermolyneux/portal-cod4x-plugin/actions/workflows/dependabot-automerge.yml/badge.svg)](https://github.com/frasermolyneux/portal-cod4x-plugin/actions/workflows/dependabot-automerge.yml)
 [![PR Verify](https://github.com/frasermolyneux/portal-cod4x-plugin/actions/workflows/pr-verify.yml/badge.svg)](https://github.com/frasermolyneux/portal-cod4x-plugin/actions/workflows/pr-verify.yml)
+[![Release - Publish Plugin](https://github.com/frasermolyneux/portal-cod4x-plugin/actions/workflows/release-publish-plugin.yml/badge.svg)](https://github.com/frasermolyneux/portal-cod4x-plugin/actions/workflows/release-publish-plugin.yml)
+[![Release - Version and Tag](https://github.com/frasermolyneux/portal-cod4x-plugin/actions/workflows/release-version-and-tag.yml/badge.svg)](https://github.com/frasermolyneux/portal-cod4x-plugin/actions/workflows/release-version-and-tag.yml)
 
 ## Documentation
 * [Development Workflows](/docs/development-workflows.md) - Branch strategy, CI workflows, and local validation commands

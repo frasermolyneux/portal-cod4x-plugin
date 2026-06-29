@@ -1,0 +1,158 @@
+name: Release - Publish Plugin
+
+on:
+  workflow_run:
+    workflows:
+      - Release - Version and Tag
+    types:
+      - completed
+
+permissions: {}
+
+jobs:
+  publish-plugin-artifacts:
+    permissions:
+      contents: write
+      actions: read
+      id-token: write
+    if: ${{ github.event.workflow_run.conclusion == 'success' && github.event.workflow_run.head_branch == 'main' && github.event.workflow_run.event == 'push' }}
+    environment: Production
+    runs-on: ubuntu-latest
+    env:
+      HAS_RELEASE_TAG: "false"
+      RELEASE_TAG: ""
+      RELEASE_SEMVER: ""
+
+    steps:
+      - name: Checkout tagged commit
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0
+        with:
+          ref: ${{ github.event.workflow_run.head_sha }}
+
+      - name: Detect release tag on commit
+        shell: pwsh
+        run: |
+          git fetch --tags --force
+          $tags = git tag --points-at HEAD | Where-Object { $_ -like 'v*' }
+          if (-not $tags) {
+            Write-Host "No release-tag (v*) found on commit ${{ github.event.workflow_run.head_sha }}. Skipping publish."
+            exit 0
+          }
+
+          $selected = ($tags | Sort-Object | Select-Object -First 1).Trim()
+          $semver = $selected.TrimStart('v')
+          Write-Host "Found release tag '$selected'. Preparing publish."
+          "HAS_RELEASE_TAG=true" | Out-File -FilePath $Env:GITHUB_ENV -Encoding utf8 -Append
+          "RELEASE_TAG=$selected" | Out-File -FilePath $Env:GITHUB_ENV -Encoding utf8 -Append
+          "RELEASE_SEMVER=$semver" | Out-File -FilePath $Env:GITHUB_ENV -Encoding utf8 -Append
+
+      - name: Download Linux plugin artifact from release workflow
+        if: env.HAS_RELEASE_TAG == 'true'
+        uses: actions/download-artifact@v7
+        with:
+          name: portal-cod4x-plugin-v${{ env.RELEASE_SEMVER }}-linux-x86
+          run-id: ${{ github.event.workflow_run.id }}
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          path: release-artifacts/linux
+
+      - name: Download Windows plugin artifact from release workflow
+        if: env.HAS_RELEASE_TAG == 'true'
+        uses: actions/download-artifact@v7
+        with:
+          name: portal-cod4x-plugin-v${{ env.RELEASE_SEMVER }}-windows-x86
+          run-id: ${{ github.event.workflow_run.id }}
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          path: release-artifacts/windows
+
+      - name: Upload release bundle artifact
+        if: env.HAS_RELEASE_TAG == 'true'
+        uses: actions/upload-artifact@v7
+        with:
+          name: portal-cod4x-plugin-${{ env.RELEASE_TAG }}
+          path: release-artifacts/**/portal-cod4x-plugin.*
+          if-no-files-found: error
+          retention-days: 90
+
+      - name: Azure login
+        if: env.HAS_RELEASE_TAG == 'true'
+        uses: azure/login@v3
+        with:
+          client-id: ${{ vars.AZURE_CLIENT_ID }}
+          tenant-id: ${{ vars.AZURE_TENANT_ID }}
+          subscription-id: ${{ vars.AZURE_SUBSCRIPTION_ID }}
+
+      - name: Initialize Terraform backend (Production)
+        if: env.HAS_RELEASE_TAG == 'true'
+        shell: bash
+        run: terraform -chdir=terraform init -backend-config="backends/prd.backend.hcl"
+        env:
+          ARM_CLIENT_ID: ${{ vars.AZURE_CLIENT_ID }}
+          ARM_SUBSCRIPTION_ID: ${{ vars.AZURE_SUBSCRIPTION_ID }}
+          ARM_TENANT_ID: ${{ vars.AZURE_TENANT_ID }}
+          ARM_USE_AZUREAD: true
+          ARM_USE_OIDC: true
+
+      - name: Resolve artifact storage details
+        if: env.HAS_RELEASE_TAG == 'true'
+        id: artifact-storage
+        shell: bash
+        run: |
+          cd terraform
+          echo "account=$(terraform output -raw artifacts_storage_account_name)" >> "$GITHUB_OUTPUT"
+          echo "container=$(terraform output -raw artifacts_storage_container_name)" >> "$GITHUB_OUTPUT"
+        env:
+          ARM_CLIENT_ID: ${{ vars.AZURE_CLIENT_ID }}
+          ARM_SUBSCRIPTION_ID: ${{ vars.AZURE_SUBSCRIPTION_ID }}
+          ARM_TENANT_ID: ${{ vars.AZURE_TENANT_ID }}
+          ARM_USE_AZUREAD: true
+          ARM_USE_OIDC: true
+
+      - name: Upload Linux plugin to blob storage
+        if: env.HAS_RELEASE_TAG == 'true'
+        shell: bash
+        run: |
+          PLUGIN_PATH=$(find release-artifacts/linux -type f -name 'portal-cod4x-plugin.so' | head -n 1)
+          if [ -z "$PLUGIN_PATH" ]; then
+            echo "Linux plugin artifact not found." >&2
+            exit 1
+          fi
+
+          BLOB_PATH="releases/${{ env.RELEASE_TAG }}/linux/x86/portal-cod4x-plugin.so"
+          az storage blob upload \
+            --account-name "${{ steps.artifact-storage.outputs.account }}" \
+            --container-name "${{ steps.artifact-storage.outputs.container }}" \
+            --name "$BLOB_PATH" \
+            --file "$PLUGIN_PATH" \
+            --auth-mode login \
+            --overwrite true
+
+      - name: Upload Windows plugin to blob storage
+        if: env.HAS_RELEASE_TAG == 'true'
+        shell: bash
+        run: |
+          PLUGIN_PATH=$(find release-artifacts/windows -type f -name 'portal-cod4x-plugin.dll' | head -n 1)
+          if [ -z "$PLUGIN_PATH" ]; then
+            echo "Windows plugin artifact not found." >&2
+            exit 1
+          fi
+
+          BLOB_PATH="releases/${{ env.RELEASE_TAG }}/windows/x86/portal-cod4x-plugin.dll"
+          az storage blob upload \
+            --account-name "${{ steps.artifact-storage.outputs.account }}" \
+            --container-name "${{ steps.artifact-storage.outputs.container }}" \
+            --name "$BLOB_PATH" \
+            --file "$PLUGIN_PATH" \
+            --auth-mode login \
+            --overwrite true
+
+      - name: Create GitHub release
+        if: env.HAS_RELEASE_TAG == 'true'
+        uses: ncipollo/release-action@v1
+        with:
+          tag: ${{ env.RELEASE_TAG }}
+          name: ${{ env.RELEASE_TAG }}
+          generateReleaseNotes: true
+          skipIfReleaseExists: true
+          artifacts: release-artifacts/linux/**/*.so,release-artifacts/windows/**/*.dll
+          artifactErrorsFailBuild: false
+          token: ${{ secrets.GITHUB_TOKEN }}

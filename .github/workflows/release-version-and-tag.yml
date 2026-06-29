@@ -1,82 +1,92 @@
-name: Build and Test
+name: Release - Version and Tag
 
 on:
+  workflow_dispatch:
   push:
     branches:
-      - "feature/**"
-      - "bugfix/**"
-      - "hotfix/**"
+      - main
+    paths:
+      - "src/**"
+      - "include/**"
+      - "CMakeLists.txt"
+      - "version.json"
 
 permissions: {}
 
 jobs:
-  build-and-test:
+  calculate-version:
     permissions:
       contents: read
     runs-on: ubuntu-latest
+    outputs:
+      semver: ${{ steps.capture_version.outputs.semver }}
+      nuget_version: ${{ steps.capture_version.outputs.nuget_version }}
+      tag_name: ${{ steps.release_tag.outputs.tag_name }}
+      should_tag: ${{ steps.release_tag.outputs.should_tag }}
+
     steps:
-      - name: Checkout repository
-        uses: actions/checkout@v6
-
-      - name: Read plugin version
-        id: plugin-version
-        shell: bash
-        run: |
-          VERSION=$(grep -oE '"version"[[:space:]]*:[[:space:]]*"[0-9]+\.[0-9]+' version.json | grep -oE '[0-9]+\.[0-9]+')
-          if [ -z "$VERSION" ]; then
-            echo "Failed to parse version from version.json" >&2
-            exit 1
-          fi
-          echo "value=$VERSION" >> "$GITHUB_OUTPUT"
-
-      - name: Configure CMake
-        run: cmake -S . -B build -DCMAKE_BUILD_TYPE=Release -DPORTAL_COD4X_BUILD_PLUGIN_BINARY=OFF
-
-      - name: Build
-        run: cmake --build build --config Release
-
-      - name: Test
-        run: ctest --test-dir build --output-on-failure --build-config Release
-
-  terraform-plan-dev:
-    permissions:
-      contents: read
-      id-token: write
-    runs-on: ubuntu-latest
-    environment: Development
-    concurrency:
-      group: ${{ github.repository }}-dev
-    steps:
-      - name: Terraform Plan (Development)
-        uses: frasermolyneux/actions/terraform-plan@terraform-plan/v1.4
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0
         with:
-          terraform-folder: "terraform"
-          terraform-var-file: "tfvars/dev.tfvars"
-          terraform-backend-file: "backends/dev.backend.hcl"
-          AZURE_CLIENT_ID: ${{ vars.AZURE_CLIENT_ID }}
-          AZURE_TENANT_ID: ${{ vars.AZURE_TENANT_ID }}
-          AZURE_SUBSCRIPTION_ID: ${{ vars.AZURE_SUBSCRIPTION_ID }}
+          fetch-depth: 0
+
+      - name: Install Nerdbank.GitVersioning tool
+        run: |
+          dotnet tool uninstall --global nbgv || true
+          dotnet tool install --global nbgv --version 3.9.50
+          echo "$HOME/.dotnet/tools" >> $GITHUB_PATH
+
+      - name: Determine version
+        id: capture_version
+        shell: pwsh
+        run: |
+          $versionInfo = nbgv get-version -f json | ConvertFrom-Json
+          $semVer = $versionInfo.SemVer2
+          $nuGetVersion = $versionInfo.NuGetPackageVersion
+          $isPublicRelease = $versionInfo.PublicRelease
+
+          Write-Host "SemVer: $semVer"
+          Write-Host "NuGet version: $nuGetVersion"
+          Write-Host "Public release: $isPublicRelease"
+
+          "semver=$semVer" | Out-File -FilePath $Env:GITHUB_OUTPUT -Encoding utf8 -Append
+          "nuget_version=$nuGetVersion" | Out-File -FilePath $Env:GITHUB_OUTPUT -Encoding utf8 -Append
+          "public_release=$isPublicRelease" | Out-File -FilePath $Env:GITHUB_OUTPUT -Encoding utf8 -Append
+
+      - name: Decide tag requirement
+        id: release_tag
+        shell: pwsh
+        env:
+          SEMVER: ${{ steps.capture_version.outputs.semver }}
+          PUBLIC_RELEASE: ${{ steps.capture_version.outputs.public_release }}
+        run: |
+          git fetch --tags --force
+          if ($Env:PUBLIC_RELEASE -ne 'True' -and $Env:PUBLIC_RELEASE -ne 'true') {
+            Write-Host 'Current commit is not a public release. No tag will be created.'
+            "should_tag=false" | Out-File -FilePath $Env:GITHUB_OUTPUT -Encoding utf8 -Append
+            "tag_name=" | Out-File -FilePath $Env:GITHUB_OUTPUT -Encoding utf8 -Append
+            exit 0
+          }
+          $tagName = "v$Env:SEMVER"
+          $existing = git tag --points-at HEAD | Where-Object { $_ -like 'v*' } | Select-Object -First 1
+          if ($existing) {
+            Write-Host "HEAD already tagged with $existing; skipping tag creation."
+            "should_tag=false" | Out-File -FilePath $Env:GITHUB_OUTPUT -Encoding utf8 -Append
+            "tag_name=$existing" | Out-File -FilePath $Env:GITHUB_OUTPUT -Encoding utf8 -Append
+            exit 0
+          }
+          Write-Host "Next release tag: $tagName"
+          "should_tag=true" | Out-File -FilePath $Env:GITHUB_OUTPUT -Encoding utf8 -Append
+          "tag_name=$tagName" | Out-File -FilePath $Env:GITHUB_OUTPUT -Encoding utf8 -Append
 
   build-plugin-artifacts-linux:
     permissions:
       contents: read
     needs:
-      - build-and-test
+      - calculate-version
     runs-on: ubuntu-latest
     steps:
       - name: Checkout repository
         uses: actions/checkout@v6
-
-      - name: Read plugin version
-        id: plugin-version
-        shell: bash
-        run: |
-          VERSION=$(grep -oE '"version"[[:space:]]*:[[:space:]]*"[0-9]+\.[0-9]+' version.json | grep -oE '[0-9]+\.[0-9]+')
-          if [ -z "$VERSION" ]; then
-            echo "Failed to parse version from version.json" >&2
-            exit 1
-          fi
-          echo "value=$VERSION" >> "$GITHUB_OUTPUT"
 
       - name: Install Linux x86 toolchain
         run: |
@@ -108,16 +118,16 @@ jobs:
       - name: Upload plugin artifact
         uses: actions/upload-artifact@v7
         with:
-          name: portal-cod4x-plugin-v${{ steps.plugin-version.outputs.value }}-linux-x86-${{ github.run_number }}
+          name: portal-cod4x-plugin-v${{ needs.calculate-version.outputs.semver }}-linux-x86
           path: build-plugin/**/portal-cod4x-plugin.so
           if-no-files-found: error
-          retention-days: 14
+          retention-days: 30
 
   build-plugin-artifacts-windows:
     permissions:
       contents: read
     needs:
-      - build-and-test
+      - calculate-version
     runs-on: windows-latest
     env:
       COD4X_WINDOWS_HOST_MODULE: cod4x18_dedrun.exe
@@ -184,17 +194,6 @@ jobs:
           Add-Content -Path $env:GITHUB_OUTPUT -Value "dumpbin_path=$dumpbinPath"
           Add-Content -Path $env:GITHUB_OUTPUT -Value "host_import_lib=$hostImportLib"
 
-      - name: Read plugin version
-        id: plugin-version
-        shell: bash
-        run: |
-          VERSION=$(grep -oE '"version"[[:space:]]*:[[:space:]]*"[0-9]+\.[0-9]+' version.json | grep -oE '[0-9]+\.[0-9]+')
-          if [ -z "$VERSION" ]; then
-            echo "Failed to parse version from version.json" >&2
-            exit 1
-          fi
-          echo "value=$VERSION" >> "$GITHUB_OUTPUT"
-
       - name: Configure CMake (plugin binary, Windows x86)
         run: cmake -S . -B build-plugin -A Win32 -DPORTAL_COD4X_BUILD_PLUGIN_BINARY=ON -DPORTAL_COD4X_PLUGIN_ARCH=x86 -DCOD4X_PLUGIN_HOST_IMPORT_LIB="${{ steps.windows-build-inputs.outputs.host_import_lib }}"
 
@@ -233,7 +232,35 @@ jobs:
       - name: Upload plugin artifact
         uses: actions/upload-artifact@v7
         with:
-          name: portal-cod4x-plugin-v${{ steps.plugin-version.outputs.value }}-windows-x86-${{ github.run_number }}
+          name: portal-cod4x-plugin-v${{ needs.calculate-version.outputs.semver }}-windows-x86
           path: build-plugin/**/portal-cod4x-plugin.dll
           if-no-files-found: error
-          retention-days: 14
+          retention-days: 30
+
+  tag-release:
+    permissions:
+      contents: write
+    needs:
+      - calculate-version
+      - build-plugin-artifacts-linux
+      - build-plugin-artifacts-windows
+    if: needs.calculate-version.outputs.should_tag == 'true'
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0
+        with:
+          fetch-depth: 0
+
+      - name: Create tag
+        shell: pwsh
+        run: |
+          git tag ${{ needs.calculate-version.outputs.tag_name }}
+
+      - name: Push tag
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        shell: pwsh
+        run: |
+          git push origin ${{ needs.calculate-version.outputs.tag_name }}

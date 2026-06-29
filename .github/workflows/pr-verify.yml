@@ -42,6 +42,29 @@ jobs:
       - name: Test
         run: ctest --test-dir build --output-on-failure --build-config Release
 
+  terraform-plan-dev:
+    permissions:
+      contents: read
+      id-token: write
+      pull-requests: write
+    if: github.event.pull_request.draft == false && !contains(github.event.pull_request.labels.*.name, 'deploy-dev') && contains(fromJson('["opened","synchronize","reopened","ready_for_review"]'), github.event.action)
+    needs:
+      - build-and-test
+    runs-on: ubuntu-latest
+    environment: Development
+    concurrency:
+      group: ${{ github.repository }}-dev
+    steps:
+      - name: Terraform Plan (Development)
+        uses: frasermolyneux/actions/terraform-plan@terraform-plan/v1.4
+        with:
+          terraform-folder: "terraform"
+          terraform-var-file: "tfvars/dev.tfvars"
+          terraform-backend-file: "backends/dev.backend.hcl"
+          AZURE_CLIENT_ID: ${{ vars.AZURE_CLIENT_ID }}
+          AZURE_TENANT_ID: ${{ vars.AZURE_TENANT_ID }}
+          AZURE_SUBSCRIPTION_ID: ${{ vars.AZURE_SUBSCRIPTION_ID }}
+
   build-plugin-artifacts-linux:
     permissions:
       contents: read
@@ -224,3 +247,26 @@ jobs:
           path: build-plugin/**/portal-cod4x-plugin.dll
           if-no-files-found: error
           retention-days: 14
+
+  terraform-plan-prd:
+    permissions:
+      contents: read
+      id-token: write
+      pull-requests: write
+    if: github.event.pull_request.draft == false && contains(github.event.pull_request.labels.*.name, 'run-prd-plan') && (contains(fromJson('["opened","synchronize","reopened","ready_for_review"]'), github.event.action) || (github.event.action == 'labeled' && github.event.label.name == 'run-prd-plan'))
+    needs:
+      - build-and-test
+    runs-on: ubuntu-latest
+    environment: Production
+    concurrency:
+      group: ${{ github.repository }}-prd
+    steps:
+      - name: Terraform Plan (Production)
+        uses: frasermolyneux/actions/terraform-plan@terraform-plan/v1.4
+        with:
+          terraform-folder: "terraform"
+          terraform-var-file: "tfvars/prd.tfvars"
+          terraform-backend-file: "backends/prd.backend.hcl"
+          AZURE_CLIENT_ID: ${{ vars.AZURE_CLIENT_ID }}
+          AZURE_TENANT_ID: ${{ vars.AZURE_TENANT_ID }}
+          AZURE_SUBSCRIPTION_ID: ${{ vars.AZURE_SUBSCRIPTION_ID }}

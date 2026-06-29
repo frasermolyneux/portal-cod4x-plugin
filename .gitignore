@@ -32,3 +32,8 @@ Thumbs.db
 *.obj
 *.o
 *.pdb
+
+# Terraform
+terraform/.terraform/
+terraform/*.tfstate
+terraform/*.tfstate.*
