@@ -29,5 +29,5 @@ resource "azurerm_storage_container" "artifacts" {
 resource "azurerm_role_assignment" "workload_blob_data_contributor" {
   scope                = azurerm_storage_account.artifacts.id
   role_definition_name = "Storage Blob Data Contributor"
-  principal_id         = local.workload_service_principal.object_id
+  principal_id         = local.workload_service_principal.service_principal_object_id
 }
