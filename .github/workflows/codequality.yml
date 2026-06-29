@@ -30,7 +30,7 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - name: Checkout repository
-        uses: actions/checkout@v6
+        uses: actions/checkout@v7
 
       - name: Configure CMake
         run: cmake -S . -B build -DCMAKE_BUILD_TYPE=Release -DCMAKE_EXPORT_COMPILE_COMMANDS=ON -DPORTAL_COD4X_BUILD_PLUGIN_BINARY=OFF
@@ -42,7 +42,7 @@ jobs:
         run: ctest --test-dir build --output-on-failure --build-config Release
 
       - name: SonarCloud Scan
-        uses: SonarSource/sonarqube-scan-action@v5
+        uses: SonarSource/sonarqube-scan-action@v8
         with:
           args: >
             -Dsonar.projectKey=frasermolyneux_portal-cod4x-plugin
