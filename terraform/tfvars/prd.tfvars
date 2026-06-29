@@ -1,6 +1,6 @@
 workload_name = "portal-cod4x-plugin"
 environment   = "prd"
-location      = "swedencentral"
+location      = "uksouth"
 
 subscription_id = "32444f38-32f4-409f-889c-8e8aa2b5b4d1"
 
