@@ -33,6 +33,18 @@ variable "platform_workloads_state" {
   })
 }
 
+variable "portal_environments_state" {
+  description = "Backend config for portal-environments remote state"
+  type = object({
+    resource_group_name  = string
+    storage_account_name = string
+    container_name       = string
+    key                  = string
+    subscription_id      = string
+    tenant_id            = string
+  })
+}
+
 variable "artifacts_container_name" {
   description = "Blob container name used for plugin binary artifacts"
   type        = string

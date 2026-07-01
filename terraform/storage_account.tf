@@ -31,3 +31,15 @@ resource "azurerm_role_assignment" "workload_blob_data_contributor" {
   role_definition_name = "Storage Blob Data Contributor"
   principal_id         = local.workload_service_principal.service_principal_object_id
 }
+
+resource "azurerm_role_assignment" "web_blob_data_reader" {
+  scope                = azurerm_storage_account.artifacts.id
+  role_definition_name = "Storage Blob Data Reader"
+  principal_id         = local.web_identity.principal_id
+}
+
+resource "azurerm_role_assignment" "server_agent_blob_data_reader" {
+  scope                = azurerm_storage_account.artifacts.id
+  role_definition_name = "Storage Blob Data Reader"
+  principal_id         = local.server_agent_identity.principal_id
+}
