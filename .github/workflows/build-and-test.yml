@@ -27,7 +27,9 @@ jobs:
             echo "Failed to parse version from version.json" >&2
             exit 1
           fi
+          FULL_VERSION="${VERSION}.${GITHUB_RUN_NUMBER}"
           echo "value=$VERSION" >> "$GITHUB_OUTPUT"
+          echo "full_version=$FULL_VERSION" >> "$GITHUB_OUTPUT"
 
       - name: Configure CMake
         run: cmake -S . -B build -DCMAKE_BUILD_TYPE=Release -DPORTAL_COD4X_BUILD_PLUGIN_BINARY=OFF
@@ -76,7 +78,9 @@ jobs:
             echo "Failed to parse version from version.json" >&2
             exit 1
           fi
+          FULL_VERSION="${VERSION}.${GITHUB_RUN_NUMBER}"
           echo "value=$VERSION" >> "$GITHUB_OUTPUT"
+          echo "full_version=$FULL_VERSION" >> "$GITHUB_OUTPUT"
 
       - name: Install Linux x86 toolchain
         run: |
@@ -84,7 +88,7 @@ jobs:
           sudo apt-get install -y gcc-multilib g++-multilib
 
       - name: Configure CMake (plugin binary, Linux x86)
-        run: cmake -S . -B build-plugin -DCMAKE_BUILD_TYPE=Release -DPORTAL_COD4X_BUILD_PLUGIN_BINARY=ON -DPORTAL_COD4X_PLUGIN_ARCH=x86
+        run: cmake -S . -B build-plugin -DCMAKE_BUILD_TYPE=Release -DPORTAL_COD4X_BUILD_PLUGIN_BINARY=ON -DPORTAL_COD4X_PLUGIN_ARCH=x86 -DPORTAL_COD4X_PLUGIN_VERSION="${{ steps.plugin-version.outputs.full_version }}"
 
       - name: Build plugin binary
         run: cmake --build build-plugin --config Release
@@ -108,7 +112,7 @@ jobs:
       - name: Upload plugin artifact
         uses: actions/upload-artifact@v7
         with:
-          name: portal-cod4x-plugin-v${{ steps.plugin-version.outputs.value }}-linux-x86-${{ github.run_number }}
+          name: portal-cod4x-plugin-v${{ steps.plugin-version.outputs.full_version }}-linux-x86
           path: build-plugin/**/portal-cod4x-plugin.so
           if-no-files-found: error
           retention-days: 14
@@ -193,10 +197,12 @@ jobs:
             echo "Failed to parse version from version.json" >&2
             exit 1
           fi
+          FULL_VERSION="${VERSION}.${GITHUB_RUN_NUMBER}"
           echo "value=$VERSION" >> "$GITHUB_OUTPUT"
+          echo "full_version=$FULL_VERSION" >> "$GITHUB_OUTPUT"
 
       - name: Configure CMake (plugin binary, Windows x86)
-        run: cmake -S . -B build-plugin -A Win32 -DPORTAL_COD4X_BUILD_PLUGIN_BINARY=ON -DPORTAL_COD4X_PLUGIN_ARCH=x86 -DCOD4X_PLUGIN_HOST_IMPORT_LIB="${{ steps.windows-build-inputs.outputs.host_import_lib }}"
+        run: cmake -S . -B build-plugin -A Win32 -DPORTAL_COD4X_BUILD_PLUGIN_BINARY=ON -DPORTAL_COD4X_PLUGIN_ARCH=x86 -DPORTAL_COD4X_PLUGIN_VERSION="${{ steps.plugin-version.outputs.full_version }}" -DCOD4X_PLUGIN_HOST_IMPORT_LIB="${{ steps.windows-build-inputs.outputs.host_import_lib }}"
 
       - name: Build plugin binary
         run: cmake --build build-plugin --config Release
@@ -233,7 +239,7 @@ jobs:
       - name: Upload plugin artifact
         uses: actions/upload-artifact@v7
         with:
-          name: portal-cod4x-plugin-v${{ steps.plugin-version.outputs.value }}-windows-x86-${{ github.run_number }}
+          name: portal-cod4x-plugin-v${{ steps.plugin-version.outputs.full_version }}-windows-x86
           path: build-plugin/**/portal-cod4x-plugin.dll
           if-no-files-found: error
           retention-days: 14

@@ -94,7 +94,7 @@ jobs:
           sudo apt-get install -y gcc-multilib g++-multilib
 
       - name: Configure CMake (plugin binary, Linux x86)
-        run: cmake -S . -B build-plugin -DCMAKE_BUILD_TYPE=Release -DPORTAL_COD4X_BUILD_PLUGIN_BINARY=ON -DPORTAL_COD4X_PLUGIN_ARCH=x86
+        run: cmake -S . -B build-plugin -DCMAKE_BUILD_TYPE=Release -DPORTAL_COD4X_BUILD_PLUGIN_BINARY=ON -DPORTAL_COD4X_PLUGIN_ARCH=x86 -DPORTAL_COD4X_PLUGIN_VERSION="${{ needs.calculate-version.outputs.semver }}"
 
       - name: Build plugin binary
         run: cmake --build build-plugin --config Release
@@ -195,7 +195,7 @@ jobs:
           Add-Content -Path $env:GITHUB_OUTPUT -Value "host_import_lib=$hostImportLib"
 
       - name: Configure CMake (plugin binary, Windows x86)
-        run: cmake -S . -B build-plugin -A Win32 -DPORTAL_COD4X_BUILD_PLUGIN_BINARY=ON -DPORTAL_COD4X_PLUGIN_ARCH=x86 -DCOD4X_PLUGIN_HOST_IMPORT_LIB="${{ steps.windows-build-inputs.outputs.host_import_lib }}"
+        run: cmake -S . -B build-plugin -A Win32 -DPORTAL_COD4X_BUILD_PLUGIN_BINARY=ON -DPORTAL_COD4X_PLUGIN_ARCH=x86 -DPORTAL_COD4X_PLUGIN_VERSION="${{ needs.calculate-version.outputs.semver }}" -DCOD4X_PLUGIN_HOST_IMPORT_LIB="${{ steps.windows-build-inputs.outputs.host_import_lib }}"
 
       - name: Build plugin binary
         run: cmake --build build-plugin --config Release

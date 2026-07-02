@@ -19,6 +19,10 @@ The runtime logic is isolated in `portal_cod4x::InitializePlugin` and `BuildOnli
 
 You can override the semantic value passed to code at build time with `-DPORTAL_COD4X_PLUGIN_VERSION=<value>`.
 
+In CI plugin-binary jobs, CMake is explicitly passed a full semantic token (`major.minor.runNumber`) via
+`-DPORTAL_COD4X_PLUGIN_VERSION=...` so `pluginInfo` short description and runtime health checks are pinned to
+the same build version as the produced artifact.
+
 ## Build modes
 
 > Local builds require CMake and a C++ toolchain. See [development-workflows.md](development-workflows.md#prerequisites-windows) for the winget install commands.
@@ -71,4 +75,5 @@ cmake -S . -B build -DPORTAL_COD4X_BUILD_PLUGIN_BINARY=ON -DPORTAL_COD4X_PLUGIN_
 `build-and-test.yml` and `pr-verify.yml` always publish Linux x86 and Windows x86 plugin binaries. For Windows builds, CI uses `windows-sdk/com_plugin.lib` when present and otherwise generates a temporary fallback import library from expected host exports (`Plugin_Printf`, `Plugin_ChatPrintf`) and the configured host module name (`COD4X_WINDOWS_HOST_MODULE`, default `exec_cod4boom.exe`) before building. CI then verifies the plugin import table contains that host module:
 
 - `portal-cod4x-plugin-v<major.minor>-linux-x86-<run-number>`
-- `portal-cod4x-plugin-v<major.minor>-windows-x86-<run-number>`
+- `portal-cod4x-plugin-v<major.minor.run-number>-linux-x86`
+- `portal-cod4x-plugin-v<major.minor.run-number>-windows-x86`
