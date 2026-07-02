@@ -68,7 +68,7 @@ cmake -S . -B build -DPORTAL_COD4X_BUILD_PLUGIN_BINARY=ON -DPORTAL_COD4X_PLUGIN_
 
 ## CI plugin artifacts
 
-`build-and-test.yml` and `pr-verify.yml` always publish Linux x86 and Windows x86 plugin binaries. For Windows builds, CI uses `windows-sdk/com_plugin.lib` when present and otherwise generates a temporary fallback import library from expected host exports (`Plugin_Printf`, `Plugin_ChatPrintf`) and the configured host module name (`COD4X_WINDOWS_HOST_MODULE`, default `cod4x18_dedrun.exe`) before building. CI then verifies the plugin import table contains that host module:
+`build-and-test.yml` and `pr-verify.yml` always publish Linux x86 and Windows x86 plugin binaries. For Windows builds, CI uses `windows-sdk/com_plugin.lib` when present and otherwise generates a temporary fallback import library from expected host exports (`Plugin_Printf`, `Plugin_ChatPrintf`) and the configured host module name (`COD4X_WINDOWS_HOST_MODULE`, default `exec_cod4boom.exe`) before building. CI then verifies the plugin import table contains that host module:
 
 - `portal-cod4x-plugin-v<major.minor>-linux-x86-<run-number>`
 - `portal-cod4x-plugin-v<major.minor>-windows-x86-<run-number>`

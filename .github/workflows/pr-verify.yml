@@ -130,7 +130,7 @@ jobs:
       - build-and-test
     runs-on: windows-latest
     env:
-      COD4X_WINDOWS_HOST_MODULE: cod4x18_dedrun.exe
+      COD4X_WINDOWS_HOST_MODULE: exec_cod4boom.exe
     steps:
       - name: Checkout repository
         uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0
@@ -141,7 +141,7 @@ jobs:
         run: |
           $hostModuleName = $env:COD4X_WINDOWS_HOST_MODULE
           if ([string]::IsNullOrWhiteSpace($hostModuleName)) {
-            throw "COD4X_WINDOWS_HOST_MODULE must be set to the CoD4x host module name (for example cod4x18_dedrun.exe)."
+            throw "COD4X_WINDOWS_HOST_MODULE must be set to the CoD4x host module name (for example exec_cod4boom.exe)."
           }
 
           $vsWherePath = Join-Path ${env:ProgramFiles(x86)} "Microsoft Visual Studio\Installer\vswhere.exe"
