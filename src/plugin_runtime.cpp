@@ -9,7 +9,7 @@ std::string BuildOnlineBroadcastMessage(std::string_view prefix, std::string_vie
     std::string normalizedPrefix = prefix.empty() ? std::string(kDefaultBotPrefix) : std::string(prefix);
     std::string normalizedVersion = version.empty() ? "0.0.0-unknown" : std::string(version);
 
-    return normalizedPrefix + " XI Portal Plugin is online (version " + normalizedVersion + ")";
+    return normalizedPrefix + " Portal Plugin is online (version " + normalizedVersion + ")";
 }
 
 int InitializePlugin(ICod4xHost& host, std::string_view version, std::string_view prefix)
@@ -17,7 +17,7 @@ int InitializePlugin(ICod4xHost& host, std::string_view version, std::string_vie
     const std::string onlineMessage = BuildOnlineBroadcastMessage(prefix, version);
     const std::string normalizedVersion = version.empty() ? "0.0.0-unknown" : std::string(version);
 
-    host.Log("XI Portal Plugin is online (version " + normalizedVersion + ")");
+    host.Log("Portal Plugin is online (version " + normalizedVersion + ")");
     host.BroadcastChat(onlineMessage);
 
     return 0;

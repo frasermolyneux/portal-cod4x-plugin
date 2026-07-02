@@ -38,7 +38,7 @@ void BuildMessage_UsesPrefixAndVersion()
     const std::string message = portal_cod4x::BuildOnlineBroadcastMessage("^4[^1XI-BOT^4]^7", "0.1.0");
 
     Assert(message.find("^4[^1XI-BOT^4]^7") != std::string::npos, "Expected colorized prefix in message");
-    Assert(message.find("XI Portal Plugin is online") != std::string::npos, "Expected startup wording in message");
+    Assert(message.find("Portal Plugin is online") != std::string::npos, "Expected startup wording in message");
     Assert(message.find("version 0.1.0") != std::string::npos, "Expected semantic version in message");
 }
 
@@ -47,7 +47,7 @@ void BuildMessage_FallsBackWhenPrefixOrVersionMissing()
     const std::string message = portal_cod4x::BuildOnlineBroadcastMessage("", "");
 
     Assert(message.find("XI-BOT") != std::string::npos, "Expected default XI-BOT prefix when prefix is empty");
-    Assert(message.find("XI Portal Plugin is online") != std::string::npos, "Expected startup wording in fallback message");
+    Assert(message.find("Portal Plugin is online") != std::string::npos, "Expected startup wording in fallback message");
     Assert(message.find("0.0.0-unknown") != std::string::npos, "Expected fallback version when version is empty");
 }
 
@@ -56,8 +56,8 @@ void InitializePlugin_EmitsLogAndBroadcast()
     FakeHost host;
 
     const int result = portal_cod4x::InitializePlugin(host, "1.2.3", "^4[^1XI-BOT^4]^7");
-    const std::string expectedBroadcast = "^4[^1XI-BOT^4]^7 XI Portal Plugin is online (version 1.2.3)";
-    const std::string expectedLog = "XI Portal Plugin is online (version 1.2.3)";
+    const std::string expectedBroadcast = "^4[^1XI-BOT^4]^7 Portal Plugin is online (version 1.2.3)";
+    const std::string expectedLog = "Portal Plugin is online (version 1.2.3)";
 
     Assert(result == 0, "InitializePlugin should return success code");
     Assert(host.Logs.size() == 1, "InitializePlugin should write one startup log");
@@ -71,8 +71,8 @@ void InitializePlugin_FallsBackWhenPrefixOrVersionMissing()
     FakeHost host;
 
     const int result = portal_cod4x::InitializePlugin(host, "", "");
-    const std::string expectedBroadcast = std::string(portal_cod4x::kDefaultBotPrefix) + " XI Portal Plugin is online (version 0.0.0-unknown)";
-    const std::string expectedLog = "XI Portal Plugin is online (version 0.0.0-unknown)";
+    const std::string expectedBroadcast = std::string(portal_cod4x::kDefaultBotPrefix) + " Portal Plugin is online (version 0.0.0-unknown)";
+    const std::string expectedLog = "Portal Plugin is online (version 0.0.0-unknown)";
 
     Assert(result == 0, "InitializePlugin should return success code for fallback path");
     Assert(host.Logs.size() == 1, "InitializePlugin should write one startup log for fallback path");

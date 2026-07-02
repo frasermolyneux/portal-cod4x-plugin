@@ -5,7 +5,7 @@
 The skeleton plugin wires CoD4x exports and sends a startup broadcast on `OnInit`:
 
 - Prefix: `^4[^1XI-BOT^4]^7`
-- Message: `XI Portal Plugin is online (version <version>)`
+- Message: `Portal Plugin is online (version <version>)`
 - Broadcast target slot: `-1` (all players)
 
 The runtime logic is isolated in `portal_cod4x::InitializePlugin` and `BuildOnlineBroadcastMessage`, which are covered by unit tests.
