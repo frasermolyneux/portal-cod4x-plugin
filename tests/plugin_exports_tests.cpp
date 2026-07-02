@@ -19,6 +19,7 @@ struct ChatMessage
 
 std::vector<std::string> g_logs;
 std::vector<ChatMessage> g_chats;
+std::vector<std::string> g_commands;
 
 void AssertTrue(bool condition, const char* failureMessage)
 {
@@ -53,9 +54,30 @@ extern "C" void COD4X_CALL Plugin_ChatPrintf(int slot, const char* fmt, ...)
     va_end(args);
 }
 
+extern "C" void COD4X_CALL Plugin_Cbuf_AddText(const char* text)
+{
+    g_commands.emplace_back(text == nullptr ? "" : text);
+}
+
+extern "C" ftRequest_t* COD4X_CALL Plugin_HTTP_Request(
+    const char*,
+    const char*,
+    byte*,
+    int,
+    const char*)
+{
+    return nullptr;
+}
+
+extern "C" void COD4X_CALL Plugin_HTTP_FreeObj(ftRequest_t*)
+{
+}
+
 extern "C"
 {
 int OnInit();
+void OnFrame();
+void OnClientAuthorized();
 void OnInfoRequest(pluginInfo_t* info);
 }
 
@@ -79,6 +101,13 @@ int main()
     AssertTrue(g_chats.front().slot == -1, "Startup broadcast should target all players with slot -1.");
     AssertTrue(g_chats.front().message.find("version") != std::string::npos, "Startup broadcast should contain a version string.");
     AssertTrue(!g_logs.empty(), "OnInit should emit at least one log message.");
+
+    const std::size_t logCountAfterInit = g_logs.size();
+
+    OnFrame();
+    OnClientAuthorized();
+
+    AssertTrue(g_logs.size() >= logCountAfterInit, "OnFrame and OnClientAuthorized should be safe to invoke.");
 
     std::cout << "All plugin export tests passed.\n";
     return 0;

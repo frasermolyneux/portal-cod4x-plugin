@@ -59,7 +59,32 @@ typedef struct
     char longDescription[1024];
 } pluginInfo_t;
 
+typedef unsigned char byte;
+
+typedef struct
+{
+    byte* data;
+    int cursize;
+} msg_t;
+
+typedef struct
+{
+    int code;
+    int headerLength;
+    int contentLength;
+    int contentLengthArrived;
+    msg_t* extrecvmsg;
+} ftRequest_t;
+
 extern "C" void COD4X_CALL Plugin_Printf(const char* fmt, ...);
 extern "C" void COD4X_CALL Plugin_ChatPrintf(int slot, const char* fmt, ...);
+extern "C" void COD4X_CALL Plugin_Cbuf_AddText(const char* text);
+extern "C" ftRequest_t* COD4X_CALL Plugin_HTTP_Request(
+    const char* url,
+    const char* method,
+    byte* requestpayload,
+    int payloadlen,
+    const char* additionalheaderlines);
+extern "C" void COD4X_CALL Plugin_HTTP_FreeObj(ftRequest_t* request);
 
 #endif

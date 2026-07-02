@@ -1,8 +1,12 @@
 #include "portal_cod4x/plugin_runtime.h"
 
 #include <cstdlib>
+#include <filesystem>
+#include <fstream>
 #include <iostream>
+#include <optional>
 #include <string>
+#include <unordered_map>
 #include <vector>
 
 namespace
@@ -12,6 +16,9 @@ class FakeHost final : public portal_cod4x::ICod4xHost
 public:
     std::vector<std::string> BroadcastMessages;
     std::vector<std::string> Logs;
+    std::vector<std::string> ExecutedCommands;
+    std::unordered_map<std::string, portal_cod4x::HttpResponse> Responses;
+    std::int64_t CurrentTime = 0;
 
     void BroadcastChat(std::string_view message) override
     {
@@ -21,6 +28,33 @@ public:
     void Log(std::string_view message) override
     {
         Logs.emplace_back(message);
+    }
+
+    bool ExecuteServerCommand(std::string_view command) override
+    {
+        ExecutedCommands.emplace_back(command);
+        return true;
+    }
+
+    std::optional<portal_cod4x::HttpResponse> HttpRequest(
+        std::string_view url,
+        std::string_view method,
+        std::string_view,
+        std::string_view) override
+    {
+        const std::string key = std::string(method) + " " + std::string(url);
+        const auto it = Responses.find(key);
+        if (it == Responses.end())
+        {
+            return std::nullopt;
+        }
+
+        return it->second;
+    }
+
+    std::int64_t GetUnixTimeSeconds() const override
+    {
+        return CurrentTime;
     }
 };
 
@@ -51,6 +85,132 @@ void BuildMessage_FallsBackWhenPrefixOrVersionMissing()
     Assert(message.find("0.0.0-unknown") != std::string::npos, "Expected fallback version when version is empty");
 }
 
+std::string EscapeJsonString(std::string_view value)
+{
+    std::string escaped;
+    escaped.reserve(value.size() * 2);
+
+    for (const char c : value)
+    {
+        if (c == '\\' || c == '"')
+        {
+            escaped.push_back('\\');
+        }
+
+        escaped.push_back(c);
+    }
+
+    return escaped;
+}
+
+void Runtime_RefreshesSettingsAndReconcilesCommandPower()
+{
+    const std::filesystem::path configPath = std::filesystem::temp_directory_path() / "portal-cod4x-plugin.runtime.test.json";
+
+    {
+        std::ofstream configFile(configPath);
+        configFile
+            << "{"
+            << "\"tenantId\":\"tenant-test\","
+            << "\"clientId\":\"client-test\","
+            << "\"clientSecret\":\"secret-test\","
+            << "\"repositoryApiBaseUrl\":\"https://example.test/repository\","
+            << "\"repositoryApiResource\":\"api://repository-test\","
+            << "\"gameServerId\":\"11111111-2222-3333-4444-555555555555\","
+            << "\"refreshIntervalSeconds\":120"
+            << "}";
+    }
+
+    FakeHost host;
+    host.CurrentTime = 1000;
+
+    const std::string globalPayload =
+        "{\"schemaVersion\":1,\"enabled\":true,\"commands\":{\"kick\":{\"minPower\":35},\"cmdpowerlist\":{\"minPower\":95}}}";
+    const std::string serverPayload =
+        "{\"schemaVersion\":1,\"commands\":{\"kick\":{\"minPower\":70},\"cmdpowerlist\":{\"minPower\":65}}}";
+
+    host.Responses["POST https://login.microsoftonline.com/tenant-test/oauth2/v2.0/token"] = {
+        200,
+        "{\"access_token\":\"token-1\",\"expires_in\":3600}"};
+    host.Responses["GET https://example.test/repository/v1.0/configurations/cod4xCommands"] = {
+        200,
+        "{\"namespace\":\"cod4xCommands\",\"configuration\":\"" + EscapeJsonString(globalPayload) + "\"}"};
+    host.Responses["GET https://example.test/repository/v1.0/game-servers/11111111-2222-3333-4444-555555555555/configurations/cod4xCommands"] = {
+        200,
+        "{\"namespace\":\"cod4xCommands\",\"configuration\":\"" + EscapeJsonString(serverPayload) + "\"}"};
+
+    portal_cod4x::PluginRuntime runtime(configPath.string());
+    const int initializeResult = runtime.Initialize(host, "1.2.3", "^4[^1XI-BOT^4]^7");
+    Assert(initializeResult == 0, "PluginRuntime initialize should succeed");
+
+    runtime.Tick(host);
+
+    Assert(!host.ExecutedCommands.empty(), "Initial tick should reconcile command powers");
+
+    bool hasKick70 = false;
+    bool hasAdminListCommands65 = false;
+    for (const auto& command : host.ExecutedCommands)
+    {
+        if (command == "setCmdMinPower kick 70")
+        {
+            hasKick70 = true;
+        }
+
+        if (command == "setCmdMinPower AdminListCommands 65")
+        {
+            hasAdminListCommands65 = true;
+        }
+    }
+
+    Assert(hasKick70, "Server override should set kick command power to 70");
+    Assert(hasAdminListCommands65, "Alias command should resolve to AdminListCommands");
+
+    const std::size_t firstApplyCount = host.ExecutedCommands.size();
+
+    host.CurrentTime = 1100;
+    runtime.Tick(host);
+    Assert(host.ExecutedCommands.size() == firstApplyCount, "Tick before interval should not perform another reconciliation");
+
+    const std::string changedServerPayload =
+        "{\"schemaVersion\":1,\"commands\":{\"kick\":{\"minPower\":80},\"cmdpowerlist\":{\"minPower\":65}}}";
+    host.Responses["GET https://example.test/repository/v1.0/game-servers/11111111-2222-3333-4444-555555555555/configurations/cod4xCommands"] = {
+        200,
+        "{\"namespace\":\"cod4xCommands\",\"configuration\":\"" + EscapeJsonString(changedServerPayload) + "\"}"};
+
+    host.CurrentTime = 1121;
+    runtime.Tick(host);
+
+    bool hasKick80 = false;
+    for (const auto& command : host.ExecutedCommands)
+    {
+        if (command == "setCmdMinPower kick 80")
+        {
+            hasKick80 = true;
+            break;
+        }
+    }
+
+    Assert(hasKick80, "Changed server context should trigger updated command power reconciliation");
+    const std::size_t secondApplyCount = host.ExecutedCommands.size();
+
+    const std::string disabledServerPayload = "{\"schemaVersion\":1,\"enabled\":false,\"commands\":{\"kick\":{\"minPower\":55}}}";
+    host.Responses["GET https://example.test/repository/v1.0/game-servers/11111111-2222-3333-4444-555555555555/configurations/cod4xCommands"] = {
+        200,
+        "{\"namespace\":\"cod4xCommands\",\"configuration\":\"" + EscapeJsonString(disabledServerPayload) + "\"}"};
+
+    host.CurrentTime = 1245;
+    runtime.Tick(host);
+    Assert(
+        host.ExecutedCommands.size() == secondApplyCount,
+        "When cod4xCommands enforcement is disabled, runtime should stop enforcing and keep existing command powers");
+
+    const auto& context = runtime.GetServerContext();
+    Assert(!context.GameServerId.empty(), "Server context should retain configured gameServerId");
+
+    std::error_code ignoreError;
+    std::filesystem::remove(configPath, ignoreError);
+}
+
 void InitializePlugin_EmitsLogAndBroadcast()
 {
     FakeHost host;
@@ -60,10 +220,10 @@ void InitializePlugin_EmitsLogAndBroadcast()
     const std::string expectedLog = "Portal Plugin is online (version 1.2.3)";
 
     Assert(result == 0, "InitializePlugin should return success code");
-    Assert(host.Logs.size() == 1, "InitializePlugin should write one startup log");
+    Assert(!host.Logs.empty(), "InitializePlugin should write startup logs");
     Assert(host.BroadcastMessages.size() == 1, "InitializePlugin should send one startup broadcast");
     Assert(host.BroadcastMessages.front() == expectedBroadcast, "Broadcast should match expected startup format");
-    Assert(host.Logs.front() == expectedLog, "Startup log should match expected startup format");
+    Assert(host.Logs.front() == expectedLog, "First startup log should match expected startup format");
 }
 
 void InitializePlugin_FallsBackWhenPrefixOrVersionMissing()
@@ -75,10 +235,10 @@ void InitializePlugin_FallsBackWhenPrefixOrVersionMissing()
     const std::string expectedLog = "Portal Plugin is online (version 0.0.0-unknown)";
 
     Assert(result == 0, "InitializePlugin should return success code for fallback path");
-    Assert(host.Logs.size() == 1, "InitializePlugin should write one startup log for fallback path");
+    Assert(!host.Logs.empty(), "InitializePlugin should write startup logs for fallback path");
     Assert(host.BroadcastMessages.size() == 1, "InitializePlugin should send one startup broadcast for fallback path");
     Assert(host.BroadcastMessages.front() == expectedBroadcast, "Fallback broadcast should match expected startup format");
-    Assert(host.Logs.front() == expectedLog, "Fallback startup log should match expected startup format");
+    Assert(host.Logs.front() == expectedLog, "First fallback startup log should match expected startup format");
 }
 }
 
@@ -86,6 +246,7 @@ int main()
 {
     BuildMessage_UsesPrefixAndVersion();
     BuildMessage_FallsBackWhenPrefixOrVersionMissing();
+    Runtime_RefreshesSettingsAndReconcilesCommandPower();
     InitializePlugin_EmitsLogAndBroadcast();
     InitializePlugin_FallsBackWhenPrefixOrVersionMissing();
 
