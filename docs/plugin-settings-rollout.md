@@ -1,0 +1,97 @@
+# Plugin Settings Rollout
+
+This runbook covers Phase 2 operations for the CoD4x plugin settings flow:
+
+- materialize local plugin config from Azure secrets and Terraform outputs
+- deploy the config to the game server host
+- validate runtime polling and command reconciliation behavior
+- rotate credentials safely
+
+## Runtime config contract
+
+The plugin reads a local JSON file named `portal-cod4x-plugin.config.json`.
+
+Required fields:
+
+- `tenantId`
+- `clientId`
+- `clientSecret`
+- `repositoryApiBaseUrl`
+- `repositoryApiResource`
+- `gameServerId`
+- `refreshIntervalSeconds` (15-900, default 120)
+
+An example file is provided at `portal-cod4x-plugin.config.example.json`.
+
+## Source of truth from Azure
+
+Values are sourced from `portal-environments` Terraform outputs and shared Key Vault secrets:
+
+- secret `azuread-app-tenant-id-cod4x-plugin`
+- secret `azuread-app-client-id-cod4x-plugin`
+- secret `azuread-app-password-cod4x-plugin`
+- secret `cod4x-plugin-repository-api-endpoint`
+- Terraform output `repository_api.application.primary_identifier_uri` for `repositoryApiResource`
+
+## Generate config file
+
+Use the helper script:
+
+```pwsh
+./scripts/New-Cod4xPluginConfigFromAzure.ps1 `
+  -SharedKeyVaultName <shared-kv-name> `
+  -GameServerId <game-server-guid> `
+  -PortalEnvironmentsPath "../portal-environments/terraform" `
+  -OutputPath "./portal-cod4x-plugin.config.json"
+```
+
+If Terraform output access is not available, pass `-RepositoryApiResource` directly.
+
+## Deploy config to CoD4x host
+
+1. Copy `portal-cod4x-plugin.config.json` to the plugin runtime working directory used by CoD4x.
+2. Restrict read access on the file to the game server process account only.
+3. Restart the CoD4x server or reload the plugin.
+
+## Smoke test checklist
+
+1. Startup check:
+- Confirm log line similar to `Portal Plugin is online (version ...)`.
+- Confirm log line `plugin config loaded for gameServerId ...`.
+
+2. API auth and poll check:
+- Confirm no recurring `failed to acquire access token for repository API` errors.
+- Confirm periodic runtime activity every `refreshIntervalSeconds`.
+
+3. Settings merge and enforcement check:
+- Set global `cod4xCommands.enabled=true`, add a command minPower, wait one poll interval.
+- Confirm command reconciliation logs and in-server power change.
+- Add a server override for the same command, wait one poll interval.
+- Confirm server override wins over global.
+
+4. Disabled gate check:
+- Set effective `cod4xCommands.enabled=false`.
+- Confirm log `cod4xCommands enforcement disabled...` and no further command updates are applied.
+
+## Rollback
+
+To stop active enforcement quickly:
+
+1. Set server-level `cod4xCommands.enabled=false` (preferred) or global false.
+2. Wait one poll interval.
+3. Confirm enforcement-disabled log message.
+
+This stops new reconciliations and leaves current in-server command powers unchanged.
+
+## Credential rotation
+
+The plugin app secret rotates in Terraform every 30 days.
+
+Rotation process:
+
+1. Apply `portal-environments` changes.
+2. Regenerate `portal-cod4x-plugin.config.json` with the helper script.
+3. Deploy updated config file to each CoD4x host.
+4. Reload plugin/server and run smoke checks.
+
+If config is not refreshed before expiry, token acquisition will fail and settings refresh will stop.

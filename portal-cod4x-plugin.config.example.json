@@ -1,0 +1,9 @@
+{
+  "tenantId": "00000000-0000-0000-0000-000000000000",
+  "clientId": "00000000-0000-0000-0000-000000000000",
+  "clientSecret": "replace-with-key-vault-secret-value",
+  "repositoryApiBaseUrl": "https://example-apim.azure-api.net/repository",
+  "repositoryApiResource": "api://xtremeidiots-portal-repository-api-prd",
+  "gameServerId": "11111111-2222-3333-4444-555555555555",
+  "refreshIntervalSeconds": 120
+}

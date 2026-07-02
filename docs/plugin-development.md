@@ -10,6 +10,14 @@ The skeleton plugin wires CoD4x exports and sends a startup broadcast on `OnInit
 
 The runtime logic is isolated in `portal_cod4x::InitializePlugin` and `BuildOnlineBroadcastMessage`, which are covered by unit tests.
 
+Phase 2 settings rollout guidance is documented in `docs/plugin-settings-rollout.md`, including config generation and smoke validation.
+
+Local config generation helper:
+
+```pwsh
+./scripts/New-Cod4xPluginConfigFromAzure.ps1 -SharedKeyVaultName <shared-kv-name> -GameServerId <server-guid> -PortalEnvironmentsPath "../portal-environments/terraform"
+```
+
 ## Versioning
 
 `version.json` is the version source for the repository. CMake extracts `major.minor` and stamps compile-time constants used by:
