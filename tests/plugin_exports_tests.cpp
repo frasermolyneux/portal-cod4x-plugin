@@ -69,6 +69,9 @@ int main()
     AssertTrue(info.pluginVersion.major == portal_cod4x::kPluginVersionMajor, "Plugin major version should match generated version metadata.");
     AssertTrue(info.pluginVersion.minor == portal_cod4x::kPluginVersionMinor, "Plugin minor version should match generated version metadata.");
     AssertTrue(std::string(info.fullName).find("portal-cod4x-plugin") != std::string::npos, "Plugin full name should be populated.");
+    AssertTrue(
+        std::string(info.shortDescription).find(std::string(portal_cod4x::kPluginSemanticVersion)) != std::string::npos,
+        "Plugin short description should include the semantic version.");
 
     const int initResult = OnInit();
     AssertTrue(initResult == 0, "OnInit should return success code.");

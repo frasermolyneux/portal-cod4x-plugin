@@ -11,6 +11,14 @@ namespace
 {
 constexpr int kBroadcastSlot = -1;
 
+std::string BuildShortDescription()
+{
+    std::string description = "Portal CoD4x plugin skeleton (v";
+    description += portal_cod4x::kPluginSemanticVersion;
+    description += ')';
+    return description;
+}
+
 void CopyToBuffer(char* destination, std::size_t destinationLength, std::string_view value)
 {
     if (destination == nullptr || destinationLength == 0)
@@ -70,7 +78,8 @@ PCL void COD4X_CALL OnInfoRequest(pluginInfo_t* info)
     info->pluginVersion.minor = portal_cod4x::kPluginVersionMinor;
 
     CopyToBuffer(info->fullName, sizeof(info->fullName), "portal-cod4x-plugin");
-    CopyToBuffer(info->shortDescription, sizeof(info->shortDescription), "Portal CoD4x plugin skeleton");
+    const std::string shortDescription = BuildShortDescription();
+    CopyToBuffer(info->shortDescription, sizeof(info->shortDescription), shortDescription);
     CopyToBuffer(
         info->longDescription,
         sizeof(info->longDescription),
