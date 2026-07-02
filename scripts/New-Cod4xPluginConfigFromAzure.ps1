@@ -75,12 +75,12 @@ if ([string]::IsNullOrWhiteSpace($RepositoryApiResource)) {
 }
 
 $configObject = [ordered]@{
-    tenantId             = $tenantId
-    clientId             = $clientId
-    clientSecret         = $clientSecret
-    repositoryApiBaseUrl = $repositoryApiBaseUrl
-    repositoryApiResource = $RepositoryApiResource
-    gameServerId         = $GameServerId
+    tenantId               = $tenantId
+    clientId               = $clientId
+    clientSecret           = $clientSecret
+    repositoryApiBaseUrl   = $repositoryApiBaseUrl
+    repositoryApiResource  = $RepositoryApiResource
+    gameServerId           = $GameServerId
     refreshIntervalSeconds = $RefreshIntervalSeconds
 }
 
