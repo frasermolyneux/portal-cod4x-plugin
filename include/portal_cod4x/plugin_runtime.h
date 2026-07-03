@@ -14,6 +14,16 @@ struct HttpResponse
     std::string Body;
 };
 
+// Opaque handle representing a single in-flight, non-blocking HTTP request.
+using HttpRequestHandle = void*;
+
+enum class HttpRequestStatus
+{
+    Pending,
+    Completed,
+    Failed
+};
+
 struct PluginConfig
 {
     std::string TenantId;
@@ -48,11 +58,19 @@ public:
     virtual void BroadcastChat(std::string_view message) = 0;
     virtual void Log(std::string_view message) = 0;
     virtual bool ExecuteServerCommand(std::string_view command) = 0;
-    virtual std::optional<HttpResponse> HttpRequest(
+
+    // Non-blocking HTTP: BeginHttpRequest kicks off a request and returns an opaque
+    // handle (nullptr if the request could not be started). PollHttpRequest is called
+    // once per frame to advance the transfer without blocking the main thread, and
+    // EndHttpRequest releases the handle once it is no longer needed.
+    virtual HttpRequestHandle BeginHttpRequest(
         std::string_view url,
         std::string_view method,
         std::string_view body,
         std::string_view additionalHeaders) = 0;
+    virtual HttpRequestStatus PollHttpRequest(HttpRequestHandle handle, HttpResponse& response) = 0;
+    virtual void EndHttpRequest(HttpRequestHandle handle) = 0;
+
     virtual std::int64_t GetUnixTimeSeconds() const = 0;
 };
 
@@ -70,6 +88,14 @@ public:
     [[nodiscard]] const EffectiveServerContext& GetServerContext() const;
 
 private:
+    enum class RefreshStage
+    {
+        Idle,
+        AcquiringToken,
+        FetchingGlobalConfig,
+        FetchingServerConfig
+    };
+
     std::string configPath;
     std::optional<PluginConfig> loadedConfig;
     EffectiveServerContext serverContext;
@@ -80,9 +106,22 @@ private:
     std::string lastAppliedSnapshotHash;
     std::string lastConfigLoadError;
 
+    RefreshStage refreshStage = RefreshStage::Idle;
+    HttpRequestHandle inFlightRequest = nullptr;
+    std::int64_t inFlightStartedUnixSeconds = 0;
+    bool pendingHasGlobalConfig = false;
+    bool pendingHasServerConfig = false;
+    std::string pendingGlobalConfigPayload;
+    std::string pendingServerConfigPayload;
+
     bool TryLoadConfig(ICod4xHost& host, std::int64_t nowUnixSeconds);
-    bool RefreshServerContext(ICod4xHost& host, std::int64_t nowUnixSeconds);
-    bool EnsureAccessToken(ICod4xHost& host, std::int64_t nowUnixSeconds);
+    bool IsAccessTokenValid(std::int64_t nowUnixSeconds) const;
+    void BeginRefresh(ICod4xHost& host, std::int64_t nowUnixSeconds);
+    void AdvanceRefresh(ICod4xHost& host, std::int64_t nowUnixSeconds);
+    void AbortRefresh(ICod4xHost& host, std::int64_t nowUnixSeconds, std::string_view reason);
+    bool StartGlobalConfigRequest(ICod4xHost& host, std::int64_t nowUnixSeconds);
+    bool StartServerConfigRequest(ICod4xHost& host, std::int64_t nowUnixSeconds);
+    void FinalizeRefresh(ICod4xHost& host, std::int64_t nowUnixSeconds);
     bool ApplyCommandReconciliation(ICod4xHost& host);
 };
 

@@ -36,26 +36,55 @@ public:
         return true;
     }
 
-    std::optional<portal_cod4x::HttpResponse> HttpRequest(
+    portal_cod4x::HttpRequestHandle BeginHttpRequest(
         std::string_view url,
         std::string_view method,
         std::string_view,
         std::string_view) override
     {
         const std::string key = std::string(method) + " " + std::string(url);
+        auto* pending = new PendingRequest{};
+
         const auto it = Responses.find(key);
-        if (it == Responses.end())
+        if (it != Responses.end())
         {
-            return std::nullopt;
+            pending->HasResponse = true;
+            pending->Response = it->second;
         }
 
-        return it->second;
+        return static_cast<portal_cod4x::HttpRequestHandle>(pending);
+    }
+
+    portal_cod4x::HttpRequestStatus PollHttpRequest(
+        portal_cod4x::HttpRequestHandle handle,
+        portal_cod4x::HttpResponse& response) override
+    {
+        auto* pending = static_cast<PendingRequest*>(handle);
+        if (pending == nullptr || !pending->HasResponse)
+        {
+            return portal_cod4x::HttpRequestStatus::Failed;
+        }
+
+        response = pending->Response;
+        return portal_cod4x::HttpRequestStatus::Completed;
+    }
+
+    void EndHttpRequest(portal_cod4x::HttpRequestHandle handle) override
+    {
+        delete static_cast<PendingRequest*>(handle);
     }
 
     std::int64_t GetUnixTimeSeconds() const override
     {
         return CurrentTime;
     }
+
+private:
+    struct PendingRequest
+    {
+        bool HasResponse = false;
+        portal_cod4x::HttpResponse Response;
+    };
 };
 
 void Assert(bool condition, const char* message)
@@ -143,9 +172,20 @@ void Runtime_RefreshesSettingsAndReconcilesCommandPower()
     const int initializeResult = runtime.Initialize(host, "1.2.3", "^4[^1XI-BOT^4]^7");
     Assert(initializeResult == 0, "PluginRuntime initialize should succeed");
 
-    runtime.Tick(host);
+    // The refresh pipeline is non-blocking and advances a single step per frame
+    // (token -> global config -> server config -> reconcile), so pump several
+    // frames to drive a refresh to completion. Extra frames past completion are
+    // no-ops until the next refresh interval elapses.
+    const auto pump = [&runtime, &host]() {
+        for (int i = 0; i < 6; ++i)
+        {
+            runtime.Tick(host);
+        }
+    };
 
-    Assert(!host.ExecutedCommands.empty(), "Initial tick should reconcile command powers");
+    pump();
+
+    Assert(!host.ExecutedCommands.empty(), "Initial refresh should reconcile command powers");
 
     bool hasKick70 = false;
     bool hasAdminListCommands65 = false;
@@ -168,8 +208,8 @@ void Runtime_RefreshesSettingsAndReconcilesCommandPower()
     const std::size_t firstApplyCount = host.ExecutedCommands.size();
 
     host.CurrentTime = 1100;
-    runtime.Tick(host);
-    Assert(host.ExecutedCommands.size() == firstApplyCount, "Tick before interval should not perform another reconciliation");
+    pump();
+    Assert(host.ExecutedCommands.size() == firstApplyCount, "Refresh before interval should not perform another reconciliation");
 
     const std::string changedServerPayload =
         "{\"schemaVersion\":1,\"commands\":{\"kick\":{\"minPower\":80},\"cmdpowerlist\":{\"minPower\":65}}}";
@@ -178,7 +218,7 @@ void Runtime_RefreshesSettingsAndReconcilesCommandPower()
         "{\"namespace\":\"cod4xCommands\",\"configuration\":\"" + EscapeJsonString(changedServerPayload) + "\"}"};
 
     host.CurrentTime = 1121;
-    runtime.Tick(host);
+    pump();
 
     bool hasKick80 = false;
     for (const auto& command : host.ExecutedCommands)
@@ -199,7 +239,7 @@ void Runtime_RefreshesSettingsAndReconcilesCommandPower()
         "{\"namespace\":\"cod4xCommands\",\"configuration\":\"" + EscapeJsonString(disabledServerPayload) + "\"}"};
 
     host.CurrentTime = 1245;
-    runtime.Tick(host);
+    pump();
     Assert(
         host.ExecutedCommands.size() == secondApplyCount,
         "When cod4xCommands enforcement is disabled, runtime should stop enforcing and keep existing command powers");

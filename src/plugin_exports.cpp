@@ -57,7 +57,7 @@ public:
         return true;
     }
 
-    std::optional<portal_cod4x::HttpResponse> HttpRequest(
+    portal_cod4x::HttpRequestHandle BeginHttpRequest(
         std::string_view url,
         std::string_view method,
         std::string_view body,
@@ -66,19 +66,40 @@ public:
         std::string payloadBody(body);
         std::string payloadHeaders(additionalHeaders);
 
-        ftRequest_t* request = Plugin_HTTP_Request(
+        ftRequest_t* request = Plugin_HTTP_MakeHttpRequest(
             std::string(url).c_str(),
             std::string(method).c_str(),
             payloadBody.empty() ? nullptr : reinterpret_cast<byte*>(payloadBody.data()),
             static_cast<int>(payloadBody.size()),
             payloadHeaders.empty() ? nullptr : payloadHeaders.c_str());
 
+        // Plugin_HTTP_MakeHttpRequest copies the payload into the request object before
+        // returning, so the local body/header buffers do not need to outlive this call.
+        return static_cast<portal_cod4x::HttpRequestHandle>(request);
+    }
+
+    portal_cod4x::HttpRequestStatus PollHttpRequest(
+        portal_cod4x::HttpRequestHandle handle,
+        portal_cod4x::HttpResponse& response) override
+    {
+        auto* request = static_cast<ftRequest_t*>(handle);
         if (request == nullptr)
         {
-            return std::nullopt;
+            return portal_cod4x::HttpRequestStatus::Failed;
         }
 
-        portal_cod4x::HttpResponse response;
+        const int transferResult = Plugin_HTTP_SendReceiveData(request);
+        if (transferResult == 0)
+        {
+            return portal_cod4x::HttpRequestStatus::Pending;
+        }
+
+        if (transferResult < 0)
+        {
+            return portal_cod4x::HttpRequestStatus::Failed;
+        }
+
+        response = portal_cod4x::HttpResponse{};
         response.StatusCode = request->code;
 
         if (request->extrecvmsg != nullptr && request->extrecvmsg->data != nullptr)
@@ -99,8 +120,16 @@ public:
             }
         }
 
-        Plugin_HTTP_FreeObj(request);
-        return response;
+        return portal_cod4x::HttpRequestStatus::Completed;
+    }
+
+    void EndHttpRequest(portal_cod4x::HttpRequestHandle handle) override
+    {
+        auto* request = static_cast<ftRequest_t*>(handle);
+        if (request != nullptr)
+        {
+            Plugin_HTTP_FreeObj(request);
+        }
     }
 
     std::int64_t GetUnixTimeSeconds() const override

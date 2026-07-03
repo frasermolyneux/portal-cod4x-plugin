@@ -59,7 +59,7 @@ extern "C" void COD4X_CALL Plugin_Cbuf_AddText(const char* text)
     g_commands.emplace_back(text == nullptr ? "" : text);
 }
 
-extern "C" ftRequest_t* COD4X_CALL Plugin_HTTP_Request(
+extern "C" ftRequest_t* COD4X_CALL Plugin_HTTP_MakeHttpRequest(
     const char*,
     const char*,
     byte*,
@@ -67,6 +67,11 @@ extern "C" ftRequest_t* COD4X_CALL Plugin_HTTP_Request(
     const char*)
 {
     return nullptr;
+}
+
+extern "C" int COD4X_CALL Plugin_HTTP_SendReceiveData(ftRequest_t*)
+{
+    return -1;
 }
 
 extern "C" void COD4X_CALL Plugin_HTTP_FreeObj(ftRequest_t*)

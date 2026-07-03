@@ -79,12 +79,13 @@ typedef struct
 extern "C" void COD4X_CALL Plugin_Printf(const char* fmt, ...);
 extern "C" void COD4X_CALL Plugin_ChatPrintf(int slot, const char* fmt, ...);
 extern "C" void COD4X_CALL Plugin_Cbuf_AddText(const char* text);
-extern "C" ftRequest_t* COD4X_CALL Plugin_HTTP_Request(
+extern "C" ftRequest_t* COD4X_CALL Plugin_HTTP_MakeHttpRequest(
     const char* url,
     const char* method,
     byte* requestpayload,
     int payloadlen,
     const char* additionalheaderlines);
+extern "C" int COD4X_CALL Plugin_HTTP_SendReceiveData(ftRequest_t* request);
 extern "C" void COD4X_CALL Plugin_HTTP_FreeObj(ftRequest_t* request);
 
 #endif

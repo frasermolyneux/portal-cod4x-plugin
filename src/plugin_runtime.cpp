@@ -13,6 +13,11 @@ namespace portal_cod4x
 {
 namespace
 {
+// Maximum wall-clock time a single in-flight HTTP request may stay pending before
+// the refresh pipeline abandons it (and frees the handle) to avoid a stalled poll
+// wedging future refreshes.
+constexpr std::int64_t kHttpRequestDeadlineSeconds = 30;
+
 struct CommandOverride
 {
     std::optional<bool> Enabled;
@@ -513,19 +518,21 @@ void PluginRuntime::Tick(ICod4xHost& host)
         }
     }
 
+    // A refresh is a multi-step, non-blocking pipeline (token -> global config ->
+    // server config -> reconcile). While one is in flight, advance it by a single
+    // step per frame so the main thread is never blocked on network I/O.
+    if (refreshStage != RefreshStage::Idle)
+    {
+        AdvanceRefresh(host, nowUnixSeconds);
+        return;
+    }
+
     if (nowUnixSeconds < nextRefreshUnixSeconds)
     {
         return;
     }
 
-    if (RefreshServerContext(host, nowUnixSeconds))
-    {
-        nextRefreshUnixSeconds = nowUnixSeconds + loadedConfig->RefreshIntervalSeconds;
-    }
-    else
-    {
-        nextRefreshUnixSeconds = nowUnixSeconds + 30;
-    }
+    BeginRefresh(host, nowUnixSeconds);
 }
 
 const EffectiveServerContext& PluginRuntime::GetServerContext() const
@@ -567,16 +574,27 @@ bool PluginRuntime::TryLoadConfig(ICod4xHost& host, std::int64_t nowUnixSeconds)
     return true;
 }
 
-bool PluginRuntime::EnsureAccessToken(ICod4xHost& host, std::int64_t nowUnixSeconds)
+bool PluginRuntime::IsAccessTokenValid(std::int64_t nowUnixSeconds) const
 {
-    if (!loadedConfig.has_value())
-    {
-        return false;
-    }
+    return !accessToken.empty() && nowUnixSeconds + 30 < accessTokenExpiresAtUnixSeconds;
+}
 
-    if (!accessToken.empty() && nowUnixSeconds + 30 < accessTokenExpiresAtUnixSeconds)
+void PluginRuntime::BeginRefresh(ICod4xHost& host, std::int64_t nowUnixSeconds)
+{
+    pendingHasGlobalConfig = false;
+    pendingHasServerConfig = false;
+    pendingGlobalConfigPayload.clear();
+    pendingServerConfigPayload.clear();
+
+    // Reuse a still-valid access token and skip straight to the config requests.
+    if (IsAccessTokenValid(nowUnixSeconds))
     {
-        return true;
+        if (!StartGlobalConfigRequest(host, nowUnixSeconds))
+        {
+            AbortRefresh(host, nowUnixSeconds, "failed to start global cod4xCommands request");
+        }
+
+        return;
     }
 
     const std::string tokenUrl = "https://login.microsoftonline.com/" + loadedConfig->TenantId + "/oauth2/v2.0/token";
@@ -584,105 +602,219 @@ bool PluginRuntime::EnsureAccessToken(ICod4xHost& host, std::int64_t nowUnixSeco
         "&client_secret=" + UrlEncode(loadedConfig->ClientSecret) +
         "&scope=" + UrlEncode(loadedConfig->RepositoryApiResource + "/.default");
 
-    const auto response = host.HttpRequest(
+    inFlightRequest = host.BeginHttpRequest(
         tokenUrl,
         "POST",
         tokenBody,
         "Content-Type: application/x-www-form-urlencoded\r\nAccept: application/json\r\n");
 
-    if (!response.has_value() || response->StatusCode != 200)
+    if (inFlightRequest == nullptr)
     {
-        host.Log("failed to acquire access token for repository API");
+        AbortRefresh(host, nowUnixSeconds, "failed to start access token request");
+        return;
+    }
+
+    inFlightStartedUnixSeconds = nowUnixSeconds;
+    refreshStage = RefreshStage::AcquiringToken;
+}
+
+bool PluginRuntime::StartGlobalConfigRequest(ICod4xHost& host, std::int64_t nowUnixSeconds)
+{
+    const std::string authHeaders = BuildAuthorizationHeaders(accessToken);
+    const std::string globalUrl = loadedConfig->RepositoryApiBaseUrl + "/v1.0/configurations/cod4xCommands";
+
+    inFlightRequest = host.BeginHttpRequest(globalUrl, "GET", "", authHeaders);
+    if (inFlightRequest == nullptr)
+    {
         return false;
     }
 
-    const auto parsedAccessToken = ExtractJsonStringValue(response->Body, "access_token");
-    if (!parsedAccessToken.has_value() || parsedAccessToken->empty())
-    {
-        host.Log("token response missing access_token");
-        return false;
-    }
-
-    const int expiresInSeconds = ExtractJsonIntValue(response->Body, "expires_in").value_or(3600);
-
-    accessToken = *parsedAccessToken;
-    accessTokenExpiresAtUnixSeconds = nowUnixSeconds + std::max(0, expiresInSeconds - 30);
+    inFlightStartedUnixSeconds = nowUnixSeconds;
+    refreshStage = RefreshStage::FetchingGlobalConfig;
     return true;
 }
 
-bool PluginRuntime::RefreshServerContext(ICod4xHost& host, std::int64_t nowUnixSeconds)
+bool PluginRuntime::StartServerConfigRequest(ICod4xHost& host, std::int64_t nowUnixSeconds)
 {
-    if (!EnsureAccessToken(host, nowUnixSeconds))
+    const std::string authHeaders = BuildAuthorizationHeaders(accessToken);
+    const std::string serverUrl =
+        loadedConfig->RepositoryApiBaseUrl + "/v1.0/game-servers/" + loadedConfig->GameServerId + "/configurations/cod4xCommands";
+
+    inFlightRequest = host.BeginHttpRequest(serverUrl, "GET", "", authHeaders);
+    if (inFlightRequest == nullptr)
     {
         return false;
     }
 
-    const std::string authHeaders = BuildAuthorizationHeaders(accessToken);
-    const std::string globalUrl = loadedConfig->RepositoryApiBaseUrl + "/v1.0/configurations/cod4xCommands";
-    const std::string serverUrl =
-        loadedConfig->RepositoryApiBaseUrl + "/v1.0/game-servers/" + loadedConfig->GameServerId + "/configurations/cod4xCommands";
+    inFlightStartedUnixSeconds = nowUnixSeconds;
+    refreshStage = RefreshStage::FetchingServerConfig;
+    return true;
+}
 
+void PluginRuntime::AdvanceRefresh(ICod4xHost& host, std::int64_t nowUnixSeconds)
+{
+    if (inFlightRequest == nullptr)
+    {
+        refreshStage = RefreshStage::Idle;
+        return;
+    }
+
+    HttpResponse response;
+    const HttpRequestStatus status = host.PollHttpRequest(inFlightRequest, response);
+    if (status == HttpRequestStatus::Pending)
+    {
+        if (nowUnixSeconds - inFlightStartedUnixSeconds >= kHttpRequestDeadlineSeconds)
+        {
+            AbortRefresh(host, nowUnixSeconds, "cod4xCommands settings request timed out");
+        }
+
+        return;
+    }
+
+    host.EndHttpRequest(inFlightRequest);
+    inFlightRequest = nullptr;
+
+    if (status == HttpRequestStatus::Failed)
+    {
+        AbortRefresh(host, nowUnixSeconds, "cod4xCommands settings request failed");
+        return;
+    }
+
+    switch (refreshStage)
+    {
+        case RefreshStage::AcquiringToken:
+        {
+            if (response.StatusCode != 200)
+            {
+                AbortRefresh(host, nowUnixSeconds, "failed to acquire access token for repository API");
+                return;
+            }
+
+            const auto parsedAccessToken = ExtractJsonStringValue(response.Body, "access_token");
+            if (!parsedAccessToken.has_value() || parsedAccessToken->empty())
+            {
+                AbortRefresh(host, nowUnixSeconds, "token response missing access_token");
+                return;
+            }
+
+            const int expiresInSeconds = ExtractJsonIntValue(response.Body, "expires_in").value_or(3600);
+            accessToken = *parsedAccessToken;
+            accessTokenExpiresAtUnixSeconds = nowUnixSeconds + std::max(0, expiresInSeconds - 30);
+
+            if (!StartGlobalConfigRequest(host, nowUnixSeconds))
+            {
+                AbortRefresh(host, nowUnixSeconds, "failed to start global cod4xCommands request");
+            }
+
+            break;
+        }
+        case RefreshStage::FetchingGlobalConfig:
+        {
+            if (response.StatusCode != 200 && response.StatusCode != 404)
+            {
+                AbortRefresh(host, nowUnixSeconds, "failed to retrieve global cod4xCommands settings");
+                return;
+            }
+
+            if (response.StatusCode == 200)
+            {
+                const auto payload = ExtractConfigurationPayload(response.Body);
+                if (!payload.has_value())
+                {
+                    AbortRefresh(host, nowUnixSeconds, "global cod4xCommands payload missing configuration");
+                    return;
+                }
+
+                pendingGlobalConfigPayload = *payload;
+                pendingHasGlobalConfig = true;
+            }
+
+            if (!StartServerConfigRequest(host, nowUnixSeconds))
+            {
+                AbortRefresh(host, nowUnixSeconds, "failed to start server cod4xCommands request");
+            }
+
+            break;
+        }
+        case RefreshStage::FetchingServerConfig:
+        {
+            if (response.StatusCode != 200 && response.StatusCode != 404)
+            {
+                AbortRefresh(host, nowUnixSeconds, "failed to retrieve server cod4xCommands settings");
+                return;
+            }
+
+            if (response.StatusCode == 200)
+            {
+                const auto payload = ExtractConfigurationPayload(response.Body);
+                if (!payload.has_value())
+                {
+                    AbortRefresh(host, nowUnixSeconds, "server cod4xCommands payload missing configuration");
+                    return;
+                }
+
+                pendingServerConfigPayload = *payload;
+                pendingHasServerConfig = true;
+            }
+
+            FinalizeRefresh(host, nowUnixSeconds);
+            break;
+        }
+        case RefreshStage::Idle:
+        default:
+            refreshStage = RefreshStage::Idle;
+            break;
+    }
+}
+
+void PluginRuntime::AbortRefresh(ICod4xHost& host, std::int64_t nowUnixSeconds, std::string_view reason)
+{
+    if (!reason.empty())
+    {
+        host.Log(std::string(reason));
+    }
+
+    if (inFlightRequest != nullptr)
+    {
+        host.EndHttpRequest(inFlightRequest);
+        inFlightRequest = nullptr;
+    }
+
+    refreshStage = RefreshStage::Idle;
+    nextRefreshUnixSeconds = nowUnixSeconds + 30;
+}
+
+void PluginRuntime::FinalizeRefresh(ICod4xHost& host, std::int64_t nowUnixSeconds)
+{
     Cod4xCommandDocument globalDoc;
     Cod4xCommandDocument serverDoc;
     bool hasGlobalDoc = false;
     bool hasServerDoc = false;
 
+    if (pendingHasGlobalConfig)
     {
-        const auto response = host.HttpRequest(globalUrl, "GET", "", authHeaders);
-        if (!response.has_value() || (response->StatusCode != 200 && response->StatusCode != 404))
+        const auto parsed = ParseCod4xCommandDocument(pendingGlobalConfigPayload);
+        if (!parsed.has_value())
         {
-            host.Log("failed to retrieve global cod4xCommands settings");
-            return false;
+            AbortRefresh(host, nowUnixSeconds, "global cod4xCommands payload parse failed");
+            return;
         }
 
-        if (response->StatusCode == 200)
-        {
-            const auto payload = ExtractConfigurationPayload(response->Body);
-            if (!payload.has_value())
-            {
-                host.Log("global cod4xCommands payload missing configuration");
-                return false;
-            }
-
-            const auto parsed = ParseCod4xCommandDocument(*payload);
-            if (!parsed.has_value())
-            {
-                host.Log("global cod4xCommands payload parse failed");
-                return false;
-            }
-
-            globalDoc = *parsed;
-            hasGlobalDoc = true;
-        }
+        globalDoc = *parsed;
+        hasGlobalDoc = true;
     }
 
+    if (pendingHasServerConfig)
     {
-        const auto response = host.HttpRequest(serverUrl, "GET", "", authHeaders);
-        if (!response.has_value() || (response->StatusCode != 200 && response->StatusCode != 404))
+        const auto parsed = ParseCod4xCommandDocument(pendingServerConfigPayload);
+        if (!parsed.has_value())
         {
-            host.Log("failed to retrieve server cod4xCommands settings");
-            return false;
+            AbortRefresh(host, nowUnixSeconds, "server cod4xCommands payload parse failed");
+            return;
         }
 
-        if (response->StatusCode == 200)
-        {
-            const auto payload = ExtractConfigurationPayload(response->Body);
-            if (!payload.has_value())
-            {
-                host.Log("server cod4xCommands payload missing configuration");
-                return false;
-            }
-
-            const auto parsed = ParseCod4xCommandDocument(*payload);
-            if (!parsed.has_value())
-            {
-                host.Log("server cod4xCommands payload parse failed");
-                return false;
-            }
-
-            serverDoc = *parsed;
-            hasServerDoc = true;
-        }
+        serverDoc = *parsed;
+        hasServerDoc = true;
     }
 
     EffectiveServerContext nextContext;
@@ -748,18 +880,25 @@ bool PluginRuntime::RefreshServerContext(ICod4xHost& host, std::int64_t nowUnixS
     const bool wasEnforced = serverContext.CommandEnforcementEnabled;
     serverContext = std::move(nextContext);
 
+    refreshStage = RefreshStage::Idle;
+
     if (!serverContext.CommandEnforcementEnabled)
     {
         host.Log("cod4xCommands enforcement disabled for current server context; command powers left unchanged");
-        return true;
+        nextRefreshUnixSeconds = nowUnixSeconds + loadedConfig->RefreshIntervalSeconds;
+        return;
     }
 
     if (serverContext.SnapshotHash == lastAppliedSnapshotHash && wasEnforced)
     {
-        return true;
+        nextRefreshUnixSeconds = nowUnixSeconds + loadedConfig->RefreshIntervalSeconds;
+        return;
     }
 
-    return ApplyCommandReconciliation(host);
+    const bool applied = ApplyCommandReconciliation(host);
+    nextRefreshUnixSeconds = applied
+        ? nowUnixSeconds + loadedConfig->RefreshIntervalSeconds
+        : nowUnixSeconds + 30;
 }
 
 bool PluginRuntime::ApplyCommandReconciliation(ICod4xHost& host)

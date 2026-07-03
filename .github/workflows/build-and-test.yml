@@ -175,7 +175,8 @@ jobs:
               "    Plugin_Printf",
               "    Plugin_ChatPrintf",
               "    Plugin_Cbuf_AddText",
-              "    Plugin_HTTP_Request",
+              "    Plugin_HTTP_MakeHttpRequest",
+              "    Plugin_HTTP_SendReceiveData",
               "    Plugin_HTTP_FreeObj"
             ) | Set-Content -Path $defPath -Encoding ascii
 
