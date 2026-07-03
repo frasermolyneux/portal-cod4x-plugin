@@ -173,7 +173,10 @@ jobs:
               "LIBRARY $hostModuleName",
               "EXPORTS",
               "    Plugin_Printf",
-              "    Plugin_ChatPrintf"
+              "    Plugin_ChatPrintf",
+              "    Plugin_Cbuf_AddText",
+              "    Plugin_HTTP_Request",
+              "    Plugin_HTTP_FreeObj"
             ) | Set-Content -Path $defPath -Encoding ascii
 
             $generatedImportLib = Join-Path $generatedSdkPath "com_plugin.lib"
