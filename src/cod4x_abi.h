@@ -61,19 +61,105 @@ typedef struct
 
 typedef unsigned char byte;
 
+typedef enum
+{
+    qfalse,
+    qtrue
+} qboolean;
+
+constexpr int kMaxStringChars = 1024;
+
+typedef enum
+{
+    NA_BAD = 0,
+    NA_BOT = 0,
+    NA_LOOPBACK = 2,
+    NA_BROADCAST = 3,
+    NA_IP = 4,
+    NA_IP6 = 5,
+    NA_TCP = 6,
+    NA_TCP6 = 7,
+    NA_MULTICAST6 = 8,
+    NA_UNSPEC = 9,
+    NA_DOWN = 10,
+} netadrtype_t;
+
 typedef struct
 {
+    qboolean overflowed;
+    qboolean readonly;
     byte* data;
+    byte* splitData;
+    int maxsize;
     int cursize;
+    int splitSize;
+    int readcount;
+    int bit;
+    int lastRefEntity;
 } msg_t;
 
 typedef struct
 {
+    netadrtype_t type;
+    int scope_id;
+    unsigned short port;
+    unsigned short pad;
+    int sock;
+    union
+    {
+        byte ip[4];
+        byte ipx[10];
+        byte ip6[16];
+    } address;
+} netadr_t;
+
+typedef enum
+{
+    FT_PROTO_HTTP,
+    FT_PROTO_HTTPS,
+    FT_PROTO_FTP
+} ftprotocols_t;
+
+typedef struct
+{
+    qboolean lock;
+    qboolean active;
+    qboolean transferactive;
+    int transferStartTime;
+    int socket;
+    int transfersocket;
+    int sentBytes;
+    int finallen;
+    int totalreceivedbytes;
+    int transfertotalreceivedbytes;
+    msg_t* extrecvmsg;
+    msg_t* extsendmsg;
+    msg_t sendmsg;
+    msg_t recvmsg;
+    msg_t transfermsg;
+    qboolean complete;
     int code;
+    int version;
+    char status[32];
+    char url[kMaxStringChars];
+    char address[kMaxStringChars];
+    char username[256];
+    char password[256];
+    char contentType[64];
+    char cookie[kMaxStringChars];
+    int mode;
     int headerLength;
     int contentLength;
     int contentLengthArrived;
-    msg_t* extrecvmsg;
+    int currentChunkLength;
+    int currentChunkReadOffset;
+    int chunkedEncoding;
+    int startTime;
+    int stage;
+    ftprotocols_t protocol;
+    netadr_t remote;
+    qboolean socketReady;
+    void* tls;
 } ftRequest_t;
 
 extern "C" void COD4X_CALL Plugin_Printf(const char* fmt, ...);
