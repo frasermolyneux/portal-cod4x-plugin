@@ -7,6 +7,7 @@ Plugin_Cbuf_AddText
 Plugin_GetSlotCount
 Plugin_GetPlayerName
 Plugin_GetPlayerID
+Plugin_GetPlayerSteamID
 Plugin_GetClientNumForClient
 Plugin_GetClientScoreboard
 Plugin_NET_AdrToStringShortMT
