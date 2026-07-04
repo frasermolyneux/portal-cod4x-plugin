@@ -37,6 +37,13 @@ constexpr std::string_view kQueueChatMessage = "chat-message";
 constexpr std::string_view kQueueServerConnected = "server-connected";
 constexpr std::string_view kQueueMapChange = "map-change";
 constexpr std::string_view kQueueServerStatus = "server-status";
+constexpr std::int64_t kCrossCallbackDedupWindowSeconds = 1;
+constexpr std::string_view kCommandsCommandPrefix = "!commands";
+constexpr std::string_view kWhoAmICommandPrefix = "!whoami";
+constexpr std::string_view kRegisterCommandPrefix = "!register";
+constexpr std::string_view kFuCommandPrefix = "!fu";
+constexpr std::string_view kLikeCommandPrefix = "!like";
+constexpr std::string_view kDislikeCommandPrefix = "!dislike";
 
 struct CommandOverride
 {
@@ -509,6 +516,43 @@ bool IsSafeCommandIdentifier(std::string_view command)
 
     return true;
 }
+
+bool EqualsIgnoreCase(std::string_view left, std::string_view right)
+{
+    if (left.size() != right.size())
+    {
+        return false;
+    }
+
+    for (std::size_t index = 0; index < left.size(); ++index)
+    {
+        const auto leftChar = static_cast<unsigned char>(left[index]);
+        const auto rightChar = static_cast<unsigned char>(right[index]);
+        if (std::tolower(leftChar) != std::tolower(rightChar))
+        {
+            return false;
+        }
+    }
+
+    return true;
+}
+
+std::string ExtractCommandToken(std::string_view command)
+{
+    const std::string trimmed = Trim(std::string(command));
+    if (trimmed.empty())
+    {
+        return {};
+    }
+
+    const std::size_t tokenEnd = trimmed.find_first_of(" \t\r\n");
+    if (tokenEnd == std::string::npos)
+    {
+        return trimmed;
+    }
+
+    return trimmed.substr(0, tokenEnd);
+}
 }
 
 std::string BuildOnlineBroadcastMessage(std::string_view prefix, std::string_view version)
@@ -524,10 +568,36 @@ PluginRuntime::PluginRuntime(std::string configPath)
 {
 }
 
+std::string PluginRuntime::BuildPrefixedChatMessage(std::string_view message) const
+{
+    if (chatPrefix.empty())
+    {
+        return std::string(message);
+    }
+
+    std::string rendered;
+    rendered.reserve(chatPrefix.size() + 1 + message.size());
+    rendered += chatPrefix;
+    rendered.push_back(' ');
+    rendered.append(message.data(), message.size());
+    return rendered;
+}
+
+void PluginRuntime::SendPrivateChat(ICod4xHost& host, int slot, std::string_view message) const
+{
+    if (slot < 0)
+    {
+        return;
+    }
+
+    host.SendChat(slot, BuildPrefixedChatMessage(message));
+}
+
 int PluginRuntime::Initialize(ICod4xHost& host, std::string_view version, std::string_view prefix)
 {
     const std::string onlineMessage = BuildOnlineBroadcastMessage(prefix, version);
     const std::string normalizedVersion = version.empty() ? "0.0.0-unknown" : std::string(version);
+    chatPrefix = prefix.empty() ? std::string(kDefaultBotPrefix) : std::string(prefix);
     pluginVersion = normalizedVersion;
 
     host.Log("Portal Plugin is online (version " + normalizedVersion + ")");
@@ -725,13 +795,23 @@ void PluginRuntime::HandlePlayerDisconnected(ICod4xHost& host, int slot)
 
 void PluginRuntime::HandleChatMessage(ICod4xHost& host, int slot, std::string_view message, bool teamMessage)
 {
-    if (!loadedConfig.has_value() || !IsIngestConfigured() || slot < 0)
+    if (slot < 0)
     {
         return;
     }
 
     const std::string trimmedMessage = Trim(std::string(message));
     if (trimmedMessage.empty())
+    {
+        return;
+    }
+
+    if (trimmedMessage.front() == '!')
+    {
+        HandleClientCommand(host, slot, trimmedMessage, true);
+    }
+
+    if (!loadedConfig.has_value() || !IsIngestConfigured())
     {
         return;
     }
@@ -776,6 +856,81 @@ void PluginRuntime::HandleChatMessage(ICod4xHost& host, int slot, std::string_vi
             teamMessage),
         messageId,
         nowUnixSeconds);
+}
+
+void PluginRuntime::HandleClientCommand(ICod4xHost& host, int slot, std::string_view command, bool fromChatMessage)
+{
+    if (slot < 0)
+    {
+        return;
+    }
+
+    const std::string commandToken = ExtractCommandToken(command);
+    if (commandToken.empty() || commandToken.front() != '!')
+    {
+        return;
+    }
+
+    const std::int64_t nowUnixSeconds = host.GetUnixTimeSeconds();
+    const bool withinCrossCallbackDedupWindow =
+        nowUnixSeconds >= lastHandledCommandUnixSeconds &&
+        (nowUnixSeconds - lastHandledCommandUnixSeconds) <= kCrossCallbackDedupWindowSeconds;
+
+    if (lastHandledCommandSlot == slot &&
+        withinCrossCallbackDedupWindow &&
+        lastHandledCommandFromChat != fromChatMessage &&
+        EqualsIgnoreCase(lastHandledCommandToken, commandToken))
+    {
+        return;
+    }
+
+    const auto markHandled = [&]() {
+        lastHandledCommandToken = commandToken;
+        lastHandledCommandSlot = slot;
+        lastHandledCommandUnixSeconds = nowUnixSeconds;
+        lastHandledCommandFromChat = fromChatMessage;
+    };
+
+    if (EqualsIgnoreCase(commandToken, kCommandsCommandPrefix))
+    {
+        markHandled();
+        SendPrivateChat(host, slot, "Available commands: !commands, !whoami, !register, !fu, !like, !dislike");
+        return;
+    }
+
+    if (EqualsIgnoreCase(commandToken, kWhoAmICommandPrefix))
+    {
+        markHandled();
+        SendPrivateChat(host, slot, "Plugin command processing active.");
+        return;
+    }
+
+    if (EqualsIgnoreCase(commandToken, kRegisterCommandPrefix))
+    {
+        markHandled();
+        SendPrivateChat(host, slot, "!register is not available from the plugin path yet.");
+        return;
+    }
+
+    if (EqualsIgnoreCase(commandToken, kFuCommandPrefix))
+    {
+        markHandled();
+        SendPrivateChat(host, slot, "!fu is handled by backend services only.");
+        return;
+    }
+
+    if (EqualsIgnoreCase(commandToken, kLikeCommandPrefix))
+    {
+        markHandled();
+        SendPrivateChat(host, slot, "Map vote registered: like.");
+        return;
+    }
+
+    if (EqualsIgnoreCase(commandToken, kDislikeCommandPrefix))
+    {
+        markHandled();
+        SendPrivateChat(host, slot, "Map vote registered: dislike.");
+    }
 }
 
 void PluginRuntime::HandleServerSpawned(ICod4xHost& host)
@@ -2008,6 +2163,11 @@ void NotifyPlayerDisconnected(ICod4xHost& host, int slot)
 void NotifyChatMessage(ICod4xHost& host, int slot, std::string_view message, bool teamMessage)
 {
     g_runtime.HandleChatMessage(host, slot, message, teamMessage);
+}
+
+void NotifyClientCommand(ICod4xHost& host, int slot, std::string_view command)
+{
+    g_runtime.HandleClientCommand(host, slot, command);
 }
 
 void NotifyServerSpawned(ICod4xHost& host)

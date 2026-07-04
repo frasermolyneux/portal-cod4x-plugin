@@ -14,6 +14,12 @@ namespace
 class FakeHost final : public portal_cod4x::ICod4xHost
 {
 public:
+    struct PrivateChatMessage
+    {
+        int Slot;
+        std::string Message;
+    };
+
     struct RequestRecord
     {
         std::string Method;
@@ -23,6 +29,7 @@ public:
     };
 
     std::vector<std::string> BroadcastMessages;
+    std::vector<PrivateChatMessage> PrivateMessages;
     std::vector<std::string> Logs;
     std::vector<std::string> ExecutedCommands;
     std::vector<RequestRecord> Requests;
@@ -36,6 +43,11 @@ public:
     void BroadcastChat(std::string_view message) override
     {
         BroadcastMessages.emplace_back(message);
+    }
+
+    void SendChat(int slot, std::string_view message) override
+    {
+        PrivateMessages.push_back(PrivateChatMessage{slot, std::string(message)});
     }
 
     void Log(std::string_view message) override
@@ -500,6 +512,75 @@ void Runtime_DropsPoisonEventsAndUnblocksOtherQueues()
     std::filesystem::remove(configPath, ignoreError);
 }
 
+void Runtime_HandleClientCommand_SendsPrivateResponse()
+{
+    FakeHost host;
+    portal_cod4x::PluginRuntime runtime;
+
+    const int initializeResult = runtime.Initialize(host, "1.2.3", "^4[^1XI-BOT^4]^7");
+    Assert(initializeResult == 0, "PluginRuntime initialize should succeed");
+
+    runtime.HandleClientCommand(host, 4, "!commands");
+
+    Assert(host.PrivateMessages.size() == 1, "Expected one private command response");
+    Assert(host.PrivateMessages.front().Slot == 4, "Private command response should target requesting slot");
+    Assert(
+        host.PrivateMessages.front().Message.find("Available commands") != std::string::npos,
+        "Expected !commands response payload");
+}
+
+void Runtime_HandleChatMessage_AlsoExecutesCommandPath()
+{
+    FakeHost host;
+    portal_cod4x::PluginRuntime runtime;
+
+    const int initializeResult = runtime.Initialize(host, "1.2.3", "^4[^1XI-BOT^4]^7");
+    Assert(initializeResult == 0, "PluginRuntime initialize should succeed");
+
+    runtime.HandleChatMessage(host, 5, "!whoami", false);
+
+    Assert(host.PrivateMessages.size() == 1, "Expected command path to execute from chat message");
+    Assert(host.PrivateMessages.front().Slot == 5, "Command response should target original chat slot");
+    Assert(
+        host.PrivateMessages.front().Message.find("Plugin command processing active") != std::string::npos,
+        "Expected !whoami command response payload");
+}
+
+void Runtime_HandleClientCommand_DoesNotPrefixMatchLongerToken()
+{
+    FakeHost host;
+    portal_cod4x::PluginRuntime runtime;
+
+    host.CurrentTime = 42;
+    const int initializeResult = runtime.Initialize(host, "1.2.3", "^4[^1XI-BOT^4]^7");
+    Assert(initializeResult == 0, "PluginRuntime initialize should succeed");
+
+    runtime.HandleClientCommand(host, 2, "!commandsfoo");
+
+    Assert(host.PrivateMessages.empty(), "Unexpected prefix overmatch for non-command token");
+}
+
+void Runtime_HandleClientCommand_DedupesCrossCallbackPath()
+{
+    FakeHost host;
+    portal_cod4x::PluginRuntime runtime;
+
+    host.CurrentTime = 99;
+    const int initializeResult = runtime.Initialize(host, "1.2.3", "^4[^1XI-BOT^4]^7");
+    Assert(initializeResult == 0, "PluginRuntime initialize should succeed");
+
+    runtime.HandleChatMessage(host, 3, "!commands", false);
+    host.CurrentTime = 100;
+    runtime.HandleClientCommand(host, 3, "!commands");
+
+    Assert(host.PrivateMessages.size() == 1, "Cross-callback duplicate command response should be suppressed");
+
+    host.CurrentTime = 101;
+    runtime.HandleClientCommand(host, 3, "!commands");
+
+    Assert(host.PrivateMessages.size() == 2, "Later command should be handled outside cross-callback dedupe window");
+}
+
 void InitializePlugin_EmitsLogAndBroadcast()
 {
     FakeHost host;
@@ -539,6 +620,10 @@ int main()
     Runtime_EmitsAndFlushesPlayerConnectedEvent();
     Runtime_AuthorizedIdentity_AllowsDisconnectEventWhenPlayerIdUnavailableAtDisconnect();
     Runtime_DropsPoisonEventsAndUnblocksOtherQueues();
+    Runtime_HandleClientCommand_SendsPrivateResponse();
+    Runtime_HandleChatMessage_AlsoExecutesCommandPath();
+    Runtime_HandleClientCommand_DoesNotPrefixMatchLongerToken();
+    Runtime_HandleClientCommand_DedupesCrossCallbackPath();
     InitializePlugin_EmitsLogAndBroadcast();
     InitializePlugin_FallsBackWhenPrefixOrVersionMissing();
 

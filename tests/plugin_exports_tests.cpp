@@ -153,6 +153,7 @@ extern "C"
 int OnInit();
 void OnFrame();
 void OnClientAuthorized();
+void OnClientCommand(client_t* client, const char* command);
 void OnMessageSent(char* message, int slot, qboolean* show, int mode);
 void OnSpawnServer();
 void OnExitLevel();
@@ -184,9 +185,11 @@ int main()
     AssertTrue(!g_logs.empty(), "OnInit should emit at least one log message.");
 
     const std::size_t logCountAfterInit = g_logs.size();
+    client_t fakeClient{};
 
     OnFrame();
     OnClientAuthorized();
+    OnClientCommand(&fakeClient, "!commands");
 
     qboolean show = qtrue;
     char chatMessage[] = "Hello world";
@@ -196,7 +199,6 @@ int main()
     playerAddress.address.ip[1] = 0;
     playerAddress.address.ip[2] = 0;
     playerAddress.address.ip[3] = 1;
-    client_t fakeClient{};
 
     OnMessageSent(chatMessage, 0, &show, 0);
     OnSpawnServer();
@@ -206,6 +208,19 @@ int main()
     OnPlayerDC(&fakeClient, "quit");
 
     AssertTrue(g_logs.size() >= logCountAfterInit, "OnFrame and OnClientAuthorized should be safe to invoke.");
+    AssertTrue(g_chats.size() >= 2, "OnClientCommand should emit a private response.");
+
+    bool foundClientCommandResponse = false;
+    for (const auto& chat : g_chats)
+    {
+        if (chat.slot == 0 && chat.message.find("Available commands") != std::string::npos)
+        {
+            foundClientCommandResponse = true;
+            break;
+        }
+    }
+
+    AssertTrue(foundClientCommandResponse, "Expected !commands response from OnClientCommand callback.");
 
     std::cout << "All plugin export tests passed.\n";
     return 0;

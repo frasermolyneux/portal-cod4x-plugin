@@ -94,6 +94,17 @@ public:
         Plugin_ChatPrintf(kBroadcastSlot, "%s", payload.c_str());
     }
 
+    void SendChat(int slot, std::string_view message) override
+    {
+        if (slot < 0)
+        {
+            return;
+        }
+
+        const std::string payload(message);
+        Plugin_ChatPrintf(slot, "%s", payload.c_str());
+    }
+
     void Log(std::string_view message) override
     {
         const std::string payload(message);
@@ -307,6 +318,17 @@ PCL void COD4X_CALL OnClientAuthorized()
     Cod4xHostAdapter host;
     portal_cod4x::NotifyClientAuthorized(host);
     portal_cod4x::TickPlugin(host);
+}
+
+PCL void COD4X_CALL OnClientCommand(client_t* client, const char* command)
+{
+    if (command == nullptr)
+    {
+        return;
+    }
+
+    Cod4xHostAdapter host;
+    portal_cod4x::NotifyClientCommand(host, ClientPointerToSlot(client), std::string_view(command));
 }
 
 PCL void COD4X_CALL OnTerminate()

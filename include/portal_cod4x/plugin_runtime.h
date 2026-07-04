@@ -61,6 +61,7 @@ public:
     virtual ~ICod4xHost() = default;
 
     virtual void BroadcastChat(std::string_view message) = 0;
+    virtual void SendChat(int slot, std::string_view message) = 0;
     virtual void Log(std::string_view message) = 0;
     virtual bool ExecuteServerCommand(std::string_view command) = 0;
 
@@ -100,6 +101,7 @@ public:
     void HandleClientAuthorized(ICod4xHost& host);
     void HandlePlayerDisconnected(ICod4xHost& host, int slot);
     void HandleChatMessage(ICod4xHost& host, int slot, std::string_view message, bool teamMessage);
+    void HandleClientCommand(ICod4xHost& host, int slot, std::string_view command, bool fromChatMessage = false);
     void HandleServerSpawned(ICod4xHost& host);
     void HandleServerExited(ICod4xHost& host);
 
@@ -142,6 +144,11 @@ private:
 
     std::string configPath;
     std::string pluginVersion = "0.0.0-unknown";
+    std::string chatPrefix = std::string(kDefaultBotPrefix);
+    std::string lastHandledCommandToken;
+    int lastHandledCommandSlot = -1;
+    std::int64_t lastHandledCommandUnixSeconds = 0;
+    bool lastHandledCommandFromChat = false;
     std::optional<PluginConfig> loadedConfig;
     EffectiveServerContext serverContext;
     std::string accessToken;
@@ -229,6 +236,8 @@ private:
     static std::string QueueEndpointPath(std::string_view queueName);
     static std::string NormalizeIpAddress(std::string ipAddress);
     static std::string Trim(std::string value);
+    std::string BuildPrefixedChatMessage(std::string_view message) const;
+    void SendPrivateChat(ICod4xHost& host, int slot, std::string_view message) const;
     long long nextSequenceId = 1;
 
     bool TryLoadConfig(ICod4xHost& host, std::int64_t nowUnixSeconds);
@@ -250,6 +259,7 @@ void NotifyPlayerConnected(ICod4xHost& host, int slot);
 void NotifyClientAuthorized(ICod4xHost& host);
 void NotifyPlayerDisconnected(ICod4xHost& host, int slot);
 void NotifyChatMessage(ICod4xHost& host, int slot, std::string_view message, bool teamMessage);
+void NotifyClientCommand(ICod4xHost& host, int slot, std::string_view command);
 void NotifyServerSpawned(ICod4xHost& host);
 void NotifyServerExited(ICod4xHost& host);
 const EffectiveServerContext& GetServerContext();
