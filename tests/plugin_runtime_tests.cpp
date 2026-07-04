@@ -426,6 +426,7 @@ void Runtime_EmitsAndFlushesPlayerConnectedEvent()
     FakeHost host;
     host.CurrentTime = 2000;
     host.PlayerIds[2] = 76561198000000001ULL;
+    host.PlayerSteamIds[2] = 76561198000000001ULL;
     host.PlayerNames[2] = "PlayerOne";
 
     host.Responses["POST https://login.microsoftonline.com/tenant-test/oauth2/v2.0/token"] = {
@@ -455,6 +456,7 @@ void Runtime_EmitsAndFlushesPlayerConnectedEvent()
         {
             foundIngestPost = true;
             Assert(request.Body.find("\"playerGuid\":\"76561198000000001\"") != std::string::npos, "Expected playerGuid in ingest payload");
+            Assert(request.Body.find("\"steamId\":\"76561198000000001\"") != std::string::npos, "Expected steamId in ingest payload");
             Assert(request.Body.find("\"ipAddress\":\"192.168.0.10\"") != std::string::npos, "Expected ipAddress in ingest payload");
             Assert(request.Body.find("\"gameType\":\"CallOfDuty4\"") != std::string::npos, "Expected gameType in ingest payload");
             break;

@@ -889,6 +889,7 @@ void PluginRuntime::HandlePlayerConnected(ICod4xHost& host, int slot)
             nowUnixSeconds,
             messageId,
             playerState.PlayerGuid,
+            playerState.SteamId,
             playerState.Username,
             playerState.IpAddress,
             slot),
@@ -2042,12 +2043,14 @@ std::string PluginRuntime::BuildPlayerConnectedPayload(
     std::int64_t nowUnixSeconds,
     const std::string& messageId,
     const std::string& playerGuid,
+    std::uint64_t steamId,
     const std::string& username,
     const std::string& ipAddress,
     int slotId)
 {
     std::string payload = BuildBaseEventPrefix(nowUnixSeconds, messageId, NextSequenceId());
     payload += ",\"playerGuid\":\"" + JsonEscape(playerGuid) + "\"";
+    payload += ",\"steamId\":\"" + std::to_string(steamId) + "\"";
     payload += ",\"username\":\"" + JsonEscape(username) + "\"";
     payload += ",\"ipAddress\":\"" + JsonEscape(ipAddress) + "\"";
     payload += ",\"slotId\":" + std::to_string(slotId);

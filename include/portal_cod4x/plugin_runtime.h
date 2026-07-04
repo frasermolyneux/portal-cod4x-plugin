@@ -212,6 +212,7 @@ private:
         std::int64_t nowUnixSeconds,
         const std::string& messageId,
         const std::string& playerGuid,
+        std::uint64_t steamId,
         const std::string& username,
         const std::string& ipAddress,
         int slotId);
