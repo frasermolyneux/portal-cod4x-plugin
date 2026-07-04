@@ -57,19 +57,6 @@ struct Cod4xCommandDocument
     std::unordered_map<std::string, CommandOverride> CommandOverrides;
 };
 
-struct ParsedAdminRoster
-{
-    struct ParsedAdminRosterEntry
-    {
-        int Power = 1;
-        std::vector<std::string> Tags;
-    };
-
-    bool Enabled = false;
-    int DefaultPower = 1;
-    std::unordered_map<std::string, ParsedAdminRosterEntry> Entries;
-};
-
 std::string Trim(std::string value)
 {
     const auto isWhitespace = [](unsigned char c) { return std::isspace(c) != 0; };
@@ -558,77 +545,6 @@ std::optional<std::string> ExtractConfigurationPayload(const std::string& respon
     return std::nullopt;
 }
 
-std::optional<ParsedAdminRoster> ParseAdminRosterPayload(const std::string& responseBody)
-{
-    const auto dataObject = ExtractJsonObjectByKey(responseBody, "data");
-    if (!dataObject.has_value())
-    {
-        return std::nullopt;
-    }
-
-    ParsedAdminRoster roster;
-    if (const auto enabledToken = ExtractJsonOptionalBool(*dataObject, "enabled");
-        enabledToken.has_value() && enabledToken->has_value())
-    {
-        roster.Enabled = enabledToken->value();
-    }
-
-    roster.DefaultPower = std::clamp(
-        ExtractJsonIntValue(*dataObject, "defaultPower").value_or(1),
-        1,
-        100);
-
-    const auto entriesArray = ExtractJsonArrayByKey(*dataObject, "entries");
-    if (!entriesArray.has_value())
-    {
-        return roster;
-    }
-
-    std::size_t cursor = 1;
-    while (cursor < entriesArray->size())
-    {
-        const std::size_t objectOpen = entriesArray->find('{', cursor);
-        if (objectOpen == std::string::npos)
-        {
-            break;
-        }
-
-        const std::size_t objectClose = FindMatchingBrace(*entriesArray, objectOpen);
-        if (objectClose == std::string::npos)
-        {
-            break;
-        }
-
-        const std::string entryJson = entriesArray->substr(objectOpen, objectClose - objectOpen + 1);
-        const auto playerGuid = ExtractJsonStringValue(entryJson, "playerGuid");
-        if (!playerGuid.has_value() || playerGuid->empty())
-        {
-            cursor = objectClose + 1;
-            continue;
-        }
-
-        const int power = std::clamp(ExtractJsonIntValue(entryJson, "power").value_or(roster.DefaultPower), 1, 100);
-        std::vector<std::string> tags;
-        const auto tagsArray = ExtractJsonArrayByKey(entryJson, "tags");
-        if (tagsArray.has_value())
-        {
-            tags = ParseJsonStringArray(*tagsArray);
-            tags.erase(
-                std::remove_if(
-                    tags.begin(),
-                    tags.end(),
-                    [](const std::string& tag) { return Trim(tag).empty(); }),
-                tags.end());
-            std::sort(tags.begin(), tags.end());
-            tags.erase(std::unique(tags.begin(), tags.end()), tags.end());
-        }
-
-        roster.Entries[*playerGuid] = ParsedAdminRoster::ParsedAdminRosterEntry{power, tags};
-        cursor = objectClose + 1;
-    }
-
-    return roster;
-}
 
 std::string BuildSnapshotHash(const EffectiveServerContext& context)
 {
@@ -657,17 +573,6 @@ std::string BuildSnapshotHash(const EffectiveServerContext& context)
     }
 
     return hash;
-}
-
-std::uint64_t BuildUnsupportedPowerWarningKey(std::uint64_t steamId, int slotId)
-{
-    if (steamId != 0)
-    {
-        return steamId;
-    }
-
-    const auto slot = slotId < 0 ? 0ULL : static_cast<std::uint64_t>(slotId);
-    return 0x8000000000000000ULL | slot;
 }
 
 std::string BuildAuthorizationHeaders(const std::string& accessToken)
@@ -931,8 +836,6 @@ void PluginRuntime::HandleClientAuthorized(ICod4xHost& host)
             state.ConnectedAtUnixSeconds = nowUnixSeconds;
         }
     }
-
-    ApplyAdminPowerReconciliation(host);
 }
 
 void PluginRuntime::HandlePlayerDisconnected(ICod4xHost& host, int slot)
@@ -948,7 +851,6 @@ void PluginRuntime::HandlePlayerDisconnected(ICod4xHost& host, int slot)
     {
         state = stateIt->second;
         connectedPlayers.erase(stateIt);
-        loggedUnsupportedSteamIds.erase(BuildUnsupportedPowerWarningKey(state.SteamId, state.SlotId));
     }
 
     if (state.PlayerGuid.empty())
@@ -1148,7 +1050,6 @@ void PluginRuntime::HandleServerSpawned(ICod4xHost& host)
 void PluginRuntime::HandleServerExited(ICod4xHost&)
 {
     connectedPlayers.clear();
-    loggedUnsupportedSteamIds.clear();
 }
 
 const EffectiveServerContext& PluginRuntime::GetServerContext() const
@@ -1200,10 +1101,8 @@ void PluginRuntime::BeginRefresh(ICod4xHost& host, std::int64_t nowUnixSeconds)
 {
     pendingHasGlobalConfig = false;
     pendingHasServerConfig = false;
-    pendingHasAdminRoster = false;
     pendingGlobalConfigPayload.clear();
     pendingServerConfigPayload.clear();
-    pendingAdminRosterPayload.clear();
 
     // Reuse a still-valid access token and skip straight to the config requests.
     if (IsAccessTokenValid(nowUnixSeconds))
@@ -1267,23 +1166,6 @@ bool PluginRuntime::StartServerConfigRequest(ICod4xHost& host, std::int64_t nowU
 
     inFlightStartedUnixSeconds = nowUnixSeconds;
     refreshStage = RefreshStage::FetchingServerConfig;
-    return true;
-}
-
-bool PluginRuntime::StartAdminRosterRequest(ICod4xHost& host, std::int64_t nowUnixSeconds)
-{
-    const std::string authHeaders = BuildAuthorizationHeaders(accessToken);
-    const std::string rosterUrl = loadedConfig->RepositoryApiBaseUrl + "/v1.0/game-servers/" + loadedConfig->GameServerId +
-        "/connected-players/admin-roster";
-
-    inFlightRequest = host.BeginHttpRequest(rosterUrl, "GET", "", authHeaders);
-    if (inFlightRequest == nullptr)
-    {
-        return false;
-    }
-
-    inFlightStartedUnixSeconds = nowUnixSeconds;
-    refreshStage = RefreshStage::FetchingAdminRoster;
     return true;
 }
 
@@ -1392,28 +1274,6 @@ void PluginRuntime::AdvanceRefresh(ICod4xHost& host, std::int64_t nowUnixSeconds
                 pendingServerConfigPayload = *payload;
                 pendingHasServerConfig = true;
             }
-
-            if (!StartAdminRosterRequest(host, nowUnixSeconds))
-            {
-                AbortRefresh(host, nowUnixSeconds, "failed to start cod4x admin-roster request");
-            }
-
-            break;
-        }
-        case RefreshStage::FetchingAdminRoster:
-        {
-            if (response.StatusCode != 200 && response.StatusCode != 404)
-            {
-                AbortRefresh(host, nowUnixSeconds, "failed to retrieve cod4x admin-roster settings");
-                return;
-            }
-
-            if (response.StatusCode == 200)
-            {
-                pendingAdminRosterPayload = response.Body;
-                pendingHasAdminRoster = true;
-            }
-
             FinalizeRefresh(host, nowUnixSeconds);
             break;
         }
@@ -1445,7 +1305,6 @@ void PluginRuntime::FinalizeRefresh(ICod4xHost& host, std::int64_t nowUnixSecond
 {
     Cod4xCommandDocument globalDoc;
     Cod4xCommandDocument serverDoc;
-    ParsedAdminRoster parsedAdminRoster;
     bool hasGlobalDoc = false;
     bool hasServerDoc = false;
 
@@ -1473,18 +1332,6 @@ void PluginRuntime::FinalizeRefresh(ICod4xHost& host, std::int64_t nowUnixSecond
 
         serverDoc = *parsed;
         hasServerDoc = true;
-    }
-
-    if (pendingHasAdminRoster)
-    {
-        const auto parsed = ParseAdminRosterPayload(pendingAdminRosterPayload);
-        if (!parsed.has_value())
-        {
-            AbortRefresh(host, nowUnixSeconds, "cod4x admin-roster payload parse failed");
-            return;
-        }
-
-        parsedAdminRoster = *parsed;
     }
 
     EffectiveServerContext nextContext;
@@ -1548,25 +1395,12 @@ void PluginRuntime::FinalizeRefresh(ICod4xHost& host, std::int64_t nowUnixSecond
     nextContext.SnapshotHash = BuildSnapshotHash(nextContext);
 
     const bool wasEnforced = serverContext.CommandEnforcementEnabled;
-    const bool previousAdminPowerEnabled = adminPowerEnabled;
-    const std::string previousAdminSnapshotHash = adminRosterSnapshotHash;
 
     serverContext = std::move(nextContext);
-    adminPowerEnabled = parsedAdminRoster.Enabled;
-    adminDefaultPower = std::clamp(parsedAdminRoster.DefaultPower, 1, 100);
-    adminRosterByPlayerGuid.clear();
-    adminRosterByPlayerGuid.reserve(parsedAdminRoster.Entries.size());
-    for (const auto& [playerGuid, entry] : parsedAdminRoster.Entries)
-    {
-        adminRosterByPlayerGuid.emplace(playerGuid, AdminRosterEntry{entry.Power, entry.Tags});
-    }
-
-    adminRosterSnapshotHash = BuildAdminRosterSnapshotHash(adminPowerEnabled, adminDefaultPower, adminRosterByPlayerGuid);
 
     refreshStage = RefreshStage::Idle;
 
     bool commandApplied = true;
-    bool adminApplied = true;
 
     if (!serverContext.CommandEnforcementEnabled)
     {
@@ -1582,12 +1416,7 @@ void PluginRuntime::FinalizeRefresh(ICod4xHost& host, std::int64_t nowUnixSecond
         commandApplied = ApplyCommandReconciliation(host);
     }
 
-    if (adminRosterSnapshotHash != previousAdminSnapshotHash || adminPowerEnabled != previousAdminPowerEnabled)
-    {
-        adminApplied = ApplyAdminPowerReconciliation(host);
-    }
-
-    nextRefreshUnixSeconds = (commandApplied && adminApplied)
+    nextRefreshUnixSeconds = commandApplied
         ? nowUnixSeconds + loadedConfig->RefreshIntervalSeconds
         : nowUnixSeconds + 30;
 }
@@ -1642,114 +1471,6 @@ bool PluginRuntime::ApplyCommandReconciliation(ICod4xHost& host)
     }
 
     return false;
-}
-
-bool PluginRuntime::ApplyAdminPowerReconciliation(ICod4xHost& host)
-{
-    int playerCount = 0;
-    int elevatedCount = 0;
-
-    for (auto& [_, playerState] : connectedPlayers)
-    {
-        ++playerCount;
-        const int desiredPower = ResolveDesiredAdminPower(playerState);
-        if (desiredPower > 1)
-        {
-            ++elevatedCount;
-        }
-
-        if (playerState.HasAppliedAdminPower && playerState.AppliedAdminPower == desiredPower)
-        {
-            continue;
-        }
-
-        playerState.AppliedAdminPower = desiredPower;
-        playerState.HasAppliedAdminPower = true;
-
-        if (desiredPower <= 1)
-        {
-            loggedUnsupportedSteamIds.erase(BuildUnsupportedPowerWarningKey(playerState.SteamId, playerState.SlotId));
-            continue;
-        }
-
-        const std::uint64_t warningKey = BuildUnsupportedPowerWarningKey(playerState.SteamId, playerState.SlotId);
-        if (loggedUnsupportedSteamIds.insert(warningKey).second)
-        {
-            host.Log(
-                "cod4xPower desired level " + std::to_string(desiredPower) + " for player " + playerState.PlayerGuid +
-                " cannot be applied because the current plugin ABI does not expose a transient player-power setter");
-        }
-    }
-
-    host.Log(
-        "cod4xPower roster reconciliation evaluated " + std::to_string(playerCount) + " connected players; " +
-        std::to_string(elevatedCount) + " require elevated power");
-
-    return true;
-}
-
-int PluginRuntime::ResolveDesiredAdminPower(const ConnectedPlayerState& playerState) const
-{
-    if (!adminPowerEnabled)
-    {
-        return 1;
-    }
-
-    int desiredPower = std::clamp(adminDefaultPower, 1, 100);
-    if (playerState.PlayerGuid.empty())
-    {
-        return desiredPower;
-    }
-
-    const auto rosterIt = adminRosterByPlayerGuid.find(playerState.PlayerGuid);
-    if (rosterIt == adminRosterByPlayerGuid.end())
-    {
-        return desiredPower;
-    }
-
-    return std::clamp(std::max(desiredPower, rosterIt->second.Power), 1, 100);
-}
-
-std::string PluginRuntime::BuildAdminRosterSnapshotHash(
-    bool enabled,
-    int defaultPower,
-    const std::unordered_map<std::string, AdminRosterEntry>& entries)
-{
-    std::vector<std::string> playerGuids;
-    playerGuids.reserve(entries.size());
-    for (const auto& [playerGuid, _] : entries)
-    {
-        playerGuids.push_back(playerGuid);
-    }
-
-    std::sort(playerGuids.begin(), playerGuids.end());
-
-    std::string hash = enabled ? "1|" : "0|";
-    hash += std::to_string(std::clamp(defaultPower, 1, 100));
-    hash.push_back('|');
-
-    for (const auto& playerGuid : playerGuids)
-    {
-        const auto& entry = entries.at(playerGuid);
-        hash += playerGuid;
-        hash.push_back('=');
-        hash += std::to_string(std::clamp(entry.Power, 1, 100));
-        hash.push_back(':');
-
-        std::vector<std::string> tags = entry.Tags;
-        std::sort(tags.begin(), tags.end());
-        tags.erase(std::unique(tags.begin(), tags.end()), tags.end());
-
-        for (const auto& tag : tags)
-        {
-            hash += tag;
-            hash.push_back(',');
-        }
-
-        hash.push_back(';');
-    }
-
-    return hash;
 }
 
 bool PluginRuntime::IsIngestConfigured() const
