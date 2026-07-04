@@ -177,25 +177,7 @@ void BuildMessage_FallsBackWhenPrefixOrVersionMissing()
     Assert(message.find("0.0.0-unknown") != std::string::npos, "Expected fallback version when version is empty");
 }
 
-std::string EscapeJsonString(std::string_view value)
-{
-    std::string escaped;
-    escaped.reserve(value.size() * 2);
-
-    for (const char c : value)
-    {
-        if (c == '\\' || c == '"')
-        {
-            escaped.push_back('\\');
-        }
-
-        escaped.push_back(c);
-    }
-
-    return escaped;
-}
-
-void Runtime_RefreshesSettingsAndReconcilesCommandPower()
+void Runtime_LoadsConfigAndStoresServerContext()
 {
     const std::filesystem::path configPath = std::filesystem::temp_directory_path() / "portal-cod4x-plugin.runtime.test.json";
 
@@ -216,99 +198,29 @@ void Runtime_RefreshesSettingsAndReconcilesCommandPower()
     FakeHost host;
     host.CurrentTime = 1000;
 
-    const std::string globalPayload =
-        "{\"schemaVersion\":1,\"enabled\":true,\"commands\":{\"kick\":{\"minPower\":35},\"cmdpowerlist\":{\"minPower\":95}}}";
-    const std::string serverPayload =
-        "{\"schemaVersion\":1,\"commands\":{\"kick\":{\"minPower\":70},\"cmdpowerlist\":{\"minPower\":65}}}";
-
-    host.Responses["POST https://login.microsoftonline.com/tenant-test/oauth2/v2.0/token"] = {
-        200,
-        "{\"access_token\":\"token-1\",\"expires_in\":3600}"};
-    host.Responses["GET https://example.test/repository/v1.0/configurations/cod4xCommands"] = {
-        200,
-        "{\"namespace\":\"cod4xCommands\",\"configuration\":\"" + EscapeJsonString(globalPayload) + "\"}"};
-    host.Responses["GET https://example.test/repository/v1.0/game-servers/11111111-2222-3333-4444-555555555555/configurations/cod4xCommands"] = {
-        200,
-        "{\"namespace\":\"cod4xCommands\",\"configuration\":\"" + EscapeJsonString(serverPayload) + "\"}"};
-
     portal_cod4x::PluginRuntime runtime(configPath.string());
     const int initializeResult = runtime.Initialize(host, "1.2.3", "^4[^1XI-BOT^4]^7");
     Assert(initializeResult == 0, "PluginRuntime initialize should succeed");
 
-    // The refresh pipeline is non-blocking and advances a single step per frame
-    // (token -> global config -> server config -> reconcile), so pump several
-    // frames to drive a refresh to completion. Extra frames past completion are
-    // no-ops until the next refresh interval elapses.
-    const auto pump = [&runtime, &host]() {
-        for (int i = 0; i < 6; ++i)
-        {
-            runtime.Tick(host);
-        }
-    };
+    runtime.Tick(host);
+    Assert(host.ExecutedCommands.empty(), "Plugin runtime should not apply cod4x command-power reconciliation");
 
-    pump();
-
-    Assert(!host.ExecutedCommands.empty(), "Initial refresh should reconcile command powers");
-
-    bool hasKick70 = false;
-    bool hasAdminListCommands65 = false;
-    for (const auto& command : host.ExecutedCommands)
+    bool requestedCod4xCommandSettings = false;
+    for (const auto& request : host.Requests)
     {
-        if (command == "setCmdMinPower kick 70")
+        if (request.Url.find("/configurations/cod4xCommands") != std::string::npos)
         {
-            hasKick70 = true;
-        }
-
-        if (command == "setCmdMinPower AdminListCommands 65")
-        {
-            hasAdminListCommands65 = true;
-        }
-    }
-
-    Assert(hasKick70, "Server override should set kick command power to 70");
-    Assert(hasAdminListCommands65, "Alias command should resolve to AdminListCommands");
-
-    const std::size_t firstApplyCount = host.ExecutedCommands.size();
-
-    host.CurrentTime = 1100;
-    pump();
-    Assert(host.ExecutedCommands.size() == firstApplyCount, "Refresh before interval should not perform another reconciliation");
-
-    const std::string changedServerPayload =
-        "{\"schemaVersion\":1,\"commands\":{\"kick\":{\"minPower\":80},\"cmdpowerlist\":{\"minPower\":65}}}";
-    host.Responses["GET https://example.test/repository/v1.0/game-servers/11111111-2222-3333-4444-555555555555/configurations/cod4xCommands"] = {
-        200,
-        "{\"namespace\":\"cod4xCommands\",\"configuration\":\"" + EscapeJsonString(changedServerPayload) + "\"}"};
-
-    host.CurrentTime = 1121;
-    pump();
-
-    bool hasKick80 = false;
-    for (const auto& command : host.ExecutedCommands)
-    {
-        if (command == "setCmdMinPower kick 80")
-        {
-            hasKick80 = true;
+            requestedCod4xCommandSettings = true;
             break;
         }
     }
 
-    Assert(hasKick80, "Changed server context should trigger updated command power reconciliation");
-    const std::size_t secondApplyCount = host.ExecutedCommands.size();
-
-    const std::string disabledServerPayload = "{\"schemaVersion\":1,\"enabled\":false,\"commands\":{\"kick\":{\"minPower\":55}}}";
-    host.Responses["GET https://example.test/repository/v1.0/game-servers/11111111-2222-3333-4444-555555555555/configurations/cod4xCommands"] = {
-        200,
-        "{\"namespace\":\"cod4xCommands\",\"configuration\":\"" + EscapeJsonString(disabledServerPayload) + "\"}"};
-
-    host.CurrentTime = 1245;
-    pump();
-    Assert(
-        host.ExecutedCommands.size() == secondApplyCount,
-        "When cod4xCommands enforcement is disabled, runtime should stop enforcing and keep existing command powers");
+    Assert(!requestedCod4xCommandSettings, "Plugin runtime should not poll cod4xCommands settings");
 
     const auto& context = runtime.GetServerContext();
-    Assert(!context.GameServerId.empty(), "Server context should retain configured gameServerId");
+    Assert(
+        context.GameServerId == "11111111-2222-3333-4444-555555555555",
+        "Server context should retain configured gameServerId");
 
     std::error_code ignoreError;
     std::filesystem::remove(configPath, ignoreError);
@@ -625,7 +537,7 @@ int main()
 {
     BuildMessage_UsesPrefixAndVersion();
     BuildMessage_FallsBackWhenPrefixOrVersionMissing();
-    Runtime_RefreshesSettingsAndReconcilesCommandPower();
+    Runtime_LoadsConfigAndStoresServerContext();
     Runtime_EmitsAndFlushesPlayerConnectedEvent();
     Runtime_AuthorizedIdentity_AllowsDisconnectEventWhenPlayerIdUnavailableAtDisconnect();
     Runtime_DropsPoisonEventsAndUnblocksOtherQueues();

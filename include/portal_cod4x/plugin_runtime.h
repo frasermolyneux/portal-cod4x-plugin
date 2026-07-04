@@ -40,18 +40,9 @@ struct PluginConfig
     int RefreshIntervalSeconds = 120;
 };
 
-struct CommandPowerRule
-{
-    bool Enabled = true;
-    int MinPower = 100;
-};
-
 struct EffectiveServerContext
 {
     std::string GameServerId;
-    bool CommandEnforcementEnabled = false;
-    std::unordered_map<std::string, CommandPowerRule> CommandRules;
-    std::string SnapshotHash;
     std::int64_t LastRefreshUnixSeconds = 0;
 };
 
@@ -109,14 +100,6 @@ public:
     [[nodiscard]] const EffectiveServerContext& GetServerContext() const;
 
 private:
-    enum class RefreshStage
-    {
-        Idle,
-        AcquiringToken,
-        FetchingGlobalConfig,
-        FetchingServerConfig
-    };
-
     enum class IngestStage
     {
         Idle,
@@ -153,20 +136,8 @@ private:
     bool lastHandledCommandFromChat = false;
     std::optional<PluginConfig> loadedConfig;
     EffectiveServerContext serverContext;
-    std::string accessToken;
-    std::int64_t accessTokenExpiresAtUnixSeconds = 0;
-    std::int64_t nextRefreshUnixSeconds = 0;
     std::int64_t nextConfigLoadAttemptUnixSeconds = 0;
-    std::string lastAppliedSnapshotHash;
     std::string lastConfigLoadError;
-
-    RefreshStage refreshStage = RefreshStage::Idle;
-    HttpRequestHandle inFlightRequest = nullptr;
-    std::int64_t inFlightStartedUnixSeconds = 0;
-    bool pendingHasGlobalConfig = false;
-    bool pendingHasServerConfig = false;
-    std::string pendingGlobalConfigPayload;
-    std::string pendingServerConfigPayload;
 
     IngestStage ingestStage = IngestStage::Idle;
     HttpRequestHandle ingestRequest = nullptr;
@@ -244,14 +215,6 @@ private:
     long long nextSequenceId = 1;
 
     bool TryLoadConfig(ICod4xHost& host, std::int64_t nowUnixSeconds);
-    bool IsAccessTokenValid(std::int64_t nowUnixSeconds) const;
-    void BeginRefresh(ICod4xHost& host, std::int64_t nowUnixSeconds);
-    void AdvanceRefresh(ICod4xHost& host, std::int64_t nowUnixSeconds);
-    void AbortRefresh(ICod4xHost& host, std::int64_t nowUnixSeconds, std::string_view reason);
-    bool StartGlobalConfigRequest(ICod4xHost& host, std::int64_t nowUnixSeconds);
-    bool StartServerConfigRequest(ICod4xHost& host, std::int64_t nowUnixSeconds);
-    void FinalizeRefresh(ICod4xHost& host, std::int64_t nowUnixSeconds);
-    bool ApplyCommandReconciliation(ICod4xHost& host);
 };
 
 std::string BuildOnlineBroadcastMessage(std::string_view prefix, std::string_view version);
