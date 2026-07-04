@@ -7,6 +7,6 @@
     "ingestBaseUrl": "https://example-apim.azure-api.net/ingest",
     "ingestApiResource": "api://xtremeidiots-portal-server-events-api-prd",
     "gameServerId": "11111111-2222-3333-4444-555555555555",
-    "gameType": "CallOfDuty4",
+    "gameType": "CallOfDuty4x",
     "refreshIntervalSeconds": 120
 }

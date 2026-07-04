@@ -1,10 +1,10 @@
 # Plugin Settings Rollout
 
-This runbook covers Phase 2 operations for the CoD4x plugin settings flow:
+This runbook covers Phase 2 operations for the CoD4x plugin runtime config flow:
 
 - materialize local plugin config from Azure secrets and Terraform outputs
 - deploy the config to the game server host
-- validate runtime polling and command reconciliation behavior
+- validate runtime polling and ingest egress behavior
 - rotate credentials safely
 
 ## Runtime config contract
@@ -18,7 +18,10 @@ Required fields:
 - `clientSecret`
 - `repositoryApiBaseUrl`
 - `repositoryApiResource`
+- `ingestBaseUrl`
+- `ingestApiResource`
 - `gameServerId`
+- `gameType` (`CallOfDuty4x`)
 - `refreshIntervalSeconds` (15-900, default 120)
 
 An example file is provided at `portal-cod4x-plugin.config.example.json`.
@@ -31,7 +34,10 @@ Values are sourced from `portal-environments` Terraform outputs and shared Key V
 - secret `azuread-app-client-id-cod4x-plugin`
 - secret `azuread-app-password-cod4x-plugin`
 - secret `cod4x-plugin-repository-api-endpoint`
+- secret `cod4x-plugin-ingest-api-endpoint`
 - Terraform output `repository_api.application.primary_identifier_uri` for `repositoryApiResource`
+- Terraform output `server_events_api.application.primary_identifier_uri` for `ingestApiResource`
+- Terraform output `server_events_api.api_management.endpoint` for ingest endpoint fallback
 
 ## Generate config file
 
@@ -45,7 +51,8 @@ Use the helper script:
   -OutputPath "./portal-cod4x-plugin.config.json"
 ```
 
-If Terraform output access is not available, pass `-RepositoryApiResource` directly.
+If Terraform output access is not available, pass `-RepositoryApiResource` and `-IngestApiResource` directly.
+If the ingest endpoint secret is unavailable in Key Vault, pass `-IngestBaseUrl` directly as well.
 
 ## Deploy config to CoD4x host
 
@@ -61,6 +68,7 @@ If Terraform output access is not available, pass `-RepositoryApiResource` direc
 
 2. API auth and poll check:
 - Confirm no recurring `failed to acquire access token for repository API` errors.
+- Confirm no recurring ingest token acquisition failures.
 - Confirm periodic runtime activity every `refreshIntervalSeconds`.
 
 3. Settings merge and enforcement check:

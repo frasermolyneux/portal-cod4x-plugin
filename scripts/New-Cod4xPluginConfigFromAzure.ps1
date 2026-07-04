@@ -10,6 +10,16 @@ param(
     [string]$RepositoryApiResource,
 
     [Parameter(Mandatory = $false)]
+    [string]$IngestBaseUrl,
+
+    [Parameter(Mandatory = $false)]
+    [string]$IngestApiResource,
+
+    [Parameter(Mandatory = $false)]
+    [ValidateSet("CallOfDuty4x")]
+    [string]$GameType = "CallOfDuty4x",
+
+    [Parameter(Mandatory = $false)]
     [string]$PortalEnvironmentsPath,
 
     [Parameter(Mandatory = $false)]
@@ -47,6 +57,37 @@ function Get-KeyVaultSecretValue {
     return $value.Trim()
 }
 
+function Get-TerraformOutputValue {
+    param(
+        [string]$Path,
+        [string]$Name,
+        [string]$JsonPath
+    )
+
+    $outputJson = terraform -chdir=$Path output -json $Name
+    if ([string]::IsNullOrWhiteSpace($outputJson)) {
+        throw "terraform output for '$Name' was empty."
+    }
+
+    $outputObject = $outputJson | ConvertFrom-Json
+    $valueObject = $outputObject
+    foreach ($segment in $JsonPath.Split('.')) {
+        if ($null -eq $valueObject) {
+            break
+        }
+
+        $valueObject = $valueObject.$segment
+    }
+
+    $value = [string]$valueObject
+
+    if ([string]::IsNullOrWhiteSpace($value)) {
+        throw "Unable to resolve '$Name.$JsonPath' from Terraform output."
+    }
+
+    return $value.Trim()
+}
+
 Get-RequiredCommand -Name "az"
 
 $tenantId = Get-KeyVaultSecretValue -VaultName $SharedKeyVaultName -SecretName "azuread-app-tenant-id-cod4x-plugin"
@@ -54,24 +95,35 @@ $clientId = Get-KeyVaultSecretValue -VaultName $SharedKeyVaultName -SecretName "
 $clientSecret = Get-KeyVaultSecretValue -VaultName $SharedKeyVaultName -SecretName "azuread-app-password-cod4x-plugin"
 $repositoryApiBaseUrl = Get-KeyVaultSecretValue -VaultName $SharedKeyVaultName -SecretName "cod4x-plugin-repository-api-endpoint"
 
-if ([string]::IsNullOrWhiteSpace($RepositoryApiResource)) {
+if ([string]::IsNullOrWhiteSpace($IngestBaseUrl)) {
+    try {
+        $IngestBaseUrl = Get-KeyVaultSecretValue -VaultName $SharedKeyVaultName -SecretName "cod4x-plugin-ingest-api-endpoint"
+    }
+    catch {
+        if ([string]::IsNullOrWhiteSpace($PortalEnvironmentsPath)) {
+            throw "IngestBaseUrl is required when the ingest endpoint secret is missing and PortalEnvironmentsPath is not provided."
+        }
+    }
+}
+
+if ([string]::IsNullOrWhiteSpace($RepositoryApiResource) -or [string]::IsNullOrWhiteSpace($IngestApiResource) -or [string]::IsNullOrWhiteSpace($IngestBaseUrl)) {
     if ([string]::IsNullOrWhiteSpace($PortalEnvironmentsPath)) {
-        throw "RepositoryApiResource is required when PortalEnvironmentsPath is not provided."
+        throw "RepositoryApiResource, IngestApiResource, and IngestBaseUrl require PortalEnvironmentsPath when not supplied directly."
     }
 
     Get-RequiredCommand -Name "terraform"
+}
 
-    $repositoryOutputJson = terraform -chdir=$PortalEnvironmentsPath output -json repository_api
-    if ([string]::IsNullOrWhiteSpace($repositoryOutputJson)) {
-        throw "terraform output for repository_api was empty."
-    }
+if ([string]::IsNullOrWhiteSpace($RepositoryApiResource)) {
+    $RepositoryApiResource = Get-TerraformOutputValue -Path $PortalEnvironmentsPath -Name "repository_api" -JsonPath "application.primary_identifier_uri"
+}
 
-    $repositoryOutput = $repositoryOutputJson | ConvertFrom-Json
-    $RepositoryApiResource = $repositoryOutput.application.primary_identifier_uri
+if ([string]::IsNullOrWhiteSpace($IngestApiResource)) {
+    $IngestApiResource = Get-TerraformOutputValue -Path $PortalEnvironmentsPath -Name "server_events_api" -JsonPath "application.primary_identifier_uri"
+}
 
-    if ([string]::IsNullOrWhiteSpace($RepositoryApiResource)) {
-        throw "Unable to resolve repository_api.application.primary_identifier_uri from Terraform output."
-    }
+if ([string]::IsNullOrWhiteSpace($IngestBaseUrl)) {
+    $IngestBaseUrl = Get-TerraformOutputValue -Path $PortalEnvironmentsPath -Name "server_events_api" -JsonPath "api_management.endpoint"
 }
 
 $configObject = [ordered]@{
@@ -80,7 +132,10 @@ $configObject = [ordered]@{
     clientSecret           = $clientSecret
     repositoryApiBaseUrl   = $repositoryApiBaseUrl
     repositoryApiResource  = $RepositoryApiResource
+    ingestBaseUrl          = $IngestBaseUrl
+    ingestApiResource      = $IngestApiResource
     gameServerId           = $GameServerId
+    gameType               = $GameType
     refreshIntervalSeconds = $RefreshIntervalSeconds
 }
 
@@ -101,7 +156,10 @@ Set-Content -Path $OutputPath -Value $configJson -Encoding utf8NoBOM
 
 Write-Host "Wrote plugin config to $OutputPath"
 Write-Host "GameServerId: $GameServerId"
+Write-Host "GameType: $GameType"
 Write-Host "Repository API base URL: $repositoryApiBaseUrl"
 Write-Host "Repository API resource: $RepositoryApiResource"
+Write-Host "Ingest API base URL: $IngestBaseUrl"
+Write-Host "Ingest API resource: $IngestApiResource"
 Write-Host "Refresh interval: $RefreshIntervalSeconds seconds"
 Write-Host "Client secret was written to disk; secure this file on the host."

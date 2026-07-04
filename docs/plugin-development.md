@@ -2,13 +2,21 @@
 
 ## Runtime behavior
 
-The skeleton plugin wires CoD4x exports and sends a startup broadcast on `OnInit`:
+The plugin runtime now includes:
+
+- CoD4x callback wiring for player/connect/chat/map lifecycle events
+- non-blocking HTTP state-machine work on `OnFrame`
+- bounded egress buffering with batch posts to APIM ingest endpoints
+- periodic settings pull with offline local cache
+- startup broadcast on `OnInit`
+
+Startup broadcast details:
 
 - Prefix: `^4[^1XI-BOT^4]^7`
 - Message: `Portal Plugin is online (version <version>)`
 - Broadcast target slot: `-1` (all players)
 
-The runtime logic is isolated in `portal_cod4x::InitializePlugin` and `BuildOnlineBroadcastMessage`, which are covered by unit tests.
+Runtime logic is isolated in `plugin_runtime` and `plugin_exports` modules with unit-test coverage for runtime behavior and callback bridging.
 
 Phase 2 settings rollout guidance is documented in `docs/plugin-settings-rollout.md`, including config generation and smoke validation.
 
