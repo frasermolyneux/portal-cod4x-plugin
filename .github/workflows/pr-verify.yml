@@ -170,6 +170,20 @@ jobs:
             throw "lib.exe was not found under $toolsRoot."
           }
 
+          $requiredHostSymbolsPath = Join-Path $PWD "windows-sdk/com_plugin.exports.txt"
+          if (-not (Test-Path $requiredHostSymbolsPath)) {
+            throw "Required host symbol list not found at $requiredHostSymbolsPath."
+          }
+
+          $requiredHostSymbols = Get-Content -Path $requiredHostSymbolsPath |
+            ForEach-Object { $_.Split("#")[0].Trim().TrimStart([char]0xFEFF) } |
+            Where-Object { $_ -and -not $_.StartsWith("#") } |
+            Select-Object -Unique
+
+          if ($requiredHostSymbols.Count -eq 0) {
+            throw "Required host symbol list at $requiredHostSymbolsPath is empty."
+          }
+
           $repoImportLib = Join-Path $PWD "windows-sdk/com_plugin.lib"
           if (Test-Path $repoImportLib) {
             $hostImportLib = $repoImportLib
@@ -179,16 +193,9 @@ jobs:
             New-Item -Path $generatedSdkPath -ItemType Directory -Force | Out-Null
 
             $defPath = Join-Path $generatedSdkPath "com_plugin.def"
-            @(
-              "LIBRARY $hostModuleName",
-              "EXPORTS",
-              "    Plugin_Printf",
-              "    Plugin_ChatPrintf",
-              "    Plugin_Cbuf_AddText",
-              "    Plugin_HTTP_MakeHttpRequest",
-              "    Plugin_HTTP_SendReceiveData",
-              "    Plugin_HTTP_FreeObj"
-            ) | Set-Content -Path $defPath -Encoding ascii
+            $defLines = @("LIBRARY $hostModuleName", "EXPORTS")
+            $defLines += $requiredHostSymbols | ForEach-Object { "    $_" }
+            $defLines | Set-Content -Path $defPath -Encoding ascii
 
             $generatedImportLib = Join-Path $generatedSdkPath "com_plugin.lib"
             & $libPath /nologo /def:$defPath /machine:x86 /out:$generatedImportLib
@@ -245,9 +252,39 @@ jobs:
           }
 
           $imports = & "${{ steps.windows-build-inputs.outputs.dumpbin_path }}" /nologo /imports $pluginPath | Out-String
-          $expectedHostModule = [Regex]::Escape($env:COD4X_WINDOWS_HOST_MODULE)
-          if ($imports -notmatch $expectedHostModule) {
+          $hostModuleName = $env:COD4X_WINDOWS_HOST_MODULE
+          $expectedHostModule = [Regex]::Escape($hostModuleName)
+          $hostSectionPattern = "(?m)^\s+$expectedHostModule\r?\n(?<section>.*?)(?=\r?\n\s{4,}[A-Za-z0-9_.-]+\.(?:dll|exe)\r?\n|\Z)"
+          $hostSectionMatch = [Regex]::Match(
+            $imports,
+            $hostSectionPattern,
+            [System.Text.RegularExpressions.RegexOptions]::Singleline -bor [System.Text.RegularExpressions.RegexOptions]::IgnoreCase)
+
+          if (-not $hostSectionMatch.Success) {
             throw "Expected host module '$($env:COD4X_WINDOWS_HOST_MODULE)' was not found in import table for $pluginPath."
+          }
+
+          $hostImportsSection = $hostSectionMatch.Groups["section"].Value
+
+          $requiredHostSymbolsPath = Join-Path $PWD "windows-sdk/com_plugin.exports.txt"
+          if (-not (Test-Path $requiredHostSymbolsPath)) {
+            throw "Required host symbol list not found at $requiredHostSymbolsPath."
+          }
+
+          $requiredHostSymbols = Get-Content -Path $requiredHostSymbolsPath |
+            ForEach-Object { $_.Split("#")[0].Trim().TrimStart([char]0xFEFF) } |
+            Where-Object { $_ -and -not $_.StartsWith("#") } |
+            Select-Object -Unique
+
+          $missingSymbols = @()
+          foreach ($symbol in $requiredHostSymbols) {
+            if ($hostImportsSection -notmatch ("(?m)\b" + [Regex]::Escape($symbol) + "\b")) {
+              $missingSymbols += $symbol
+            }
+          }
+
+          if ($missingSymbols.Count -gt 0) {
+            throw "Plugin import table is missing required host symbols: $($missingSymbols -join ', ')"
           }
 
       - name: Upload plugin artifact

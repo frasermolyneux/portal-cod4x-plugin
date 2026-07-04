@@ -1,0 +1,16 @@
+# Canonical CoD4x host ABI imports required by portal-cod4x-plugin.
+# Workflows consume this list to generate fallback import libraries and
+# to assert the built plugin imports every required symbol.
+Plugin_Printf
+Plugin_ChatPrintf
+Plugin_Cbuf_AddText
+Plugin_GetSlotCount
+Plugin_GetPlayerName
+Plugin_GetPlayerID
+Plugin_GetClientNumForClient
+Plugin_GetClientScoreboard
+Plugin_NET_AdrToStringShortMT
+Plugin_Cvar_VariableStringBuffer
+Plugin_HTTP_MakeHttpRequest
+Plugin_HTTP_SendReceiveData
+Plugin_HTTP_FreeObj
