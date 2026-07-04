@@ -24,6 +24,8 @@ namespace
 constexpr std::int64_t kHttpRequestDeadlineSeconds = 30;
 constexpr std::int64_t kIngestRequestDeadlineSeconds = 20;
 constexpr std::int64_t kServerStatusIntervalSeconds = 60;
+constexpr std::int64_t kMaxBufferedEventAgeSeconds = 15 * 60;
+constexpr std::size_t kMaxBufferedEventAttempts = 8;
 
 constexpr std::size_t kMaxBufferedEvents = 1000;
 constexpr std::size_t kIngestMaxBatchEvents = 100;
@@ -647,6 +649,37 @@ void PluginRuntime::HandlePlayerConnected(ICod4xHost& host, int slot)
         nowUnixSeconds);
 }
 
+void PluginRuntime::HandleClientAuthorized(ICod4xHost& host)
+{
+    if (!loadedConfig.has_value())
+    {
+        return;
+    }
+
+    const std::int64_t nowUnixSeconds = host.GetUnixTimeSeconds();
+    for (auto& [slot, state] : connectedPlayers)
+    {
+        if (state.PlayerGuid.empty())
+        {
+            const std::uint64_t playerId = host.GetPlayerId(slot);
+            if (playerId != 0)
+            {
+                state.PlayerGuid = std::to_string(playerId);
+            }
+        }
+
+        if (state.Username.empty())
+        {
+            state.Username = Trim(host.GetPlayerName(slot));
+        }
+
+        if (state.ConnectedAtUnixSeconds == 0)
+        {
+            state.ConnectedAtUnixSeconds = nowUnixSeconds;
+        }
+    }
+}
+
 void PluginRuntime::HandlePlayerDisconnected(ICod4xHost& host, int slot)
 {
     if (!loadedConfig.has_value() || !IsIngestConfigured() || slot < 0)
@@ -1226,6 +1259,11 @@ void PluginRuntime::AdvanceIngest(ICod4xHost& host, std::int64_t nowUnixSeconds)
 
     ingestConfigWarningLogged = false;
 
+    if (ingestStage == IngestStage::Idle)
+    {
+        PruneBufferedEvents(host, nowUnixSeconds);
+    }
+
     if (ingestStage != IngestStage::Idle)
     {
         if (ingestRequest == nullptr)
@@ -1303,6 +1341,8 @@ void PluginRuntime::AdvanceIngest(ICod4xHost& host, std::int64_t nowUnixSeconds)
                     bufferedEvents[index].AttemptCount++;
                 }
             }
+
+            PruneBufferedEvents(host, nowUnixSeconds);
 
             ingestConsecutiveFailureCount++;
             const std::int64_t backoffSeconds = static_cast<std::int64_t>(
@@ -1420,6 +1460,17 @@ void PluginRuntime::AbortIngest(ICod4xHost& host, std::int64_t nowUnixSeconds, s
         ingestRequest = nullptr;
     }
 
+    if (ingestStage == IngestStage::PostingBatch)
+    {
+        for (const std::size_t index : ingestBatchIndices)
+        {
+            if (index < bufferedEvents.size())
+            {
+                bufferedEvents[index].AttemptCount++;
+            }
+        }
+    }
+
     ingestStage = IngestStage::Idle;
     ingestConsecutiveFailureCount++;
     const std::int64_t backoffSeconds = static_cast<std::int64_t>(
@@ -1428,6 +1479,8 @@ void PluginRuntime::AbortIngest(ICod4xHost& host, std::int64_t nowUnixSeconds, s
     ingestBatchIndices.clear();
     ingestBatchQueueName.clear();
     ingestBatchPayload.clear();
+
+    PruneBufferedEvents(host, nowUnixSeconds);
 }
 
 void PluginRuntime::FlushServerStatusSnapshot(ICod4xHost& host, std::int64_t nowUnixSeconds)
@@ -1658,6 +1711,50 @@ void PluginRuntime::BufferEvent(std::string queueName, std::string payloadJson, 
     if (nextIngestAttemptUnixSeconds > nowUnixSeconds)
     {
         nextIngestAttemptUnixSeconds = nowUnixSeconds;
+    }
+}
+
+void PluginRuntime::PruneBufferedEvents(ICod4xHost& host, std::int64_t nowUnixSeconds)
+{
+    if (bufferedEvents.empty())
+    {
+        return;
+    }
+
+    std::size_t droppedByAttempts = 0;
+    std::size_t droppedByAge = 0;
+
+    for (auto it = bufferedEvents.begin(); it != bufferedEvents.end();)
+    {
+        const bool exceededAttempts = it->AttemptCount >= kMaxBufferedEventAttempts;
+        const bool exceededAge = (nowUnixSeconds - it->CreatedUnixSeconds) >= kMaxBufferedEventAgeSeconds;
+
+        if (!exceededAttempts && !exceededAge)
+        {
+            ++it;
+            continue;
+        }
+
+        if (exceededAttempts)
+        {
+            droppedByAttempts++;
+        }
+
+        if (exceededAge)
+        {
+            droppedByAge++;
+        }
+
+        it = bufferedEvents.erase(it);
+    }
+
+    const std::size_t droppedTotal = droppedByAttempts + droppedByAge;
+    if (droppedTotal > 0)
+    {
+        host.Log(
+            "ingest buffer dropped " + std::to_string(droppedTotal) +
+            " event(s) (attempt-threshold=" + std::to_string(droppedByAttempts) +
+            ", age-threshold=" + std::to_string(droppedByAge) + ")");
     }
 }
 
@@ -1896,6 +1993,11 @@ void NotifyPlayerConnect(ICod4xHost& host, int slot, std::string_view ipAddress)
 void NotifyPlayerConnected(ICod4xHost& host, int slot)
 {
     g_runtime.HandlePlayerConnected(host, slot);
+}
+
+void NotifyClientAuthorized(ICod4xHost& host)
+{
+    g_runtime.HandleClientAuthorized(host);
 }
 
 void NotifyPlayerDisconnected(ICod4xHost& host, int slot)

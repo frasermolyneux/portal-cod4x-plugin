@@ -359,6 +359,147 @@ void Runtime_EmitsAndFlushesPlayerConnectedEvent()
     std::filesystem::remove(configPath, ignoreError);
 }
 
+void Runtime_AuthorizedIdentity_AllowsDisconnectEventWhenPlayerIdUnavailableAtDisconnect()
+{
+    const std::filesystem::path configPath = std::filesystem::temp_directory_path() / "portal-cod4x-plugin.authorized.test.json";
+
+    {
+        std::ofstream configFile(configPath);
+        configFile
+            << "{"
+            << "\"tenantId\":\"tenant-test\","
+            << "\"clientId\":\"client-test\","
+            << "\"clientSecret\":\"secret-test\","
+            << "\"repositoryApiBaseUrl\":\"https://example.test/repository\","
+            << "\"repositoryApiResource\":\"api://repository-test\","
+            << "\"ingestBaseUrl\":\"https://example.test/ingest\","
+            << "\"ingestApiResource\":\"api://server-events-ingest\","
+            << "\"gameServerId\":\"11111111-2222-3333-4444-555555555555\","
+            << "\"gameType\":\"CallOfDuty4\","
+            << "\"refreshIntervalSeconds\":120"
+            << "}";
+    }
+
+    FakeHost host;
+    host.CurrentTime = 2500;
+    host.PlayerIds[2] = 76561198000000001ULL;
+    host.PlayerNames[2] = "PlayerOne";
+
+    host.Responses["POST https://login.microsoftonline.com/tenant-test/oauth2/v2.0/token"] = {
+        200,
+        "{\"access_token\":\"token-1\",\"expires_in\":3600}"};
+    host.Responses["GET https://example.test/repository/v1.0/configurations/cod4xCommands"] = {404, ""};
+    host.Responses["GET https://example.test/repository/v1.0/game-servers/11111111-2222-3333-4444-555555555555/configurations/cod4xCommands"] = {404, ""};
+    host.Responses["POST https://example.test/ingest/events/player-disconnected"] = {202, ""};
+
+    portal_cod4x::PluginRuntime runtime(configPath.string());
+    const int initializeResult = runtime.Initialize(host, "1.2.3", "^4[^1XI-BOT^4]^7");
+    Assert(initializeResult == 0, "PluginRuntime initialize should succeed");
+
+    runtime.HandlePlayerConnect(host, 2, "192.168.0.10");
+    runtime.HandleClientAuthorized(host);
+
+    host.PlayerIds.erase(2);
+    runtime.HandlePlayerDisconnected(host, 2);
+
+    for (int i = 0; i < 8; ++i)
+    {
+        runtime.Tick(host);
+    }
+
+    bool foundDisconnectPost = false;
+    for (const auto& request : host.Requests)
+    {
+        if (request.Method == "POST" && request.Url == "https://example.test/ingest/events/player-disconnected")
+        {
+            foundDisconnectPost = true;
+            Assert(request.Body.find("\"playerGuid\":\"76561198000000001\"") != std::string::npos, "Expected cached playerGuid in disconnect payload");
+            Assert(request.Body.find("\"username\":\"PlayerOne\"") != std::string::npos, "Expected cached username in disconnect payload");
+            break;
+        }
+    }
+
+    Assert(foundDisconnectPost, "Expected a player-disconnected ingest POST request");
+
+    std::error_code ignoreError;
+    std::filesystem::remove(configPath, ignoreError);
+}
+
+void Runtime_DropsPoisonEventsAndUnblocksOtherQueues()
+{
+    const std::filesystem::path configPath = std::filesystem::temp_directory_path() / "portal-cod4x-plugin.poison.test.json";
+
+    {
+        std::ofstream configFile(configPath);
+        configFile
+            << "{"
+            << "\"tenantId\":\"tenant-test\","
+            << "\"clientId\":\"client-test\","
+            << "\"clientSecret\":\"secret-test\","
+            << "\"repositoryApiBaseUrl\":\"https://example.test/repository\","
+            << "\"repositoryApiResource\":\"api://repository-test\","
+            << "\"ingestBaseUrl\":\"https://example.test/ingest\","
+            << "\"ingestApiResource\":\"api://server-events-ingest\","
+            << "\"gameServerId\":\"11111111-2222-3333-4444-555555555555\","
+            << "\"gameType\":\"CallOfDuty4\","
+            << "\"refreshIntervalSeconds\":120"
+            << "}";
+    }
+
+    FakeHost host;
+    host.CurrentTime = 3000;
+    host.PlayerIds[2] = 76561198000000001ULL;
+    host.PlayerNames[2] = "PlayerOne";
+
+    host.Responses["POST https://login.microsoftonline.com/tenant-test/oauth2/v2.0/token"] = {
+        200,
+        "{\"access_token\":\"token-1\",\"expires_in\":3600}"};
+    host.Responses["GET https://example.test/repository/v1.0/configurations/cod4xCommands"] = {404, ""};
+    host.Responses["GET https://example.test/repository/v1.0/game-servers/11111111-2222-3333-4444-555555555555/configurations/cod4xCommands"] = {404, ""};
+    host.Responses["POST https://example.test/ingest/events/player-connected"] = {500, ""};
+    host.Responses["POST https://example.test/ingest/events/chat-message"] = {202, ""};
+    host.Responses["POST https://example.test/ingest/events/server-status"] = {202, ""};
+
+    portal_cod4x::PluginRuntime runtime(configPath.string());
+    const int initializeResult = runtime.Initialize(host, "1.2.3", "^4[^1XI-BOT^4]^7");
+    Assert(initializeResult == 0, "PluginRuntime initialize should succeed");
+
+    runtime.HandlePlayerConnect(host, 2, "192.168.0.10");
+    runtime.HandlePlayerConnected(host, 2);
+    runtime.HandleChatMessage(host, 2, "hello", false);
+
+    for (int i = 0; i < 20; ++i)
+    {
+        for (int frame = 0; frame < 6; ++frame)
+        {
+            runtime.Tick(host);
+        }
+
+        host.CurrentTime += 65;
+    }
+
+    bool attemptedPoisonQueue = false;
+    bool deliveredOtherQueue = false;
+    for (const auto& request : host.Requests)
+    {
+        if (request.Method == "POST" && request.Url == "https://example.test/ingest/events/player-connected")
+        {
+            attemptedPoisonQueue = true;
+        }
+
+        if (request.Method == "POST" && request.Url == "https://example.test/ingest/events/chat-message")
+        {
+            deliveredOtherQueue = true;
+        }
+    }
+
+    Assert(attemptedPoisonQueue, "Expected attempts against poison queue");
+    Assert(deliveredOtherQueue, "Expected non-poison queue to be delivered after poison events are dropped");
+
+    std::error_code ignoreError;
+    std::filesystem::remove(configPath, ignoreError);
+}
+
 void InitializePlugin_EmitsLogAndBroadcast()
 {
     FakeHost host;
@@ -396,6 +537,8 @@ int main()
     BuildMessage_FallsBackWhenPrefixOrVersionMissing();
     Runtime_RefreshesSettingsAndReconcilesCommandPower();
     Runtime_EmitsAndFlushesPlayerConnectedEvent();
+    Runtime_AuthorizedIdentity_AllowsDisconnectEventWhenPlayerIdUnavailableAtDisconnect();
+    Runtime_DropsPoisonEventsAndUnblocksOtherQueues();
     InitializePlugin_EmitsLogAndBroadcast();
     InitializePlugin_FallsBackWhenPrefixOrVersionMissing();
 

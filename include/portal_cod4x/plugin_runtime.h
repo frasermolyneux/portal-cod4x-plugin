@@ -97,6 +97,7 @@ public:
     void Tick(ICod4xHost& host);
     void HandlePlayerConnect(ICod4xHost& host, int slot, std::string_view ipAddress);
     void HandlePlayerConnected(ICod4xHost& host, int slot);
+    void HandleClientAuthorized(ICod4xHost& host);
     void HandlePlayerDisconnected(ICod4xHost& host, int slot);
     void HandleChatMessage(ICod4xHost& host, int slot, std::string_view message, bool teamMessage);
     void HandleServerSpawned(ICod4xHost& host);
@@ -216,6 +217,7 @@ private:
     std::string GetServerMod(ICod4xHost& host) const;
 
     void BufferEvent(std::string queueName, std::string payloadJson, std::string messageId, std::int64_t nowUnixSeconds);
+    void PruneBufferedEvents(ICod4xHost& host, std::int64_t nowUnixSeconds);
     std::vector<std::size_t> BuildBatchIndicesForQueue(const std::string& queueName, std::size_t maxEvents, std::size_t maxBytes) const;
     void DropBufferedEventsByIndex(const std::vector<std::size_t>& indices);
     std::string BuildBaseEventPrefix(std::int64_t nowUnixSeconds, const std::string& messageId, long long sequenceId) const;
@@ -245,6 +247,7 @@ int InitializePlugin(ICod4xHost& host, std::string_view version, std::string_vie
 void TickPlugin(ICod4xHost& host);
 void NotifyPlayerConnect(ICod4xHost& host, int slot, std::string_view ipAddress);
 void NotifyPlayerConnected(ICod4xHost& host, int slot);
+void NotifyClientAuthorized(ICod4xHost& host);
 void NotifyPlayerDisconnected(ICod4xHost& host, int slot);
 void NotifyChatMessage(ICod4xHost& host, int slot, std::string_view message, bool teamMessage);
 void NotifyServerSpawned(ICod4xHost& host);

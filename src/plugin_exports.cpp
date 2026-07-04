@@ -305,6 +305,7 @@ PCL void COD4X_CALL OnPlayerDC(client_t* client, const char*)
 PCL void COD4X_CALL OnClientAuthorized()
 {
     Cod4xHostAdapter host;
+    portal_cod4x::NotifyClientAuthorized(host);
     portal_cod4x::TickPlugin(host);
 }
 
