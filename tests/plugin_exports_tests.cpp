@@ -96,6 +96,11 @@ extern "C" std::uint64_t COD4X_CALL Plugin_GetPlayerID(unsigned int)
     return g_player_id;
 }
 
+extern "C" std::uint64_t COD4X_CALL Plugin_GetPlayerSteamID(unsigned int)
+{
+    return g_player_id;
+}
+
 extern "C" unsigned int COD4X_CALL Plugin_GetClientNumForClient(client_t*)
 {
     return 0;

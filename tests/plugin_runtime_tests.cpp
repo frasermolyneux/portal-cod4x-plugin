@@ -35,6 +35,7 @@ public:
     std::vector<RequestRecord> Requests;
     std::unordered_map<std::string, portal_cod4x::HttpResponse> Responses;
     std::unordered_map<int, std::uint64_t> PlayerIds;
+    std::unordered_map<int, std::uint64_t> PlayerSteamIds;
     std::unordered_map<int, std::string> PlayerNames;
     std::unordered_map<int, int> PlayerScores;
     std::unordered_map<std::string, std::string> CvarValues;
@@ -105,6 +106,12 @@ public:
     {
         const auto it = PlayerIds.find(slot);
         return it == PlayerIds.end() ? 0 : it->second;
+    }
+
+    std::uint64_t GetPlayerSteamId(int slot) const override
+    {
+        const auto it = PlayerSteamIds.find(slot);
+        return it == PlayerSteamIds.end() ? 0 : it->second;
     }
 
     std::string GetPlayerName(int slot) const override
@@ -223,6 +230,9 @@ void Runtime_RefreshesSettingsAndReconcilesCommandPower()
     host.Responses["GET https://example.test/repository/v1.0/game-servers/11111111-2222-3333-4444-555555555555/configurations/cod4xCommands"] = {
         200,
         "{\"namespace\":\"cod4xCommands\",\"configuration\":\"" + EscapeJsonString(serverPayload) + "\"}"};
+    host.Responses["GET https://example.test/repository/v1.0/game-servers/11111111-2222-3333-4444-555555555555/connected-players/admin-roster"] = {
+        200,
+        "{\"data\":{\"enabled\":false,\"defaultPower\":1,\"entries\":[]}}"};
 
     portal_cod4x::PluginRuntime runtime(configPath.string());
     const int initializeResult = runtime.Initialize(host, "1.2.3", "^4[^1XI-BOT^4]^7");
@@ -307,6 +317,91 @@ void Runtime_RefreshesSettingsAndReconcilesCommandPower()
     std::filesystem::remove(configPath, ignoreError);
 }
 
+void Runtime_AdminRosterEnabled_LogsUnsupportedElevatedPowerOncePerPlayer()
+{
+    const std::filesystem::path configPath = std::filesystem::temp_directory_path() / "portal-cod4x-plugin.admin-roster.test.json";
+
+    {
+        std::ofstream configFile(configPath);
+        configFile
+            << "{"
+            << "\"tenantId\":\"tenant-test\"," 
+            << "\"clientId\":\"client-test\"," 
+            << "\"clientSecret\":\"secret-test\"," 
+            << "\"repositoryApiBaseUrl\":\"https://example.test/repository\"," 
+            << "\"repositoryApiResource\":\"api://repository-test\"," 
+            << "\"gameServerId\":\"11111111-2222-3333-4444-555555555555\"," 
+            << "\"refreshIntervalSeconds\":120"
+            << "}";
+    }
+
+    FakeHost host;
+    host.CurrentTime = 5000;
+    host.PlayerIds[2] = 76561198000000001ULL;
+    host.PlayerSteamIds[2] = 76561198000000001ULL;
+    host.PlayerNames[2] = "AdminPlayer";
+
+    host.Responses["POST https://login.microsoftonline.com/tenant-test/oauth2/v2.0/token"] = {
+        200,
+        "{\"access_token\":\"token-1\",\"expires_in\":3600}"};
+    host.Responses["GET https://example.test/repository/v1.0/configurations/cod4xCommands"] = {404, ""};
+    host.Responses["GET https://example.test/repository/v1.0/game-servers/11111111-2222-3333-4444-555555555555/configurations/cod4xCommands"] = {404, ""};
+    host.Responses["GET https://example.test/repository/v1.0/game-servers/11111111-2222-3333-4444-555555555555/connected-players/admin-roster"] = {
+        200,
+        "{\"data\":{\"enabled\":true,\"defaultPower\":10,\"entries\":[{\"playerGuid\":\"76561198000000001\",\"power\":70,\"tags\":[\"GameAdmin\"]}]}}"};
+
+    portal_cod4x::PluginRuntime runtime(configPath.string());
+    const int initializeResult = runtime.Initialize(host, "1.2.3", "^4[^1XI-BOT^4]^7");
+    Assert(initializeResult == 0, "PluginRuntime initialize should succeed");
+
+    runtime.HandlePlayerConnect(host, 2, "127.0.0.1");
+    runtime.HandleClientAuthorized(host);
+
+    const auto pump = [&runtime, &host]() {
+        for (int i = 0; i < 6; ++i)
+        {
+            runtime.Tick(host);
+        }
+    };
+
+    pump();
+
+    int unsupportedWarningCount = 0;
+    int reconciliationSummaryCount = 0;
+    for (const auto& logMessage : host.Logs)
+    {
+        if (logMessage.find("cod4xPower desired level 70 for player 76561198000000001 cannot be applied") != std::string::npos)
+        {
+            unsupportedWarningCount++;
+        }
+
+        if (logMessage.find("cod4xPower roster reconciliation evaluated") != std::string::npos)
+        {
+            reconciliationSummaryCount++;
+        }
+    }
+
+    Assert(unsupportedWarningCount == 1, "Expected elevated admin-power warning to log once for the player");
+    Assert(reconciliationSummaryCount >= 1, "Expected admin roster reconciliation to run");
+
+    host.CurrentTime = 5121;
+    pump();
+
+    int warningCountAfterSecondRefresh = 0;
+    for (const auto& logMessage : host.Logs)
+    {
+        if (logMessage.find("cod4xPower desired level 70 for player 76561198000000001 cannot be applied") != std::string::npos)
+        {
+            warningCountAfterSecondRefresh++;
+        }
+    }
+
+    Assert(warningCountAfterSecondRefresh == 1, "Expected warning dedupe for unchanged admin roster");
+
+    std::error_code ignoreError;
+    std::filesystem::remove(configPath, ignoreError);
+}
+
 void Runtime_EmitsAndFlushesPlayerConnectedEvent()
 {
     const std::filesystem::path configPath = std::filesystem::temp_directory_path() / "portal-cod4x-plugin.ingest.test.json";
@@ -338,6 +433,7 @@ void Runtime_EmitsAndFlushesPlayerConnectedEvent()
         "{\"access_token\":\"token-1\",\"expires_in\":3600}"};
     host.Responses["GET https://example.test/repository/v1.0/configurations/cod4xCommands"] = {404, ""};
     host.Responses["GET https://example.test/repository/v1.0/game-servers/11111111-2222-3333-4444-555555555555/configurations/cod4xCommands"] = {404, ""};
+    host.Responses["GET https://example.test/repository/v1.0/game-servers/11111111-2222-3333-4444-555555555555/connected-players/admin-roster"] = {404, ""};
     host.Responses["POST https://example.test/ingest/events/player-connected"] = {202, ""};
 
     portal_cod4x::PluginRuntime runtime(configPath.string());
@@ -402,6 +498,7 @@ void Runtime_AuthorizedIdentity_AllowsDisconnectEventWhenPlayerIdUnavailableAtDi
         "{\"access_token\":\"token-1\",\"expires_in\":3600}"};
     host.Responses["GET https://example.test/repository/v1.0/configurations/cod4xCommands"] = {404, ""};
     host.Responses["GET https://example.test/repository/v1.0/game-servers/11111111-2222-3333-4444-555555555555/configurations/cod4xCommands"] = {404, ""};
+    host.Responses["GET https://example.test/repository/v1.0/game-servers/11111111-2222-3333-4444-555555555555/connected-players/admin-roster"] = {404, ""};
     host.Responses["POST https://example.test/ingest/events/player-disconnected"] = {202, ""};
 
     portal_cod4x::PluginRuntime runtime(configPath.string());
@@ -468,6 +565,7 @@ void Runtime_DropsPoisonEventsAndUnblocksOtherQueues()
         "{\"access_token\":\"token-1\",\"expires_in\":3600}"};
     host.Responses["GET https://example.test/repository/v1.0/configurations/cod4xCommands"] = {404, ""};
     host.Responses["GET https://example.test/repository/v1.0/game-servers/11111111-2222-3333-4444-555555555555/configurations/cod4xCommands"] = {404, ""};
+    host.Responses["GET https://example.test/repository/v1.0/game-servers/11111111-2222-3333-4444-555555555555/connected-players/admin-roster"] = {404, ""};
     host.Responses["POST https://example.test/ingest/events/player-connected"] = {500, ""};
     host.Responses["POST https://example.test/ingest/events/chat-message"] = {202, ""};
     host.Responses["POST https://example.test/ingest/events/server-status"] = {202, ""};
@@ -617,6 +715,7 @@ int main()
     BuildMessage_UsesPrefixAndVersion();
     BuildMessage_FallsBackWhenPrefixOrVersionMissing();
     Runtime_RefreshesSettingsAndReconcilesCommandPower();
+    Runtime_AdminRosterEnabled_LogsUnsupportedElevatedPowerOncePerPlayer();
     Runtime_EmitsAndFlushesPlayerConnectedEvent();
     Runtime_AuthorizedIdentity_AllowsDisconnectEventWhenPlayerIdUnavailableAtDisconnect();
     Runtime_DropsPoisonEventsAndUnblocksOtherQueues();

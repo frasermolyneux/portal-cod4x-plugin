@@ -182,6 +182,7 @@ extern "C" void COD4X_CALL Plugin_Cbuf_AddText(const char* text);
 extern "C" int COD4X_CALL Plugin_GetSlotCount();
 extern "C" char* COD4X_CALL Plugin_GetPlayerName(int slot);
 extern "C" std::uint64_t COD4X_CALL Plugin_GetPlayerID(unsigned int clientslot);
+extern "C" std::uint64_t COD4X_CALL Plugin_GetPlayerSteamID(unsigned int clientslot);
 extern "C" unsigned int COD4X_CALL Plugin_GetClientNumForClient(client_t* cl);
 extern "C" clientScoreboard_t COD4X_CALL Plugin_GetClientScoreboard(int clientNum);
 extern "C" const char* COD4X_CALL Plugin_NET_AdrToStringShortMT(netadr_t* a, char* buf, int len);

@@ -6,6 +6,7 @@
 #include <string>
 #include <string_view>
 #include <unordered_map>
+#include <unordered_set>
 #include <vector>
 
 namespace portal_cod4x
@@ -78,6 +79,7 @@ public:
     virtual void EndHttpRequest(HttpRequestHandle handle) = 0;
 
     virtual std::uint64_t GetPlayerId(int slot) const = 0;
+    virtual std::uint64_t GetPlayerSteamId(int slot) const = 0;
     virtual std::string GetPlayerName(int slot) const = 0;
     virtual int GetSlotCount() const = 0;
     virtual int GetPlayerScore(int slot) const = 0;
@@ -113,7 +115,8 @@ private:
         Idle,
         AcquiringToken,
         FetchingGlobalConfig,
-        FetchingServerConfig
+        FetchingServerConfig,
+        FetchingAdminRoster
     };
 
     enum class IngestStage
@@ -139,7 +142,16 @@ private:
         std::string IpAddress;
         int SlotId = -1;
         int Score = 0;
+        int AppliedAdminPower = 1;
+        bool HasAppliedAdminPower = false;
+        std::uint64_t SteamId = 0;
         std::int64_t ConnectedAtUnixSeconds = 0;
+    };
+
+    struct AdminRosterEntry
+    {
+        int Power = 1;
+        std::vector<std::string> Tags;
     };
 
     std::string configPath;
@@ -163,8 +175,10 @@ private:
     std::int64_t inFlightStartedUnixSeconds = 0;
     bool pendingHasGlobalConfig = false;
     bool pendingHasServerConfig = false;
+    bool pendingHasAdminRoster = false;
     std::string pendingGlobalConfigPayload;
     std::string pendingServerConfigPayload;
+    std::string pendingAdminRosterPayload;
 
     IngestStage ingestStage = IngestStage::Idle;
     HttpRequestHandle ingestRequest = nullptr;
@@ -180,6 +194,11 @@ private:
     std::vector<std::size_t> ingestBatchIndices;
     std::deque<BufferedEvent> bufferedEvents;
     std::unordered_map<int, ConnectedPlayerState> connectedPlayers;
+    bool adminPowerEnabled = false;
+    int adminDefaultPower = 1;
+    std::unordered_map<std::string, AdminRosterEntry> adminRosterByPlayerGuid;
+    std::string adminRosterSnapshotHash;
+    std::unordered_set<std::uint64_t> loggedUnsupportedSteamIds;
 
     bool IsIngestConfigured() const;
     bool IsIngestTokenValid(std::int64_t nowUnixSeconds) const;
@@ -247,8 +266,15 @@ private:
     void AbortRefresh(ICod4xHost& host, std::int64_t nowUnixSeconds, std::string_view reason);
     bool StartGlobalConfigRequest(ICod4xHost& host, std::int64_t nowUnixSeconds);
     bool StartServerConfigRequest(ICod4xHost& host, std::int64_t nowUnixSeconds);
+    bool StartAdminRosterRequest(ICod4xHost& host, std::int64_t nowUnixSeconds);
     void FinalizeRefresh(ICod4xHost& host, std::int64_t nowUnixSeconds);
     bool ApplyCommandReconciliation(ICod4xHost& host);
+    bool ApplyAdminPowerReconciliation(ICod4xHost& host);
+    int ResolveDesiredAdminPower(const ConnectedPlayerState& playerState) const;
+    static std::string BuildAdminRosterSnapshotHash(
+        bool enabled,
+        int defaultPower,
+        const std::unordered_map<std::string, AdminRosterEntry>& entries);
 };
 
 std::string BuildOnlineBroadcastMessage(std::string_view prefix, std::string_view version);

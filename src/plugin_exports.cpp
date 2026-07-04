@@ -204,6 +204,16 @@ public:
         return Plugin_GetPlayerID(static_cast<unsigned int>(slot));
     }
 
+    std::uint64_t GetPlayerSteamId(int slot) const override
+    {
+        if (slot < 0)
+        {
+            return 0;
+        }
+
+        return Plugin_GetPlayerSteamID(static_cast<unsigned int>(slot));
+    }
+
     std::string GetPlayerName(int slot) const override
     {
         if (slot < 0)
