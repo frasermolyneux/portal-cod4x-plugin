@@ -14,10 +14,23 @@ namespace
 class FakeHost final : public portal_cod4x::ICod4xHost
 {
 public:
+    struct RequestRecord
+    {
+        std::string Method;
+        std::string Url;
+        std::string Body;
+        std::string Headers;
+    };
+
     std::vector<std::string> BroadcastMessages;
     std::vector<std::string> Logs;
     std::vector<std::string> ExecutedCommands;
+    std::vector<RequestRecord> Requests;
     std::unordered_map<std::string, portal_cod4x::HttpResponse> Responses;
+    std::unordered_map<int, std::uint64_t> PlayerIds;
+    std::unordered_map<int, std::string> PlayerNames;
+    std::unordered_map<int, int> PlayerScores;
+    std::unordered_map<std::string, std::string> CvarValues;
     std::int64_t CurrentTime = 0;
 
     void BroadcastChat(std::string_view message) override
@@ -39,9 +52,11 @@ public:
     portal_cod4x::HttpRequestHandle BeginHttpRequest(
         std::string_view url,
         std::string_view method,
-        std::string_view,
-        std::string_view) override
+        std::string_view body,
+        std::string_view additionalHeaders) override
     {
+        Requests.push_back(RequestRecord{std::string(method), std::string(url), std::string(body), std::string(additionalHeaders)});
+
         const std::string key = std::string(method) + " " + std::string(url);
         auto* pending = new PendingRequest{};
 
@@ -72,6 +87,35 @@ public:
     void EndHttpRequest(portal_cod4x::HttpRequestHandle handle) override
     {
         delete static_cast<PendingRequest*>(handle);
+    }
+
+    std::uint64_t GetPlayerId(int slot) const override
+    {
+        const auto it = PlayerIds.find(slot);
+        return it == PlayerIds.end() ? 0 : it->second;
+    }
+
+    std::string GetPlayerName(int slot) const override
+    {
+        const auto it = PlayerNames.find(slot);
+        return it == PlayerNames.end() ? std::string() : it->second;
+    }
+
+    int GetSlotCount() const override
+    {
+        return 64;
+    }
+
+    int GetPlayerScore(int slot) const override
+    {
+        const auto it = PlayerScores.find(slot);
+        return it == PlayerScores.end() ? 0 : it->second;
+    }
+
+    std::string GetCvarString(std::string_view cvarName) const override
+    {
+        const auto it = CvarValues.find(std::string(cvarName));
+        return it == CvarValues.end() ? std::string() : it->second;
     }
 
     std::int64_t GetUnixTimeSeconds() const override
@@ -251,6 +295,70 @@ void Runtime_RefreshesSettingsAndReconcilesCommandPower()
     std::filesystem::remove(configPath, ignoreError);
 }
 
+void Runtime_EmitsAndFlushesPlayerConnectedEvent()
+{
+    const std::filesystem::path configPath = std::filesystem::temp_directory_path() / "portal-cod4x-plugin.ingest.test.json";
+
+    {
+        std::ofstream configFile(configPath);
+        configFile
+            << "{"
+            << "\"tenantId\":\"tenant-test\"," 
+            << "\"clientId\":\"client-test\"," 
+            << "\"clientSecret\":\"secret-test\"," 
+            << "\"repositoryApiBaseUrl\":\"https://example.test/repository\"," 
+            << "\"repositoryApiResource\":\"api://repository-test\"," 
+            << "\"ingestBaseUrl\":\"https://example.test/ingest\"," 
+            << "\"ingestApiResource\":\"api://server-events-ingest\"," 
+            << "\"gameServerId\":\"11111111-2222-3333-4444-555555555555\"," 
+            << "\"gameType\":\"CallOfDuty4\"," 
+            << "\"refreshIntervalSeconds\":120"
+            << "}";
+    }
+
+    FakeHost host;
+    host.CurrentTime = 2000;
+    host.PlayerIds[2] = 76561198000000001ULL;
+    host.PlayerNames[2] = "PlayerOne";
+
+    host.Responses["POST https://login.microsoftonline.com/tenant-test/oauth2/v2.0/token"] = {
+        200,
+        "{\"access_token\":\"token-1\",\"expires_in\":3600}"};
+    host.Responses["GET https://example.test/repository/v1.0/configurations/cod4xCommands"] = {404, ""};
+    host.Responses["GET https://example.test/repository/v1.0/game-servers/11111111-2222-3333-4444-555555555555/configurations/cod4xCommands"] = {404, ""};
+    host.Responses["POST https://example.test/ingest/events/player-connected"] = {202, ""};
+
+    portal_cod4x::PluginRuntime runtime(configPath.string());
+    const int initializeResult = runtime.Initialize(host, "1.2.3", "^4[^1XI-BOT^4]^7");
+    Assert(initializeResult == 0, "PluginRuntime initialize should succeed");
+
+    runtime.HandlePlayerConnect(host, 2, "192.168.0.10");
+    runtime.HandlePlayerConnected(host, 2);
+
+    for (int i = 0; i < 8; ++i)
+    {
+        runtime.Tick(host);
+    }
+
+    bool foundIngestPost = false;
+    for (const auto& request : host.Requests)
+    {
+        if (request.Method == "POST" && request.Url == "https://example.test/ingest/events/player-connected")
+        {
+            foundIngestPost = true;
+            Assert(request.Body.find("\"playerGuid\":\"76561198000000001\"") != std::string::npos, "Expected playerGuid in ingest payload");
+            Assert(request.Body.find("\"ipAddress\":\"192.168.0.10\"") != std::string::npos, "Expected ipAddress in ingest payload");
+            Assert(request.Body.find("\"gameType\":\"CallOfDuty4\"") != std::string::npos, "Expected gameType in ingest payload");
+            break;
+        }
+    }
+
+    Assert(foundIngestPost, "Expected a player-connected ingest POST request");
+
+    std::error_code ignoreError;
+    std::filesystem::remove(configPath, ignoreError);
+}
+
 void InitializePlugin_EmitsLogAndBroadcast()
 {
     FakeHost host;
@@ -287,6 +395,7 @@ int main()
     BuildMessage_UsesPrefixAndVersion();
     BuildMessage_FallsBackWhenPrefixOrVersionMissing();
     Runtime_RefreshesSettingsAndReconcilesCommandPower();
+    Runtime_EmitsAndFlushesPlayerConnectedEvent();
     InitializePlugin_EmitsLogAndBroadcast();
     InitializePlugin_FallsBackWhenPrefixOrVersionMissing();
 

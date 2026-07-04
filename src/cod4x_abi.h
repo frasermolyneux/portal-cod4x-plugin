@@ -1,6 +1,7 @@
 #pragma once
 
 #include <cstddef>
+#include <cstdint>
 
 #if defined(PORTAL_COD4X_USE_EXTERNAL_SDK)
 #if !defined(PLUGIN_HANDLER_VERSION_MAJOR)
@@ -162,9 +163,29 @@ typedef struct
     void* tls;
 } ftRequest_t;
 
+typedef struct
+{
+    int score;
+    int kills;
+    int deaths;
+    int assists;
+} clientScoreboard_t;
+
+typedef struct client_t
+{
+    int reserved;
+} client_t;
+
 extern "C" void COD4X_CALL Plugin_Printf(const char* fmt, ...);
 extern "C" void COD4X_CALL Plugin_ChatPrintf(int slot, const char* fmt, ...);
 extern "C" void COD4X_CALL Plugin_Cbuf_AddText(const char* text);
+extern "C" int COD4X_CALL Plugin_GetSlotCount();
+extern "C" char* COD4X_CALL Plugin_GetPlayerName(int slot);
+extern "C" std::uint64_t COD4X_CALL Plugin_GetPlayerID(unsigned int clientslot);
+extern "C" unsigned int COD4X_CALL Plugin_GetClientNumForClient(client_t* cl);
+extern "C" clientScoreboard_t COD4X_CALL Plugin_GetClientScoreboard(int clientNum);
+extern "C" const char* COD4X_CALL Plugin_NET_AdrToStringShortMT(netadr_t* a, char* buf, int len);
+extern "C" void COD4X_CALL Plugin_Cvar_VariableStringBuffer(const char* cvarname, char* buff, size_t size);
 extern "C" ftRequest_t* COD4X_CALL Plugin_HTTP_MakeHttpRequest(
     const char* url,
     const char* method,

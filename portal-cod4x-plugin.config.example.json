@@ -4,6 +4,9 @@
     "clientSecret": "replace-with-key-vault-secret-value",
     "repositoryApiBaseUrl": "https://example-apim.azure-api.net/repository",
     "repositoryApiResource": "api://xtremeidiots-portal-repository-api-prd",
+    "ingestBaseUrl": "https://example-apim.azure-api.net/ingest",
+    "ingestApiResource": "api://xtremeidiots-portal-server-events-api-prd",
     "gameServerId": "11111111-2222-3333-4444-555555555555",
+    "gameType": "CallOfDuty4",
     "refreshIntervalSeconds": 120
 }

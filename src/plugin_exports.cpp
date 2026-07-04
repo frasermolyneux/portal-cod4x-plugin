@@ -6,6 +6,7 @@
 #include <cstring>
 #include <ctime>
 #include <algorithm>
+#include <array>
 #include <optional>
 #include <string>
 #include <string_view>
@@ -20,6 +21,56 @@ std::string BuildShortDescription()
     description += portal_cod4x::kPluginSemanticVersion;
     description += ')';
     return description;
+}
+
+std::string StripPortFromAddress(std::string value)
+{
+    const std::size_t bracketPos = value.rfind("]:");
+    if (!value.empty() && value.front() == '[' && bracketPos != std::string::npos)
+    {
+        return value.substr(1, bracketPos - 1);
+    }
+
+    const std::size_t colonPos = value.rfind(':');
+    if (colonPos != std::string::npos && value.find('.') != std::string::npos)
+    {
+        return value.substr(0, colonPos);
+    }
+
+    return value;
+}
+
+std::string NetAddressToIp(const netadr_t* address)
+{
+    if (address == nullptr)
+    {
+        return "0.0.0.0";
+    }
+
+    if (address->type == NA_IP)
+    {
+        return std::to_string(address->address.ip[0]) + "." + std::to_string(address->address.ip[1]) + "." +
+            std::to_string(address->address.ip[2]) + "." + std::to_string(address->address.ip[3]);
+    }
+
+    std::array<char, 128> buffer{};
+    const char* formatted = Plugin_NET_AdrToStringShortMT(const_cast<netadr_t*>(address), buffer.data(), static_cast<int>(buffer.size()));
+    if (formatted == nullptr)
+    {
+        return "0.0.0.0";
+    }
+
+    return StripPortFromAddress(std::string(formatted));
+}
+
+int ClientPointerToSlot(client_t* client)
+{
+    if (client == nullptr)
+    {
+        return -1;
+    }
+
+    return static_cast<int>(Plugin_GetClientNumForClient(client));
 }
 
 void CopyToBuffer(char* destination, std::size_t destinationLength, std::string_view value)
@@ -132,6 +183,49 @@ public:
         }
     }
 
+    std::uint64_t GetPlayerId(int slot) const override
+    {
+        if (slot < 0)
+        {
+            return 0;
+        }
+
+        return Plugin_GetPlayerID(static_cast<unsigned int>(slot));
+    }
+
+    std::string GetPlayerName(int slot) const override
+    {
+        if (slot < 0)
+        {
+            return {};
+        }
+
+        const char* value = Plugin_GetPlayerName(slot);
+        return value == nullptr ? std::string() : std::string(value);
+    }
+
+    int GetSlotCount() const override
+    {
+        return Plugin_GetSlotCount();
+    }
+
+    int GetPlayerScore(int slot) const override
+    {
+        if (slot < 0)
+        {
+            return 0;
+        }
+
+        return Plugin_GetClientScoreboard(slot).score;
+    }
+
+    std::string GetCvarString(std::string_view cvarName) const override
+    {
+        std::array<char, 256> buffer{};
+        Plugin_Cvar_VariableStringBuffer(std::string(cvarName).c_str(), buffer.data(), buffer.size());
+        return std::string(buffer.data());
+    }
+
     std::int64_t GetUnixTimeSeconds() const override
     {
         return static_cast<std::int64_t>(std::time(nullptr));
@@ -153,6 +247,59 @@ PCL void COD4X_CALL OnFrame()
 {
     Cod4xHostAdapter host;
     portal_cod4x::TickPlugin(host);
+}
+
+PCL void COD4X_CALL OnMessageSent(char* message, int slot, qboolean* show, int mode)
+{
+    if (show != nullptr && *show == qfalse)
+    {
+        return;
+    }
+
+    if (message == nullptr)
+    {
+        return;
+    }
+
+    Cod4xHostAdapter host;
+    portal_cod4x::NotifyChatMessage(host, slot, std::string_view(message), mode != 0);
+}
+
+PCL void COD4X_CALL OnSpawnServer()
+{
+    Cod4xHostAdapter host;
+    portal_cod4x::NotifyServerSpawned(host);
+}
+
+PCL void COD4X_CALL OnExitLevel()
+{
+    Cod4xHostAdapter host;
+    portal_cod4x::NotifyServerExited(host);
+}
+
+PCL void COD4X_CALL OnPlayerConnect(
+    int clientnum,
+    netadr_t* netaddress,
+    char*,
+    char*,
+    int,
+    char*,
+    int)
+{
+    Cod4xHostAdapter host;
+    portal_cod4x::NotifyPlayerConnect(host, clientnum, NetAddressToIp(netaddress));
+}
+
+PCL void COD4X_CALL OnClientEnterWorld(client_t* client)
+{
+    Cod4xHostAdapter host;
+    portal_cod4x::NotifyPlayerConnected(host, ClientPointerToSlot(client));
+}
+
+PCL void COD4X_CALL OnPlayerDC(client_t* client, const char*)
+{
+    Cod4xHostAdapter host;
+    portal_cod4x::NotifyPlayerDisconnected(host, ClientPointerToSlot(client));
 }
 
 PCL void COD4X_CALL OnClientAuthorized()

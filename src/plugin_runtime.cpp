@@ -3,10 +3,15 @@
 #include <algorithm>
 #include <array>
 #include <cctype>
+#include <ctime>
 #include <fstream>
+#include <iomanip>
+#include <random>
 #include <regex>
+#include <sstream>
 #include <string>
 #include <string_view>
+#include <unordered_set>
 #include <vector>
 
 namespace portal_cod4x
@@ -17,6 +22,19 @@ namespace
 // the refresh pipeline abandons it (and frees the handle) to avoid a stalled poll
 // wedging future refreshes.
 constexpr std::int64_t kHttpRequestDeadlineSeconds = 30;
+constexpr std::int64_t kIngestRequestDeadlineSeconds = 20;
+constexpr std::int64_t kServerStatusIntervalSeconds = 60;
+
+constexpr std::size_t kMaxBufferedEvents = 1000;
+constexpr std::size_t kIngestMaxBatchEvents = 100;
+constexpr std::size_t kIngestMaxBatchBytes = 200 * 1024;
+
+constexpr std::string_view kQueuePlayerConnected = "player-connected";
+constexpr std::string_view kQueuePlayerDisconnected = "player-disconnected";
+constexpr std::string_view kQueueChatMessage = "chat-message";
+constexpr std::string_view kQueueServerConnected = "server-connected";
+constexpr std::string_view kQueueMapChange = "map-change";
+constexpr std::string_view kQueueServerStatus = "server-status";
 
 struct CommandOverride
 {
@@ -380,6 +398,9 @@ std::optional<PluginConfig> ParsePluginConfig(const std::string& configJson)
     auto repositoryApiBaseUrl = ExtractJsonStringValue(configJson, "repositoryApiBaseUrl");
     auto repositoryApiResource = ExtractJsonStringValue(configJson, "repositoryApiResource");
     auto gameServerId = ExtractJsonStringValue(configJson, "gameServerId");
+    auto ingestBaseUrl = ExtractJsonStringValue(configJson, "ingestBaseUrl");
+    auto ingestApiResource = ExtractJsonStringValue(configJson, "ingestApiResource");
+    auto gameType = ExtractJsonStringValue(configJson, "gameType");
 
     if (!tenantId.has_value() || !clientId.has_value() || !clientSecret.has_value() || !repositoryApiBaseUrl.has_value() ||
         !repositoryApiResource.has_value() || !gameServerId.has_value())
@@ -394,6 +415,21 @@ std::optional<PluginConfig> ParsePluginConfig(const std::string& configJson)
     config.RepositoryApiBaseUrl = NormalizeBaseUrl(Trim(*repositoryApiBaseUrl));
     config.RepositoryApiResource = Trim(*repositoryApiResource);
     config.GameServerId = Trim(*gameServerId);
+
+    if (ingestBaseUrl.has_value())
+    {
+        config.IngestBaseUrl = NormalizeBaseUrl(Trim(*ingestBaseUrl));
+    }
+
+    if (ingestApiResource.has_value())
+    {
+        config.IngestApiResource = Trim(*ingestApiResource);
+    }
+
+    if (gameType.has_value())
+    {
+        config.GameType = Trim(*gameType);
+    }
 
     const auto refreshInterval = ExtractJsonIntValue(configJson, "refreshIntervalSeconds");
     if (refreshInterval.has_value())
@@ -490,6 +526,7 @@ int PluginRuntime::Initialize(ICod4xHost& host, std::string_view version, std::s
 {
     const std::string onlineMessage = BuildOnlineBroadcastMessage(prefix, version);
     const std::string normalizedVersion = version.empty() ? "0.0.0-unknown" : std::string(version);
+    pluginVersion = normalizedVersion;
 
     host.Log("Portal Plugin is online (version " + normalizedVersion + ")");
     host.BroadcastChat(onlineMessage);
@@ -497,6 +534,7 @@ int PluginRuntime::Initialize(ICod4xHost& host, std::string_view version, std::s
     const std::int64_t nowUnixSeconds = host.GetUnixTimeSeconds();
     TryLoadConfig(host, nowUnixSeconds);
     nextRefreshUnixSeconds = 0;
+    nextServerStatusUnixSeconds = nowUnixSeconds + kServerStatusIntervalSeconds;
 
     return 0;
 }
@@ -516,23 +554,226 @@ void PluginRuntime::Tick(ICod4xHost& host)
         {
             return;
         }
+
+        nextServerStatusUnixSeconds = nowUnixSeconds + kServerStatusIntervalSeconds;
     }
 
-    // A refresh is a multi-step, non-blocking pipeline (token -> global config ->
-    // server config -> reconcile). While one is in flight, advance it by a single
-    // step per frame so the main thread is never blocked on network I/O.
     if (refreshStage != RefreshStage::Idle)
     {
         AdvanceRefresh(host, nowUnixSeconds);
-        return;
+    }
+    else if (nowUnixSeconds >= nextRefreshUnixSeconds)
+    {
+        BeginRefresh(host, nowUnixSeconds);
     }
 
-    if (nowUnixSeconds < nextRefreshUnixSeconds)
+    if (IsIngestConfigured() && nowUnixSeconds >= nextServerStatusUnixSeconds)
+    {
+        FlushServerStatusSnapshot(host, nowUnixSeconds);
+        nextServerStatusUnixSeconds = nowUnixSeconds + kServerStatusIntervalSeconds;
+    }
+
+    AdvanceIngest(host, nowUnixSeconds);
+}
+
+void PluginRuntime::HandlePlayerConnect(ICod4xHost& host, int slot, std::string_view ipAddress)
+{
+    if (!loadedConfig.has_value() || slot < 0)
     {
         return;
     }
 
-    BeginRefresh(host, nowUnixSeconds);
+    ConnectedPlayerState& playerState = connectedPlayers[slot];
+    playerState.SlotId = slot;
+    playerState.IpAddress = NormalizeIpAddress(std::string(ipAddress));
+    if (playerState.ConnectedAtUnixSeconds == 0)
+    {
+        playerState.ConnectedAtUnixSeconds = host.GetUnixTimeSeconds();
+    }
+
+    if (playerState.IpAddress.empty())
+    {
+        playerState.IpAddress = "0.0.0.0";
+    }
+
+    if (playerState.Username.empty())
+    {
+        playerState.Username = Trim(host.GetPlayerName(slot));
+    }
+}
+
+void PluginRuntime::HandlePlayerConnected(ICod4xHost& host, int slot)
+{
+    if (!loadedConfig.has_value() || !IsIngestConfigured() || slot < 0)
+    {
+        return;
+    }
+
+    const std::uint64_t playerId = host.GetPlayerId(slot);
+    if (playerId == 0)
+    {
+        return;
+    }
+
+    const std::int64_t nowUnixSeconds = host.GetUnixTimeSeconds();
+    ConnectedPlayerState& playerState = connectedPlayers[slot];
+    playerState.SlotId = slot;
+    playerState.PlayerGuid = std::to_string(playerId);
+    playerState.Username = Trim(host.GetPlayerName(slot));
+    playerState.Score = host.GetPlayerScore(slot);
+    playerState.ConnectedAtUnixSeconds = nowUnixSeconds;
+
+    if (playerState.IpAddress.empty())
+    {
+        playerState.IpAddress = "0.0.0.0";
+    }
+
+    if (playerState.Username.empty())
+    {
+        return;
+    }
+
+    const std::string messageId = GenerateMessageId();
+    BufferEvent(
+        std::string(kQueuePlayerConnected),
+        BuildPlayerConnectedPayload(
+            nowUnixSeconds,
+            messageId,
+            playerState.PlayerGuid,
+            playerState.Username,
+            playerState.IpAddress,
+            slot),
+        messageId,
+        nowUnixSeconds);
+}
+
+void PluginRuntime::HandlePlayerDisconnected(ICod4xHost& host, int slot)
+{
+    if (!loadedConfig.has_value() || !IsIngestConfigured() || slot < 0)
+    {
+        return;
+    }
+
+    auto stateIt = connectedPlayers.find(slot);
+    ConnectedPlayerState state;
+    if (stateIt != connectedPlayers.end())
+    {
+        state = stateIt->second;
+        connectedPlayers.erase(stateIt);
+    }
+
+    if (state.PlayerGuid.empty())
+    {
+        const std::uint64_t playerId = host.GetPlayerId(slot);
+        if (playerId != 0)
+        {
+            state.PlayerGuid = std::to_string(playerId);
+        }
+    }
+
+    if (state.Username.empty())
+    {
+        state.Username = Trim(host.GetPlayerName(slot));
+    }
+
+    if (state.PlayerGuid.empty() || state.Username.empty())
+    {
+        return;
+    }
+
+    const std::int64_t nowUnixSeconds = host.GetUnixTimeSeconds();
+    const std::string messageId = GenerateMessageId();
+    BufferEvent(
+        std::string(kQueuePlayerDisconnected),
+        BuildPlayerDisconnectedPayload(nowUnixSeconds, messageId, state.PlayerGuid, state.Username, slot),
+        messageId,
+        nowUnixSeconds);
+}
+
+void PluginRuntime::HandleChatMessage(ICod4xHost& host, int slot, std::string_view message, bool teamMessage)
+{
+    if (!loadedConfig.has_value() || !IsIngestConfigured() || slot < 0)
+    {
+        return;
+    }
+
+    const std::string trimmedMessage = Trim(std::string(message));
+    if (trimmedMessage.empty())
+    {
+        return;
+    }
+
+    ConnectedPlayerState& playerState = connectedPlayers[slot];
+    playerState.SlotId = slot;
+    if (playerState.ConnectedAtUnixSeconds == 0)
+    {
+        playerState.ConnectedAtUnixSeconds = host.GetUnixTimeSeconds();
+    }
+
+    if (playerState.PlayerGuid.empty())
+    {
+        const std::uint64_t playerId = host.GetPlayerId(slot);
+        if (playerId != 0)
+        {
+            playerState.PlayerGuid = std::to_string(playerId);
+        }
+    }
+
+    if (playerState.Username.empty())
+    {
+        playerState.Username = Trim(host.GetPlayerName(slot));
+    }
+
+    if (playerState.PlayerGuid.empty() || playerState.Username.empty())
+    {
+        return;
+    }
+
+    const std::int64_t nowUnixSeconds = host.GetUnixTimeSeconds();
+    const std::string messageId = GenerateMessageId();
+    BufferEvent(
+        std::string(kQueueChatMessage),
+        BuildChatMessagePayload(
+            nowUnixSeconds,
+            messageId,
+            playerState.PlayerGuid,
+            playerState.Username,
+            slot,
+            trimmedMessage,
+            teamMessage),
+        messageId,
+        nowUnixSeconds);
+}
+
+void PluginRuntime::HandleServerSpawned(ICod4xHost& host)
+{
+    if (!loadedConfig.has_value() || !IsIngestConfigured())
+    {
+        return;
+    }
+
+    const std::int64_t nowUnixSeconds = host.GetUnixTimeSeconds();
+
+    const std::string serverConnectedMessageId = GenerateMessageId();
+    BufferEvent(
+        std::string(kQueueServerConnected),
+        BuildServerConnectedPayload(nowUnixSeconds, serverConnectedMessageId),
+        serverConnectedMessageId,
+        nowUnixSeconds);
+
+    const std::string mapChangeMessageId = GenerateMessageId();
+    BufferEvent(
+        std::string(kQueueMapChange),
+        BuildMapChangePayload(nowUnixSeconds, mapChangeMessageId, GetMapName(host), GetGameName(host)),
+        mapChangeMessageId,
+        nowUnixSeconds);
+
+    nextServerStatusUnixSeconds = nowUnixSeconds;
+}
+
+void PluginRuntime::HandleServerExited(ICod4xHost&)
+{
+    connectedPlayers.clear();
 }
 
 const EffectiveServerContext& PluginRuntime::GetServerContext() const
@@ -562,7 +803,8 @@ bool PluginRuntime::TryLoadConfig(ICod4xHost& host, std::int64_t nowUnixSeconds)
     const auto parsedConfig = ParsePluginConfig(configJson);
     if (!parsedConfig.has_value())
     {
-        logConfigIssue("plugin config is invalid; expected tenantId, clientId, clientSecret, repositoryApiBaseUrl, repositoryApiResource, and gameServerId");
+        logConfigIssue(
+            "plugin config is invalid; expected tenantId, clientId, clientSecret, repositoryApiBaseUrl, repositoryApiResource, and gameServerId");
         return false;
     }
 
@@ -953,6 +1195,684 @@ bool PluginRuntime::ApplyCommandReconciliation(ICod4xHost& host)
     return false;
 }
 
+bool PluginRuntime::IsIngestConfigured() const
+{
+    return loadedConfig.has_value() && !loadedConfig->IngestBaseUrl.empty() && !loadedConfig->IngestApiResource.empty() &&
+        !loadedConfig->GameType.empty();
+}
+
+bool PluginRuntime::IsIngestTokenValid(std::int64_t nowUnixSeconds) const
+{
+    return !ingestAccessToken.empty() && nowUnixSeconds + 30 < ingestAccessTokenExpiresAtUnixSeconds;
+}
+
+void PluginRuntime::AdvanceIngest(ICod4xHost& host, std::int64_t nowUnixSeconds)
+{
+    if (!loadedConfig.has_value())
+    {
+        return;
+    }
+
+    if (!IsIngestConfigured())
+    {
+        if (!ingestConfigWarningLogged)
+        {
+            host.Log("ingest egress disabled; configure ingestBaseUrl, ingestApiResource, and gameType to enable event emission");
+            ingestConfigWarningLogged = true;
+        }
+
+        return;
+    }
+
+    ingestConfigWarningLogged = false;
+
+    if (ingestStage != IngestStage::Idle)
+    {
+        if (ingestRequest == nullptr)
+        {
+            ingestStage = IngestStage::Idle;
+            return;
+        }
+
+        HttpResponse response;
+        const HttpRequestStatus status = host.PollHttpRequest(ingestRequest, response);
+        if (status == HttpRequestStatus::Pending)
+        {
+            if (nowUnixSeconds - ingestRequestStartedUnixSeconds >= kIngestRequestDeadlineSeconds)
+            {
+                AbortIngest(host, nowUnixSeconds, "ingest request timed out");
+            }
+
+            return;
+        }
+
+        host.EndHttpRequest(ingestRequest);
+        ingestRequest = nullptr;
+
+        if (status == HttpRequestStatus::Failed)
+        {
+            AbortIngest(host, nowUnixSeconds, "ingest request failed");
+            return;
+        }
+
+        if (ingestStage == IngestStage::AcquiringToken)
+        {
+            if (response.StatusCode != 200)
+            {
+                AbortIngest(host, nowUnixSeconds, "failed to acquire ingest access token");
+                return;
+            }
+
+            const auto parsedAccessToken = ExtractJsonStringValue(response.Body, "access_token");
+            if (!parsedAccessToken.has_value() || parsedAccessToken->empty())
+            {
+                AbortIngest(host, nowUnixSeconds, "ingest token response missing access_token");
+                return;
+            }
+
+            const int expiresInSeconds = ExtractJsonIntValue(response.Body, "expires_in").value_or(3600);
+            ingestAccessToken = *parsedAccessToken;
+            ingestAccessTokenExpiresAtUnixSeconds = nowUnixSeconds + std::max(0, expiresInSeconds - 30);
+
+            if (!StartIngestBatchRequest(host, nowUnixSeconds))
+            {
+                AbortIngest(host, nowUnixSeconds, "failed to start ingest batch request");
+            }
+
+            return;
+        }
+
+        if (ingestStage == IngestStage::PostingBatch)
+        {
+            if (response.StatusCode >= 200 && response.StatusCode < 300)
+            {
+                DropBufferedEventsByIndex(ingestBatchIndices);
+                ingestBatchIndices.clear();
+                ingestBatchQueueName.clear();
+                ingestBatchPayload.clear();
+                ingestConsecutiveFailureCount = 0;
+                nextIngestAttemptUnixSeconds = nowUnixSeconds;
+                ingestStage = IngestStage::Idle;
+                return;
+            }
+
+            for (const std::size_t index : ingestBatchIndices)
+            {
+                if (index < bufferedEvents.size())
+                {
+                    bufferedEvents[index].AttemptCount++;
+                }
+            }
+
+            ingestConsecutiveFailureCount++;
+            const std::int64_t backoffSeconds = static_cast<std::int64_t>(
+                std::min<std::size_t>(60, static_cast<std::size_t>(1) << std::min<std::size_t>(6, ingestConsecutiveFailureCount)));
+
+            nextIngestAttemptUnixSeconds = nowUnixSeconds + backoffSeconds;
+            host.Log("ingest batch POST returned HTTP " + std::to_string(response.StatusCode) + " for queue " + ingestBatchQueueName);
+
+            ingestBatchIndices.clear();
+            ingestBatchQueueName.clear();
+            ingestBatchPayload.clear();
+            ingestStage = IngestStage::Idle;
+            return;
+        }
+    }
+
+    if (bufferedEvents.empty() || nowUnixSeconds < nextIngestAttemptUnixSeconds)
+    {
+        return;
+    }
+
+    if (!IsIngestTokenValid(nowUnixSeconds))
+    {
+        if (!StartIngestTokenRequest(host, nowUnixSeconds))
+        {
+            AbortIngest(host, nowUnixSeconds, "failed to start ingest access token request");
+        }
+
+        return;
+    }
+
+    if (!StartIngestBatchRequest(host, nowUnixSeconds))
+    {
+        AbortIngest(host, nowUnixSeconds, "failed to start ingest batch request");
+    }
+}
+
+bool PluginRuntime::StartIngestTokenRequest(ICod4xHost& host, std::int64_t nowUnixSeconds)
+{
+    const std::string tokenUrl = "https://login.microsoftonline.com/" + loadedConfig->TenantId + "/oauth2/v2.0/token";
+    const std::string tokenBody = "grant_type=client_credentials&client_id=" + UrlEncode(loadedConfig->ClientId) +
+        "&client_secret=" + UrlEncode(loadedConfig->ClientSecret) +
+        "&scope=" + UrlEncode(loadedConfig->IngestApiResource + "/.default");
+
+    ingestRequest = host.BeginHttpRequest(
+        tokenUrl,
+        "POST",
+        tokenBody,
+        "Content-Type: application/x-www-form-urlencoded\r\nAccept: application/json\r\n");
+
+    if (ingestRequest == nullptr)
+    {
+        return false;
+    }
+
+    ingestRequestStartedUnixSeconds = nowUnixSeconds;
+    ingestStage = IngestStage::AcquiringToken;
+    return true;
+}
+
+bool PluginRuntime::StartIngestBatchRequest(ICod4xHost& host, std::int64_t nowUnixSeconds)
+{
+    if (bufferedEvents.empty())
+    {
+        ingestStage = IngestStage::Idle;
+        return true;
+    }
+
+    ingestBatchQueueName = bufferedEvents.front().QueueName;
+    ingestBatchIndices = BuildBatchIndicesForQueue(ingestBatchQueueName, kIngestMaxBatchEvents, kIngestMaxBatchBytes);
+    if (ingestBatchIndices.empty())
+    {
+        return false;
+    }
+
+    ingestBatchPayload.clear();
+    ingestBatchPayload.push_back('[');
+    for (std::size_t i = 0; i < ingestBatchIndices.size(); ++i)
+    {
+        if (i > 0)
+        {
+            ingestBatchPayload.push_back(',');
+        }
+
+        ingestBatchPayload += StampPublishedUtc(bufferedEvents[ingestBatchIndices[i]].PayloadJson, nowUnixSeconds);
+    }
+
+    ingestBatchPayload.push_back(']');
+
+    std::string headers = BuildAuthorizationHeaders(ingestAccessToken);
+    headers += "Content-Type: application/json\r\n";
+
+    const std::string requestUrl = loadedConfig->IngestBaseUrl + QueueEndpointPath(ingestBatchQueueName);
+    ingestRequest = host.BeginHttpRequest(requestUrl, "POST", ingestBatchPayload, headers);
+    if (ingestRequest == nullptr)
+    {
+        return false;
+    }
+
+    ingestRequestStartedUnixSeconds = nowUnixSeconds;
+    ingestStage = IngestStage::PostingBatch;
+    return true;
+}
+
+void PluginRuntime::AbortIngest(ICod4xHost& host, std::int64_t nowUnixSeconds, std::string_view reason)
+{
+    if (!reason.empty())
+    {
+        host.Log(std::string(reason));
+    }
+
+    if (ingestRequest != nullptr)
+    {
+        host.EndHttpRequest(ingestRequest);
+        ingestRequest = nullptr;
+    }
+
+    ingestStage = IngestStage::Idle;
+    ingestConsecutiveFailureCount++;
+    const std::int64_t backoffSeconds = static_cast<std::int64_t>(
+        std::min<std::size_t>(60, static_cast<std::size_t>(1) << std::min<std::size_t>(6, ingestConsecutiveFailureCount)));
+    nextIngestAttemptUnixSeconds = nowUnixSeconds + backoffSeconds;
+    ingestBatchIndices.clear();
+    ingestBatchQueueName.clear();
+    ingestBatchPayload.clear();
+}
+
+void PluginRuntime::FlushServerStatusSnapshot(ICod4xHost& host, std::int64_t nowUnixSeconds)
+{
+    if (!IsIngestConfigured())
+    {
+        return;
+    }
+
+    for (auto it = connectedPlayers.begin(); it != connectedPlayers.end();)
+    {
+        if (it->second.PlayerGuid.empty())
+        {
+            it = connectedPlayers.erase(it);
+            continue;
+        }
+
+        if (it->second.Username.empty())
+        {
+            it->second.Username = Trim(host.GetPlayerName(it->first));
+        }
+
+        it->second.Score = host.GetPlayerScore(it->first);
+        ++it;
+    }
+
+    const std::string messageId = GenerateMessageId();
+    BufferEvent(
+        std::string(kQueueServerStatus),
+        BuildServerStatusPayload(nowUnixSeconds, messageId, host),
+        messageId,
+        nowUnixSeconds);
+}
+
+std::string PluginRuntime::BuildPlayerConnectedPayload(
+    std::int64_t nowUnixSeconds,
+    const std::string& messageId,
+    const std::string& playerGuid,
+    const std::string& username,
+    const std::string& ipAddress,
+    int slotId)
+{
+    std::string payload = BuildBaseEventPrefix(nowUnixSeconds, messageId, NextSequenceId());
+    payload += ",\"playerGuid\":\"" + JsonEscape(playerGuid) + "\"";
+    payload += ",\"username\":\"" + JsonEscape(username) + "\"";
+    payload += ",\"ipAddress\":\"" + JsonEscape(ipAddress) + "\"";
+    payload += ",\"slotId\":" + std::to_string(slotId);
+    payload += "}";
+    return payload;
+}
+
+std::string PluginRuntime::BuildPlayerDisconnectedPayload(
+    std::int64_t nowUnixSeconds,
+    const std::string& messageId,
+    const std::string& playerGuid,
+    const std::string& username,
+    int slotId)
+{
+    std::string payload = BuildBaseEventPrefix(nowUnixSeconds, messageId, NextSequenceId());
+    payload += ",\"playerGuid\":\"" + JsonEscape(playerGuid) + "\"";
+    payload += ",\"username\":\"" + JsonEscape(username) + "\"";
+    payload += ",\"slotId\":" + std::to_string(slotId);
+    payload += "}";
+    return payload;
+}
+
+std::string PluginRuntime::BuildChatMessagePayload(
+    std::int64_t nowUnixSeconds,
+    const std::string& messageId,
+    const std::string& playerGuid,
+    const std::string& username,
+    int slotId,
+    std::string_view message,
+    bool teamMessage)
+{
+    std::string payload = BuildBaseEventPrefix(nowUnixSeconds, messageId, NextSequenceId());
+    payload += ",\"playerGuid\":\"" + JsonEscape(playerGuid) + "\"";
+    payload += ",\"username\":\"" + JsonEscape(username) + "\"";
+    payload += ",\"slotId\":" + std::to_string(slotId);
+    payload += ",\"message\":\"" + JsonEscape(message) + "\"";
+    payload += ",\"type\":\"";
+    payload += teamMessage ? "Team" : "All";
+    payload += "\"}";
+    return payload;
+}
+
+std::string PluginRuntime::BuildServerConnectedPayload(std::int64_t nowUnixSeconds, const std::string& messageId)
+{
+    return BuildBaseEventPrefix(nowUnixSeconds, messageId, NextSequenceId()) + "}";
+}
+
+std::string PluginRuntime::BuildMapChangePayload(
+    std::int64_t nowUnixSeconds,
+    const std::string& messageId,
+    const std::string& mapName,
+    const std::string& gameName)
+{
+    std::string payload = BuildBaseEventPrefix(nowUnixSeconds, messageId, NextSequenceId());
+    payload += ",\"mapName\":\"" + JsonEscape(mapName) + "\"";
+    payload += ",\"gameName\":\"" + JsonEscape(gameName) + "\"";
+    payload += "}";
+    return payload;
+}
+
+std::string PluginRuntime::BuildServerStatusPayload(std::int64_t nowUnixSeconds, const std::string& messageId, ICod4xHost& host)
+{
+    std::vector<int> sortedSlots;
+    sortedSlots.reserve(connectedPlayers.size());
+    for (const auto& [slot, state] : connectedPlayers)
+    {
+        if (!state.PlayerGuid.empty() && !state.Username.empty())
+        {
+            sortedSlots.push_back(slot);
+        }
+    }
+
+    std::sort(sortedSlots.begin(), sortedSlots.end());
+
+    std::string payload = BuildBaseEventPrefix(nowUnixSeconds, messageId, NextSequenceId());
+    payload += ",\"mapName\":\"" + JsonEscape(GetMapName(host)) + "\"";
+    payload += ",\"gameName\":\"" + JsonEscape(GetGameName(host)) + "\"";
+    payload += ",\"playerCount\":" + std::to_string(sortedSlots.size());
+    payload += ",\"players\":[";
+
+    for (std::size_t i = 0; i < sortedSlots.size(); ++i)
+    {
+        const ConnectedPlayerState& state = connectedPlayers.at(sortedSlots[i]);
+        if (i > 0)
+        {
+            payload.push_back(',');
+        }
+
+        payload += "{\"playerGuid\":\"" + JsonEscape(state.PlayerGuid) + "\"";
+        payload += ",\"username\":\"" + JsonEscape(state.Username) + "\"";
+        payload += ",\"ipAddress\":\"" + JsonEscape(state.IpAddress.empty() ? "0.0.0.0" : state.IpAddress) + "\"";
+        payload += ",\"slotId\":" + std::to_string(state.SlotId);
+        payload += ",\"connectedAtUtc\":\"" + ToIso8601Utc(state.ConnectedAtUnixSeconds) + "\"";
+        payload += ",\"score\":" + std::to_string(state.Score);
+        payload += ",\"ping\":0,\"rate\":0}";
+    }
+
+    payload += "]";
+
+    const std::string serverTitle = GetServerTitle(host);
+    if (!serverTitle.empty())
+    {
+        payload += ",\"serverTitle\":\"" + JsonEscape(serverTitle) + "\"";
+    }
+
+    const std::string serverMod = GetServerMod(host);
+    if (!serverMod.empty())
+    {
+        payload += ",\"serverMod\":\"" + JsonEscape(serverMod) + "\"";
+    }
+
+    payload += ",\"maxPlayers\":" + std::to_string(std::max(0, host.GetSlotCount()));
+    payload += ",\"pluginVersion\":\"" + JsonEscape(pluginVersion) + "\"";
+    payload += ",\"pluginHealth\":\"ok\"";
+    payload += ",\"egressBufferedEventCount\":" + std::to_string(bufferedEvents.size());
+    payload += "}";
+
+    return payload;
+}
+
+std::string PluginRuntime::GetMapName(ICod4xHost& host) const
+{
+    const std::string mapName = Trim(host.GetCvarString("mapname"));
+    return mapName.empty() ? "unknown" : mapName;
+}
+
+std::string PluginRuntime::GetGameName(ICod4xHost& host) const
+{
+    const std::string gameName = Trim(host.GetCvarString("gamename"));
+    if (!gameName.empty())
+    {
+        return gameName;
+    }
+
+    const std::string gameTypeName = Trim(host.GetCvarString("g_gametype"));
+    return gameTypeName.empty() ? loadedConfig->GameType : gameTypeName;
+}
+
+std::string PluginRuntime::GetServerTitle(ICod4xHost& host) const
+{
+    return Trim(host.GetCvarString("sv_hostname"));
+}
+
+std::string PluginRuntime::GetServerMod(ICod4xHost& host) const
+{
+    return Trim(host.GetCvarString("fs_game"));
+}
+
+void PluginRuntime::BufferEvent(std::string queueName, std::string payloadJson, std::string messageId, std::int64_t nowUnixSeconds)
+{
+    if (queueName.empty() || payloadJson.empty())
+    {
+        return;
+    }
+
+    if (bufferedEvents.size() >= kMaxBufferedEvents)
+    {
+        if (std::string_view(queueName) == kQueueChatMessage)
+        {
+            return;
+        }
+
+        auto chatIt = std::find_if(bufferedEvents.begin(), bufferedEvents.end(), [](const BufferedEvent& item) {
+            return std::string_view(item.QueueName) == kQueueChatMessage;
+        });
+
+        if (chatIt != bufferedEvents.end())
+        {
+            bufferedEvents.erase(chatIt);
+        }
+        else if (!bufferedEvents.empty())
+        {
+            bufferedEvents.pop_front();
+        }
+    }
+
+    bufferedEvents.push_back(BufferedEvent{
+        std::move(queueName),
+        std::move(payloadJson),
+        std::move(messageId),
+        nowUnixSeconds,
+        0});
+
+    if (nextIngestAttemptUnixSeconds > nowUnixSeconds)
+    {
+        nextIngestAttemptUnixSeconds = nowUnixSeconds;
+    }
+}
+
+std::vector<std::size_t> PluginRuntime::BuildBatchIndicesForQueue(
+    const std::string& queueName,
+    std::size_t maxEvents,
+    std::size_t maxBytes) const
+{
+    std::vector<std::size_t> indices;
+    std::size_t currentBytes = 2;
+
+    for (std::size_t i = 0; i < bufferedEvents.size(); ++i)
+    {
+        if (bufferedEvents[i].QueueName != queueName)
+        {
+            continue;
+        }
+
+        const std::size_t eventBytes = bufferedEvents[i].PayloadJson.size() + (indices.empty() ? 0 : 1);
+        if (!indices.empty() && currentBytes + eventBytes > maxBytes)
+        {
+            break;
+        }
+
+        currentBytes += eventBytes;
+        indices.push_back(i);
+
+        if (indices.size() >= maxEvents)
+        {
+            break;
+        }
+    }
+
+    return indices;
+}
+
+void PluginRuntime::DropBufferedEventsByIndex(const std::vector<std::size_t>& indices)
+{
+    if (indices.empty())
+    {
+        return;
+    }
+
+    std::vector<std::size_t> sortedIndices = indices;
+    std::sort(sortedIndices.begin(), sortedIndices.end(), std::greater<>());
+
+    for (const std::size_t index : sortedIndices)
+    {
+        if (index < bufferedEvents.size())
+        {
+            bufferedEvents.erase(bufferedEvents.begin() + static_cast<std::ptrdiff_t>(index));
+        }
+    }
+}
+
+std::string PluginRuntime::BuildBaseEventPrefix(std::int64_t nowUnixSeconds, const std::string& messageId, long long sequenceId) const
+{
+    std::string payload;
+    payload.reserve(256);
+    payload += "{\"messageId\":\"" + JsonEscape(messageId) + "\"";
+    payload += ",\"eventGeneratedUtc\":\"" + ToIso8601Utc(nowUnixSeconds) + "\"";
+    payload += ",\"eventPublishedUtc\":\"" + ToIso8601Utc(nowUnixSeconds) + "\"";
+    payload += ",\"serverId\":\"" + JsonEscape(loadedConfig->GameServerId) + "\"";
+    payload += ",\"gameType\":\"" + JsonEscape(loadedConfig->GameType) + "\"";
+    payload += ",\"sequenceId\":" + std::to_string(sequenceId);
+    return payload;
+}
+
+long long PluginRuntime::NextSequenceId()
+{
+    return nextSequenceId++;
+}
+
+std::string PluginRuntime::GenerateMessageId()
+{
+    static std::mt19937_64 generator(std::random_device{}());
+    static constexpr char kHexChars[] = "0123456789abcdef";
+
+    std::uniform_int_distribution<unsigned int> distribution(0, 15);
+
+    std::string output;
+    output.reserve(36);
+
+    const std::array<int, 5> groups{8, 4, 4, 4, 12};
+    for (std::size_t groupIndex = 0; groupIndex < groups.size(); ++groupIndex)
+    {
+        if (groupIndex > 0)
+        {
+            output.push_back('-');
+        }
+
+        for (int i = 0; i < groups[groupIndex]; ++i)
+        {
+            output.push_back(kHexChars[distribution(generator)]);
+        }
+    }
+
+    return output;
+}
+
+std::string PluginRuntime::JsonEscape(std::string_view value)
+{
+    std::string escaped;
+    escaped.reserve(value.size());
+
+    for (const char c : value)
+    {
+        switch (c)
+        {
+            case '"':
+                escaped += "\\\"";
+                break;
+            case '\\':
+                escaped += "\\\\";
+                break;
+            case '\b':
+                escaped += "\\b";
+                break;
+            case '\f':
+                escaped += "\\f";
+                break;
+            case '\n':
+                escaped += "\\n";
+                break;
+            case '\r':
+                escaped += "\\r";
+                break;
+            case '\t':
+                escaped += "\\t";
+                break;
+            default:
+                escaped.push_back(c);
+                break;
+        }
+    }
+
+    return escaped;
+}
+
+std::string PluginRuntime::ToIso8601Utc(std::int64_t unixSeconds)
+{
+    std::time_t unixTime = static_cast<std::time_t>(unixSeconds);
+    std::tm utcTime{};
+
+#if defined(_WIN32)
+    gmtime_s(&utcTime, &unixTime);
+#else
+    gmtime_r(&unixTime, &utcTime);
+#endif
+
+    std::ostringstream output;
+    output << std::put_time(&utcTime, "%Y-%m-%dT%H:%M:%SZ");
+    return output.str();
+}
+
+std::string PluginRuntime::StampPublishedUtc(std::string payloadJson, std::int64_t nowUnixSeconds)
+{
+    constexpr std::string_view kToken = "\"eventPublishedUtc\":\"";
+    const std::size_t tokenPos = payloadJson.find(kToken);
+    if (tokenPos == std::string::npos)
+    {
+        return payloadJson;
+    }
+
+    const std::size_t valueStart = tokenPos + kToken.size();
+    const std::size_t valueEnd = payloadJson.find('"', valueStart);
+    if (valueEnd == std::string::npos)
+    {
+        return payloadJson;
+    }
+
+    payloadJson.replace(valueStart, valueEnd - valueStart, ToIso8601Utc(nowUnixSeconds));
+    return payloadJson;
+}
+
+std::string PluginRuntime::QueueEndpointPath(std::string_view queueName)
+{
+    return "/events/" + std::string(queueName);
+}
+
+std::string PluginRuntime::NormalizeIpAddress(std::string ipAddress)
+{
+    ipAddress = Trim(std::move(ipAddress));
+    if (ipAddress.empty())
+    {
+        return ipAddress;
+    }
+
+    const std::size_t bracketPos = ipAddress.rfind("]:");
+    if (!ipAddress.empty() && ipAddress.front() == '[' && bracketPos != std::string::npos)
+    {
+        return ipAddress.substr(1, bracketPos - 1);
+    }
+
+    const std::size_t colonPos = ipAddress.rfind(':');
+    if (colonPos != std::string::npos && ipAddress.find('.') != std::string::npos)
+    {
+        return ipAddress.substr(0, colonPos);
+    }
+
+    return ipAddress;
+}
+
+std::string PluginRuntime::Trim(std::string value)
+{
+    const auto isWhitespace = [](unsigned char c) { return std::isspace(c) != 0; };
+
+    value.erase(value.begin(), std::find_if(value.begin(), value.end(), [&](unsigned char c) { return !isWhitespace(c); }));
+    value.erase(
+        std::find_if(value.rbegin(), value.rend(), [&](unsigned char c) { return !isWhitespace(c); }).base(),
+        value.end());
+
+    return value;
+}
+
 namespace
 {
 PluginRuntime g_runtime;
@@ -966,6 +1886,36 @@ int InitializePlugin(ICod4xHost& host, std::string_view version, std::string_vie
 void TickPlugin(ICod4xHost& host)
 {
     g_runtime.Tick(host);
+}
+
+void NotifyPlayerConnect(ICod4xHost& host, int slot, std::string_view ipAddress)
+{
+    g_runtime.HandlePlayerConnect(host, slot, ipAddress);
+}
+
+void NotifyPlayerConnected(ICod4xHost& host, int slot)
+{
+    g_runtime.HandlePlayerConnected(host, slot);
+}
+
+void NotifyPlayerDisconnected(ICod4xHost& host, int slot)
+{
+    g_runtime.HandlePlayerDisconnected(host, slot);
+}
+
+void NotifyChatMessage(ICod4xHost& host, int slot, std::string_view message, bool teamMessage)
+{
+    g_runtime.HandleChatMessage(host, slot, message, teamMessage);
+}
+
+void NotifyServerSpawned(ICod4xHost& host)
+{
+    g_runtime.HandleServerSpawned(host);
+}
+
+void NotifyServerExited(ICod4xHost& host)
+{
+    g_runtime.HandleServerExited(host);
 }
 
 const EffectiveServerContext& GetServerContext()
