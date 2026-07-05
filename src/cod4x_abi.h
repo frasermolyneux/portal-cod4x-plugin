@@ -2,6 +2,7 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <ctime>
 
 #if defined(PORTAL_COD4X_USE_EXTERNAL_SDK)
 #if !defined(PLUGIN_HANDLER_VERSION_MAJOR)
@@ -170,6 +171,22 @@ typedef struct
     int deaths;
     int assists;
 } clientScoreboard_t;
+
+typedef struct
+{
+    char playername[33];
+    std::uint64_t steamid;
+    std::uint64_t playerid;
+    netadr_t adr;
+
+    char adminname[33];
+    std::uint64_t adminsteamid;
+
+    char message[1024];
+    std::time_t expire;
+    unsigned int duration;
+    std::time_t created;
+} baninfo_t;
 
 typedef struct client_t
 {

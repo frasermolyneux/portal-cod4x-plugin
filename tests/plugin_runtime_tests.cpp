@@ -502,6 +502,81 @@ void Runtime_HandleClientCommand_DedupesCrossCallbackPath()
     Assert(host.PrivateMessages.size() == 2, "Later command should be handled outside cross-callback dedupe window");
 }
 
+void Runtime_LoadsActiveBanCacheAndAnswersBanQuery()
+{
+    const std::filesystem::path configPath = std::filesystem::temp_directory_path() / "portal-cod4x-plugin.bansync.test.json";
+
+    {
+        std::ofstream configFile(configPath);
+        configFile
+            << "{" 
+            << "\"tenantId\":\"tenant-test\"," 
+            << "\"clientId\":\"client-test\"," 
+            << "\"clientSecret\":\"secret-test\"," 
+            << "\"repositoryApiBaseUrl\":\"https://example.test/repository\"," 
+            << "\"repositoryApiResource\":\"api://repository-test\"," 
+            << "\"gameServerId\":\"11111111-2222-3333-4444-555555555555\"," 
+            << "\"gameType\":\"CallOfDuty4x\"," 
+            << "\"refreshIntervalSeconds\":120"
+            << "}";
+    }
+
+    FakeHost host;
+    host.CurrentTime = 4000;
+
+    host.Responses["POST https://login.microsoftonline.com/tenant-test/oauth2/v2.0/token"] = {
+        200,
+        "{\"access_token\":\"repo-token\",\"expires_in\":3600}"};
+
+    host.Responses["GET https://example.test/repository/v1.0/admin-actions?gameType=CallOfDuty4x&filter=ActiveBans&skipEntries=0&takeEntries=200&order=CreatedDesc"] = {
+        200,
+        "{\"data\":{\"items\":[{\"player\":{\"guid\":\"76561198000000001\"}}]}}"};
+
+    portal_cod4x::PluginRuntime runtime(configPath.string());
+    const int initializeResult = runtime.Initialize(host, "1.2.3", "^4[^1XI-BOT^4]^7");
+    Assert(initializeResult == 0, "PluginRuntime initialize should succeed");
+
+    for (int i = 0; i < 6; ++i)
+    {
+        runtime.Tick(host);
+    }
+
+    std::string banMessage;
+    const bool isBanned = runtime.TryGetPlayerBanMessage(76561198000000001ULL, banMessage);
+
+    Assert(isBanned, "Expected player to be banned after active-ban cache sync");
+    Assert(
+        banMessage.find("banned") != std::string::npos,
+        "Expected returned ban message to contain ban wording");
+
+    std::error_code ignoreError;
+    std::filesystem::remove(configPath, ignoreError);
+}
+
+void Runtime_PlayerBanMutationHintsUpdateCacheImmediately()
+{
+    FakeHost host;
+    portal_cod4x::PluginRuntime runtime;
+
+    const int initializeResult = runtime.Initialize(host, "1.2.3", "^4[^1XI-BOT^4]^7");
+    Assert(initializeResult == 0, "PluginRuntime initialize should succeed");
+
+    runtime.HandlePlayerBanAdded(76561198000000002ULL, "Manual server ban");
+
+    std::string banMessage;
+    bool isBanned = runtime.TryGetPlayerBanMessage(76561198000000002ULL, banMessage);
+
+    Assert(isBanned, "Expected add-ban hint to populate local ban cache");
+    Assert(
+        banMessage.find("Manual server ban") != std::string::npos,
+        "Expected local ban cache to preserve callback-provided reason");
+
+    runtime.HandlePlayerBanRemoved(76561198000000002ULL);
+
+    isBanned = runtime.TryGetPlayerBanMessage(76561198000000002ULL, banMessage);
+    Assert(!isBanned, "Expected remove-ban hint to evict local ban cache entry");
+}
+
 void InitializePlugin_EmitsLogAndBroadcast()
 {
     FakeHost host;
@@ -545,6 +620,8 @@ int main()
     Runtime_HandleChatMessage_AlsoExecutesCommandPath();
     Runtime_HandleClientCommand_DoesNotPrefixMatchLongerToken();
     Runtime_HandleClientCommand_DedupesCrossCallbackPath();
+    Runtime_LoadsActiveBanCacheAndAnswersBanQuery();
+    Runtime_PlayerBanMutationHintsUpdateCacheImmediately();
     InitializePlugin_EmitsLogAndBroadcast();
     InitializePlugin_FallsBackWhenPrefixOrVersionMissing();
 

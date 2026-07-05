@@ -18,13 +18,17 @@ namespace portal_cod4x
 namespace
 {
 constexpr std::int64_t kIngestRequestDeadlineSeconds = 20;
+constexpr std::int64_t kBanSyncRequestDeadlineSeconds = 20;
 constexpr std::int64_t kServerStatusIntervalSeconds = 60;
 constexpr std::int64_t kMaxBufferedEventAgeSeconds = 15 * 60;
 constexpr std::size_t kMaxBufferedEventAttempts = 8;
+constexpr std::int64_t kDefaultBanSyncIntervalSeconds = 60;
+constexpr std::string_view kDefaultBanMessage = "You are banned from this server.";
 
 constexpr std::size_t kMaxBufferedEvents = 1000;
 constexpr std::size_t kIngestMaxBatchEvents = 100;
 constexpr std::size_t kIngestMaxBatchBytes = 200 * 1024;
+constexpr int kActiveBanPageSize = 200;
 
 constexpr std::string_view kQueuePlayerConnected = "player-connected";
 constexpr std::string_view kQueuePlayerDisconnected = "player-disconnected";
@@ -252,6 +256,16 @@ std::string ExtractCommandToken(std::string_view command)
 
     return trimmed.substr(0, tokenEnd);
 }
+
+std::string BuildPlayerGuidKey(std::uint64_t playerId)
+{
+    if (playerId == 0)
+    {
+        return {};
+    }
+
+    return std::to_string(playerId);
+}
 }
 
 std::string BuildOnlineBroadcastMessage(std::string_view prefix, std::string_view version)
@@ -335,6 +349,7 @@ void PluginRuntime::Tick(ICod4xHost& host)
     }
 
     AdvanceIngest(host, nowUnixSeconds);
+    AdvanceBanSync(host, nowUnixSeconds);
 }
 
 void PluginRuntime::HandlePlayerConnect(ICod4xHost& host, int slot, std::string_view ipAddress)
@@ -660,6 +675,63 @@ void PluginRuntime::HandleServerExited(ICod4xHost&)
     connectedPlayers.clear();
 }
 
+void PluginRuntime::HandlePlayerBanAdded(std::uint64_t playerId, std::string_view reason)
+{
+    const std::string playerGuid = BuildPlayerGuidKey(playerId);
+    if (playerGuid.empty())
+    {
+        return;
+    }
+
+    std::string renderedReason = Trim(std::string(reason));
+    if (renderedReason.empty())
+    {
+        renderedReason = std::string(kDefaultBanMessage);
+    }
+
+    {
+        std::lock_guard<std::mutex> guard(activeBanCacheMutex);
+        activeBanMessagesByPlayerGuid[playerGuid] = std::move(renderedReason);
+    }
+
+    nextBanSyncUnixSeconds.store(0, std::memory_order_relaxed);
+}
+
+void PluginRuntime::HandlePlayerBanRemoved(std::uint64_t playerId)
+{
+    const std::string playerGuid = BuildPlayerGuidKey(playerId);
+    if (playerGuid.empty())
+    {
+        return;
+    }
+
+    {
+        std::lock_guard<std::mutex> guard(activeBanCacheMutex);
+        activeBanMessagesByPlayerGuid.erase(playerGuid);
+    }
+
+    nextBanSyncUnixSeconds.store(0, std::memory_order_relaxed);
+}
+
+bool PluginRuntime::TryGetPlayerBanMessage(std::uint64_t playerId, std::string& message) const
+{
+    const std::string playerGuid = BuildPlayerGuidKey(playerId);
+    if (playerGuid.empty())
+    {
+        return false;
+    }
+
+    std::lock_guard<std::mutex> guard(activeBanCacheMutex);
+    const auto it = activeBanMessagesByPlayerGuid.find(playerGuid);
+    if (it == activeBanMessagesByPlayerGuid.end())
+    {
+        return false;
+    }
+
+    message = it->second.empty() ? std::string(kDefaultBanMessage) : it->second;
+    return true;
+}
+
 const EffectiveServerContext& PluginRuntime::GetServerContext() const
 {
     return serverContext;
@@ -697,6 +769,8 @@ bool PluginRuntime::TryLoadConfig(ICod4xHost& host, std::int64_t nowUnixSeconds)
     serverContext.LastRefreshUnixSeconds = nowUnixSeconds;
     lastConfigLoadError.clear();
     nextConfigLoadAttemptUnixSeconds = nowUnixSeconds;
+    nextBanSyncUnixSeconds.store(nowUnixSeconds, std::memory_order_relaxed);
+    repositoryConfigWarningLogged = false;
     host.Log("plugin config loaded for gameServerId " + loadedConfig->GameServerId);
     return true;
 }
@@ -954,6 +1028,268 @@ void PluginRuntime::AbortIngest(ICod4xHost& host, std::int64_t nowUnixSeconds, s
     ingestBatchPayload.clear();
 
     PruneBufferedEvents(host, nowUnixSeconds);
+}
+
+bool PluginRuntime::IsRepositoryConfigured() const
+{
+    return loadedConfig.has_value() && !loadedConfig->RepositoryApiBaseUrl.empty() && !loadedConfig->RepositoryApiResource.empty() &&
+        !loadedConfig->TenantId.empty() && !loadedConfig->ClientId.empty() && !loadedConfig->ClientSecret.empty();
+}
+
+bool PluginRuntime::IsRepositoryTokenValid(std::int64_t nowUnixSeconds) const
+{
+    return !repositoryAccessToken.empty() && nowUnixSeconds + 30 < repositoryAccessTokenExpiresAtUnixSeconds;
+}
+
+void PluginRuntime::AdvanceBanSync(ICod4xHost& host, std::int64_t nowUnixSeconds)
+{
+    if (!loadedConfig.has_value())
+    {
+        return;
+    }
+
+    if (!IsRepositoryConfigured())
+    {
+        if (!repositoryConfigWarningLogged)
+        {
+            host.Log("repository active-ban sync disabled; configure repository API auth settings to enable plugin ban cache enforcement");
+            repositoryConfigWarningLogged = true;
+        }
+
+        return;
+    }
+
+    repositoryConfigWarningLogged = false;
+
+    if (banSyncStage != BanSyncStage::Idle)
+    {
+        if (banSyncRequest == nullptr)
+        {
+            banSyncStage = BanSyncStage::Idle;
+            return;
+        }
+
+        HttpResponse response;
+        const HttpRequestStatus status = host.PollHttpRequest(banSyncRequest, response);
+        if (status == HttpRequestStatus::Pending)
+        {
+            if (nowUnixSeconds - banSyncRequestStartedUnixSeconds >= kBanSyncRequestDeadlineSeconds)
+            {
+                AbortBanSync(host, nowUnixSeconds, "active-ban sync request timed out");
+            }
+
+            return;
+        }
+
+        host.EndHttpRequest(banSyncRequest);
+        banSyncRequest = nullptr;
+
+        if (status == HttpRequestStatus::Failed)
+        {
+            AbortBanSync(host, nowUnixSeconds, "active-ban sync request failed");
+            return;
+        }
+
+        if (banSyncStage == BanSyncStage::AcquiringToken)
+        {
+            if (response.StatusCode != 200)
+            {
+                AbortBanSync(host, nowUnixSeconds, "failed to acquire repository API access token");
+                return;
+            }
+
+            const auto parsedAccessToken = ExtractJsonStringValue(response.Body, "access_token");
+            if (!parsedAccessToken.has_value() || parsedAccessToken->empty())
+            {
+                AbortBanSync(host, nowUnixSeconds, "repository token response missing access_token");
+                return;
+            }
+
+            const int expiresInSeconds = ExtractJsonIntValue(response.Body, "expires_in").value_or(3600);
+            repositoryAccessToken = *parsedAccessToken;
+            repositoryAccessTokenExpiresAtUnixSeconds = nowUnixSeconds + std::max(0, expiresInSeconds - 30);
+            activeBanFetchSkipEntries = 0;
+            pendingActiveBanMessagesByPlayerGuid.clear();
+
+            if (!StartActiveBanFetchRequest(host, nowUnixSeconds, activeBanFetchSkipEntries))
+            {
+                AbortBanSync(host, nowUnixSeconds, "failed to start repository active-ban request");
+            }
+
+            return;
+        }
+
+        if (banSyncStage == BanSyncStage::FetchingActiveBans)
+        {
+            if (response.StatusCode < 200 || response.StatusCode >= 300)
+            {
+                AbortBanSync(
+                    host,
+                    nowUnixSeconds,
+                    "repository active-ban request returned HTTP " + std::to_string(response.StatusCode));
+                return;
+            }
+
+            auto pageBanMessages = ParseActiveBanMessagesByPlayerGuid(response.Body);
+            const std::size_t pageItemCount = CountActiveBanItems(response.Body);
+            for (auto& [playerGuid, banMessage] : pageBanMessages)
+            {
+                pendingActiveBanMessagesByPlayerGuid[playerGuid] = std::move(banMessage);
+            }
+
+            if (pageItemCount >= static_cast<std::size_t>(kActiveBanPageSize))
+            {
+                activeBanFetchSkipEntries += kActiveBanPageSize;
+                if (!StartActiveBanFetchRequest(host, nowUnixSeconds, activeBanFetchSkipEntries))
+                {
+                    AbortBanSync(host, nowUnixSeconds, "failed to continue repository active-ban request");
+                }
+
+                return;
+            }
+
+            {
+                std::lock_guard<std::mutex> guard(activeBanCacheMutex);
+                activeBanMessagesByPlayerGuid = std::move(pendingActiveBanMessagesByPlayerGuid);
+            }
+
+            pendingActiveBanMessagesByPlayerGuid.clear();
+            activeBanFetchSkipEntries = 0;
+            banSyncConsecutiveFailureCount = 0;
+
+            const int configuredInterval = std::clamp(loadedConfig->RefreshIntervalSeconds, 15, 900);
+            const int intervalSeconds = configuredInterval > 0 ? configuredInterval : static_cast<int>(kDefaultBanSyncIntervalSeconds);
+
+            nextBanSyncUnixSeconds.store(nowUnixSeconds + intervalSeconds, std::memory_order_relaxed);
+            banSyncStage = BanSyncStage::Idle;
+            return;
+        }
+    }
+
+    if (nowUnixSeconds < nextBanSyncUnixSeconds.load(std::memory_order_relaxed))
+    {
+        return;
+    }
+
+    if (!IsRepositoryTokenValid(nowUnixSeconds))
+    {
+        if (!StartRepositoryTokenRequest(host, nowUnixSeconds))
+        {
+            AbortBanSync(host, nowUnixSeconds, "failed to start repository token request");
+        }
+
+        return;
+    }
+
+    activeBanFetchSkipEntries = 0;
+    pendingActiveBanMessagesByPlayerGuid.clear();
+
+    if (!StartActiveBanFetchRequest(host, nowUnixSeconds, activeBanFetchSkipEntries))
+    {
+        AbortBanSync(host, nowUnixSeconds, "failed to start repository active-ban request");
+    }
+}
+
+bool PluginRuntime::StartRepositoryTokenRequest(ICod4xHost& host, std::int64_t nowUnixSeconds)
+{
+    const std::string tokenUrl = "https://login.microsoftonline.com/" + loadedConfig->TenantId + "/oauth2/v2.0/token";
+    const std::string tokenBody = "grant_type=client_credentials&client_id=" + UrlEncode(loadedConfig->ClientId) +
+        "&client_secret=" + UrlEncode(loadedConfig->ClientSecret) +
+        "&scope=" + UrlEncode(loadedConfig->RepositoryApiResource + "/.default");
+
+    banSyncRequest = host.BeginHttpRequest(
+        tokenUrl,
+        "POST",
+        tokenBody,
+        "Content-Type: application/x-www-form-urlencoded\r\nAccept: application/json\r\n");
+
+    if (banSyncRequest == nullptr)
+    {
+        return false;
+    }
+
+    banSyncRequestStartedUnixSeconds = nowUnixSeconds;
+    banSyncStage = BanSyncStage::AcquiringToken;
+    return true;
+}
+
+bool PluginRuntime::StartActiveBanFetchRequest(ICod4xHost& host, std::int64_t nowUnixSeconds, int skipEntries)
+{
+    const std::string gameType = loadedConfig->GameType.empty() ? "CallOfDuty4x" : loadedConfig->GameType;
+    const std::string requestUrl = loadedConfig->RepositoryApiBaseUrl +
+        "/v1.0/admin-actions?gameType=" + UrlEncode(gameType) +
+        "&filter=ActiveBans&skipEntries=" + std::to_string(skipEntries) +
+        "&takeEntries=" + std::to_string(kActiveBanPageSize) +
+        "&order=CreatedDesc";
+
+    std::string headers = BuildAuthorizationHeaders(repositoryAccessToken);
+
+    banSyncRequest = host.BeginHttpRequest(requestUrl, "GET", "", headers);
+    if (banSyncRequest == nullptr)
+    {
+        return false;
+    }
+
+    banSyncRequestStartedUnixSeconds = nowUnixSeconds;
+    banSyncStage = BanSyncStage::FetchingActiveBans;
+    return true;
+}
+
+void PluginRuntime::AbortBanSync(ICod4xHost& host, std::int64_t nowUnixSeconds, std::string_view reason)
+{
+    if (!reason.empty())
+    {
+        host.Log(std::string(reason));
+    }
+
+    if (banSyncRequest != nullptr)
+    {
+        host.EndHttpRequest(banSyncRequest);
+        banSyncRequest = nullptr;
+    }
+
+    banSyncStage = BanSyncStage::Idle;
+    banSyncConsecutiveFailureCount++;
+    activeBanFetchSkipEntries = 0;
+    pendingActiveBanMessagesByPlayerGuid.clear();
+
+    const std::int64_t backoffSeconds = static_cast<std::int64_t>(
+        std::min<std::size_t>(60, static_cast<std::size_t>(1) << std::min<std::size_t>(6, banSyncConsecutiveFailureCount)));
+    nextBanSyncUnixSeconds.store(nowUnixSeconds + backoffSeconds, std::memory_order_relaxed);
+}
+
+std::size_t PluginRuntime::CountActiveBanItems(const std::string& responseBody) const
+{
+    static const std::regex itemPattern("\\\"adminActionId\\\"\\s*:\\s*\\\"[^\\\"]+\\\"", std::regex::icase);
+
+    return static_cast<std::size_t>(std::distance(
+        std::sregex_iterator(responseBody.begin(), responseBody.end(), itemPattern),
+        std::sregex_iterator()));
+}
+
+std::unordered_map<std::string, std::string> PluginRuntime::ParseActiveBanMessagesByPlayerGuid(const std::string& responseBody) const
+{
+    std::unordered_map<std::string, std::string> parsed;
+
+    static const std::regex playerGuidPattern(
+        "\\\"player\\\"\\s*:\\s*\\{[^\\}]*\\\"guid\\\"\\s*:\\s*\\\"((?:\\\\.|[^\\\"])*)\\\"[^\\}]*\\}",
+        std::regex::icase);
+
+    const auto begin = std::sregex_iterator(responseBody.begin(), responseBody.end(), playerGuidPattern);
+    const auto end = std::sregex_iterator();
+
+    for (auto it = begin; it != end; ++it)
+    {
+        std::string playerGuid = Trim(JsonUnescape((*it)[1].str()));
+        if (playerGuid.empty())
+        {
+            continue;
+        }
+
+        parsed[playerGuid] = std::string(kDefaultBanMessage);
+    }
+
+    return parsed;
 }
 
 void PluginRuntime::FlushServerStatusSnapshot(ICod4xHost& host, std::int64_t nowUnixSeconds)
@@ -1498,6 +1834,21 @@ void NotifyServerSpawned(ICod4xHost& host)
 void NotifyServerExited(ICod4xHost& host)
 {
     g_runtime.HandleServerExited(host);
+}
+
+void NotifyPlayerBanAdded(std::uint64_t playerId, std::string_view reason)
+{
+    g_runtime.HandlePlayerBanAdded(playerId, reason);
+}
+
+void NotifyPlayerBanRemoved(std::uint64_t playerId)
+{
+    g_runtime.HandlePlayerBanRemoved(playerId);
+}
+
+bool TryGetPlayerBanMessage(std::uint64_t playerId, std::string& message)
+{
+    return g_runtime.TryGetPlayerBanMessage(playerId, message);
 }
 
 const EffectiveServerContext& GetServerContext()

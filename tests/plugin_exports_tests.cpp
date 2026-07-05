@@ -165,6 +165,9 @@ void OnExitLevel();
 void OnPlayerConnect(int clientnum, netadr_t* netaddress, char* pbguid, char* userinfo, int authstatus, char* deniedmsg, int deniedmsgbufmaxlen);
 void OnClientEnterWorld(client_t* client);
 void OnPlayerDC(client_t* client, const char* reason);
+void OnPlayerGetBanStatus(baninfo_t* baninfo, char* message, int len);
+void OnPlayerAddBan(baninfo_t* baninfo);
+void OnPlayerRemoveBan(baninfo_t* baninfo);
 void OnInfoRequest(pluginInfo_t* info);
 }
 
@@ -226,6 +229,24 @@ int main()
     }
 
     AssertTrue(foundClientCommandResponse, "Expected !commands response from OnClientCommand callback.");
+
+    baninfo_t banInfo{};
+    banInfo.playerid = g_player_id;
+    std::snprintf(banInfo.message, sizeof(banInfo.message), "%s", "Portal callback ban reason");
+
+    OnPlayerAddBan(&banInfo);
+
+    char banMessage[256] = {};
+    OnPlayerGetBanStatus(&banInfo, banMessage, static_cast<int>(sizeof(banMessage)));
+    AssertTrue(std::strlen(banMessage) > 0, "OnPlayerGetBanStatus should return a ban message for cached ban entries.");
+
+    OnPlayerRemoveBan(&banInfo);
+
+    char clearedBanMessage[256] = {};
+    OnPlayerGetBanStatus(&banInfo, clearedBanMessage, static_cast<int>(sizeof(clearedBanMessage)));
+    AssertTrue(
+        std::strlen(clearedBanMessage) == 0,
+        "OnPlayerGetBanStatus should not return a ban message after OnPlayerRemoveBan clears the cache.");
 
     std::cout << "All plugin export tests passed.\n";
     return 0;

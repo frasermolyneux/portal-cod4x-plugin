@@ -1,7 +1,9 @@
 #pragma once
 
 #include <cstdint>
+#include <atomic>
 #include <deque>
+#include <mutex>
 #include <optional>
 #include <string>
 #include <string_view>
@@ -96,6 +98,9 @@ public:
     void HandleClientCommand(ICod4xHost& host, int slot, std::string_view command, bool fromChatMessage = false);
     void HandleServerSpawned(ICod4xHost& host);
     void HandleServerExited(ICod4xHost& host);
+    void HandlePlayerBanAdded(std::uint64_t playerId, std::string_view reason);
+    void HandlePlayerBanRemoved(std::uint64_t playerId);
+    bool TryGetPlayerBanMessage(std::uint64_t playerId, std::string& message) const;
 
     [[nodiscard]] const EffectiveServerContext& GetServerContext() const;
 
@@ -105,6 +110,13 @@ private:
         Idle,
         AcquiringToken,
         PostingBatch
+    };
+
+    enum class BanSyncStage
+    {
+        Idle,
+        AcquiringToken,
+        FetchingActiveBans
     };
 
     struct BufferedEvent
@@ -154,6 +166,19 @@ private:
     std::deque<BufferedEvent> bufferedEvents;
     std::unordered_map<int, ConnectedPlayerState> connectedPlayers;
 
+    BanSyncStage banSyncStage = BanSyncStage::Idle;
+    HttpRequestHandle banSyncRequest = nullptr;
+    std::int64_t banSyncRequestStartedUnixSeconds = 0;
+    std::string repositoryAccessToken;
+    std::int64_t repositoryAccessTokenExpiresAtUnixSeconds = 0;
+    std::atomic<std::int64_t> nextBanSyncUnixSeconds = 0;
+    std::size_t banSyncConsecutiveFailureCount = 0;
+    int activeBanFetchSkipEntries = 0;
+    bool repositoryConfigWarningLogged = false;
+    std::unordered_map<std::string, std::string> pendingActiveBanMessagesByPlayerGuid;
+    std::unordered_map<std::string, std::string> activeBanMessagesByPlayerGuid;
+    mutable std::mutex activeBanCacheMutex;
+
     bool IsIngestConfigured() const;
     bool IsIngestTokenValid(std::int64_t nowUnixSeconds) const;
     void AdvanceIngest(ICod4xHost& host, std::int64_t nowUnixSeconds);
@@ -161,6 +186,15 @@ private:
     bool StartIngestBatchRequest(ICod4xHost& host, std::int64_t nowUnixSeconds);
     void AbortIngest(ICod4xHost& host, std::int64_t nowUnixSeconds, std::string_view reason);
     void FlushServerStatusSnapshot(ICod4xHost& host, std::int64_t nowUnixSeconds);
+
+    bool IsRepositoryConfigured() const;
+    bool IsRepositoryTokenValid(std::int64_t nowUnixSeconds) const;
+    void AdvanceBanSync(ICod4xHost& host, std::int64_t nowUnixSeconds);
+    bool StartRepositoryTokenRequest(ICod4xHost& host, std::int64_t nowUnixSeconds);
+    bool StartActiveBanFetchRequest(ICod4xHost& host, std::int64_t nowUnixSeconds, int skipEntries);
+    void AbortBanSync(ICod4xHost& host, std::int64_t nowUnixSeconds, std::string_view reason);
+    std::size_t CountActiveBanItems(const std::string& responseBody) const;
+    std::unordered_map<std::string, std::string> ParseActiveBanMessagesByPlayerGuid(const std::string& responseBody) const;
 
     std::string BuildPlayerConnectedPayload(
         std::int64_t nowUnixSeconds,
@@ -228,5 +262,8 @@ void NotifyChatMessage(ICod4xHost& host, int slot, std::string_view message, boo
 void NotifyClientCommand(ICod4xHost& host, int slot, std::string_view command);
 void NotifyServerSpawned(ICod4xHost& host);
 void NotifyServerExited(ICod4xHost& host);
+void NotifyPlayerBanAdded(std::uint64_t playerId, std::string_view reason);
+void NotifyPlayerBanRemoved(std::uint64_t playerId);
+bool TryGetPlayerBanMessage(std::uint64_t playerId, std::string& message);
 const EffectiveServerContext& GetServerContext();
 }

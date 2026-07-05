@@ -341,6 +341,50 @@ PCL void COD4X_CALL OnClientCommand(client_t* client, const char* command)
     portal_cod4x::NotifyClientCommand(host, ClientPointerToSlot(client), std::string_view(command));
 }
 
+PCL void COD4X_CALL OnPlayerGetBanStatus(baninfo_t* baninfo, char* message, int len)
+{
+    if (baninfo == nullptr || message == nullptr || len <= 0)
+    {
+        return;
+    }
+
+    if (message[0] != '\0')
+    {
+        return;
+    }
+
+    std::string banMessage;
+    if (!portal_cod4x::TryGetPlayerBanMessage(baninfo->playerid, banMessage))
+    {
+        return;
+    }
+
+    CopyToBuffer(message, static_cast<std::size_t>(len), banMessage);
+    CopyToBuffer(baninfo->message, sizeof(baninfo->message), banMessage);
+}
+
+PCL void COD4X_CALL OnPlayerAddBan(baninfo_t* baninfo)
+{
+    if (baninfo == nullptr)
+    {
+        return;
+    }
+
+    portal_cod4x::NotifyPlayerBanAdded(
+        baninfo->playerid,
+        std::string_view(baninfo->message));
+}
+
+PCL void COD4X_CALL OnPlayerRemoveBan(baninfo_t* baninfo)
+{
+    if (baninfo == nullptr)
+    {
+        return;
+    }
+
+    portal_cod4x::NotifyPlayerBanRemoved(baninfo->playerid);
+}
+
 PCL void COD4X_CALL OnTerminate()
 {
     Plugin_Printf("portal-cod4x-plugin terminated\n");
