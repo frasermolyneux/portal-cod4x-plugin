@@ -37,12 +37,6 @@ constexpr std::string_view kQueueServerConnected = "server-connected";
 constexpr std::string_view kQueueMapChange = "map-change";
 constexpr std::string_view kQueueServerStatus = "server-status";
 constexpr std::int64_t kCrossCallbackDedupWindowSeconds = 1;
-constexpr std::string_view kCommandsCommandPrefix = "!commands";
-constexpr std::string_view kWhoAmICommandPrefix = "!whoami";
-constexpr std::string_view kRegisterCommandPrefix = "!register";
-constexpr std::string_view kFuCommandPrefix = "!fu";
-constexpr std::string_view kLikeCommandPrefix = "!like";
-constexpr std::string_view kDislikeCommandPrefix = "!dislike";
 constexpr std::string_view kPortalPluginHealthCommandPrefix = "!portalpluginhealth";
 
 std::string Trim(std::string value)
@@ -603,60 +597,20 @@ void PluginRuntime::HandleClientCommand(ICod4xHost& host, int slot, std::string_
         lastHandledCommandFromChat = fromChatMessage;
     };
 
-    if (EqualsIgnoreCase(commandToken, kCommandsCommandPrefix))
+    if (!EqualsIgnoreCase(commandToken, kPortalPluginHealthCommandPrefix))
     {
-        markHandled();
-        SendPrivateChat(host, slot, "Available commands: !commands, !whoami, !register, !fu, !like, !dislike, !portalpluginhealth");
         return;
     }
 
-    if (EqualsIgnoreCase(commandToken, kWhoAmICommandPrefix))
+    markHandled();
+
+    if (!host.CanPlayerUseCommand(slot, kPortalPluginHealthCommandName))
     {
-        markHandled();
-        SendPrivateChat(host, slot, "Plugin command processing active.");
+        SendPrivateChat(host, slot, "You are not authorized to run !portalpluginhealth.");
         return;
     }
 
-    if (EqualsIgnoreCase(commandToken, kRegisterCommandPrefix))
-    {
-        markHandled();
-        SendPrivateChat(host, slot, "!register is not available from the plugin path yet.");
-        return;
-    }
-
-    if (EqualsIgnoreCase(commandToken, kFuCommandPrefix))
-    {
-        markHandled();
-        SendPrivateChat(host, slot, "!fu is handled by backend services only.");
-        return;
-    }
-
-    if (EqualsIgnoreCase(commandToken, kLikeCommandPrefix))
-    {
-        markHandled();
-        SendPrivateChat(host, slot, "Map vote registered: like.");
-        return;
-    }
-
-    if (EqualsIgnoreCase(commandToken, kDislikeCommandPrefix))
-    {
-        markHandled();
-        SendPrivateChat(host, slot, "Map vote registered: dislike.");
-        return;
-    }
-
-    if (EqualsIgnoreCase(commandToken, kPortalPluginHealthCommandPrefix))
-    {
-        markHandled();
-
-        if (!host.CanPlayerUseCommand(slot, kPortalPluginHealthCommandName))
-        {
-            SendPrivateChat(host, slot, "You are not authorized to run !portalpluginhealth.");
-            return;
-        }
-
-        HandlePortalPluginHealthCommand(host, slot);
-    }
+    HandlePortalPluginHealthCommand(host, slot);
 }
 
 void PluginRuntime::HandlePortalPluginHealthCommand(ICod4xHost& host, int invokerSlot)

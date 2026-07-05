@@ -1,5 +1,6 @@
 #include "portal_cod4x/plugin_runtime.h"
 
+#include <algorithm>
 #include <cstdlib>
 #include <filesystem>
 #include <fstream>
@@ -440,7 +441,7 @@ void Runtime_DropsPoisonEventsAndUnblocksOtherQueues()
     std::filesystem::remove(configPath, ignoreError);
 }
 
-void Runtime_HandleClientCommand_SendsPrivateResponse()
+void Runtime_HandleClientCommand_IgnoresPortalOwnedCommands()
 {
     FakeHost host;
     portal_cod4x::PluginRuntime runtime;
@@ -450,14 +451,11 @@ void Runtime_HandleClientCommand_SendsPrivateResponse()
 
     runtime.HandleClientCommand(host, 4, "!commands");
 
-    Assert(host.PrivateMessages.size() == 1, "Expected one private command response");
-    Assert(host.PrivateMessages.front().Slot == 4, "Private command response should target requesting slot");
-    Assert(
-        host.PrivateMessages.front().Message.find("Available commands") != std::string::npos,
-        "Expected !commands response payload");
+    Assert(host.PrivateMessages.empty(), "Plugin should ignore portal-owned commands like !commands.");
+    Assert(host.ExecutedCommands.empty(), "Plugin should not emit server commands for portal-owned command input.");
 }
 
-void Runtime_HandleChatMessage_AlsoExecutesCommandPath()
+void Runtime_HandleChatMessage_DoesNotInterceptPortalOwnedCommands()
 {
     FakeHost host;
     portal_cod4x::PluginRuntime runtime;
@@ -467,11 +465,8 @@ void Runtime_HandleChatMessage_AlsoExecutesCommandPath()
 
     runtime.HandleChatMessage(host, 5, "!whoami", false);
 
-    Assert(host.PrivateMessages.size() == 1, "Expected command path to execute from chat message");
-    Assert(host.PrivateMessages.front().Slot == 5, "Command response should target original chat slot");
-    Assert(
-        host.PrivateMessages.front().Message.find("Plugin command processing active") != std::string::npos,
-        "Expected !whoami command response payload");
+    Assert(host.PrivateMessages.empty(), "Plugin should not respond to portal-owned chat commands.");
+    Assert(host.ExecutedCommands.empty(), "Plugin should not run server commands for portal-owned chat commands.");
 }
 
 void Runtime_HandleClientCommand_DoesNotPrefixMatchLongerToken()
@@ -492,21 +487,30 @@ void Runtime_HandleClientCommand_DedupesCrossCallbackPath()
 {
     FakeHost host;
     portal_cod4x::PluginRuntime runtime;
+    host.CommandPermissions[std::string(portal_cod4x::kPortalPluginHealthCommandName)] = true;
 
     host.CurrentTime = 99;
     const int initializeResult = runtime.Initialize(host, "1.2.3", "^4[^1XI-BOT^4]^7");
     Assert(initializeResult == 0, "PluginRuntime initialize should succeed");
 
-    runtime.HandleChatMessage(host, 3, "!commands", false);
+    runtime.HandleChatMessage(host, 3, "!portalpluginhealth", false);
     host.CurrentTime = 100;
-    runtime.HandleClientCommand(host, 3, "!commands");
+    runtime.HandleClientCommand(host, 3, "!portalpluginhealth");
 
-    Assert(host.PrivateMessages.size() == 1, "Cross-callback duplicate command response should be suppressed");
+    const std::size_t tellMessageCount = std::count_if(
+        host.ExecutedCommands.begin(),
+        host.ExecutedCommands.end(),
+        [](const std::string& command) { return command.find("tell 3 ") != std::string::npos; });
+    Assert(tellMessageCount == 1, "Cross-callback duplicate command response should be suppressed");
 
     host.CurrentTime = 101;
-    runtime.HandleClientCommand(host, 3, "!commands");
+    runtime.HandleClientCommand(host, 3, "!portalpluginhealth");
 
-    Assert(host.PrivateMessages.size() == 2, "Later command should be handled outside cross-callback dedupe window");
+    const std::size_t tellMessageCountAfterSecondInvoke = std::count_if(
+        host.ExecutedCommands.begin(),
+        host.ExecutedCommands.end(),
+        [](const std::string& command) { return command.find("tell 3 ") != std::string::npos; });
+    Assert(tellMessageCountAfterSecondInvoke == 2, "Later command should be handled outside cross-callback dedupe window");
 }
 
 void Runtime_HandleClientCommand_PortalPluginHealth_UsesConsoleAndTellFlow()
@@ -692,8 +696,8 @@ int main()
     Runtime_EmitsAndFlushesPlayerConnectedEvent();
     Runtime_AuthorizedIdentity_AllowsDisconnectEventWhenPlayerIdUnavailableAtDisconnect();
     Runtime_DropsPoisonEventsAndUnblocksOtherQueues();
-    Runtime_HandleClientCommand_SendsPrivateResponse();
-    Runtime_HandleChatMessage_AlsoExecutesCommandPath();
+    Runtime_HandleClientCommand_IgnoresPortalOwnedCommands();
+    Runtime_HandleChatMessage_DoesNotInterceptPortalOwnedCommands();
     Runtime_HandleClientCommand_DoesNotPrefixMatchLongerToken();
     Runtime_HandleClientCommand_DedupesCrossCallbackPath();
     Runtime_HandleClientCommand_PortalPluginHealth_UsesConsoleAndTellFlow();

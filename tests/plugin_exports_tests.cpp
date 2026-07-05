@@ -309,19 +309,9 @@ int main()
     OnPlayerDC(&fakeClient, "quit");
 
     AssertTrue(g_logs.size() >= logCountAfterInit, "OnFrame and OnClientAuthorized should be safe to invoke.");
-    AssertTrue(g_chats.size() >= 2, "OnClientCommand should emit a private response.");
-
-    bool foundClientCommandResponse = false;
-    for (const auto& chat : g_chats)
-    {
-        if (chat.slot == 0 && chat.message.find("Available commands") != std::string::npos)
-        {
-            foundClientCommandResponse = true;
-            break;
-        }
-    }
-
-    AssertTrue(foundClientCommandResponse, "Expected !commands response from OnClientCommand callback.");
+    AssertTrue(
+        g_chats.size() == 1,
+        "Plugin should not emit private chat responses for portal-owned commands like !commands.");
 
     baninfo_t banInfo{};
     banInfo.playerid = g_player_id;
