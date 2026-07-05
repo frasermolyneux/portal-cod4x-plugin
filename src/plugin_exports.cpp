@@ -14,6 +14,28 @@
 namespace
 {
 constexpr int kBroadcastSlot = -1;
+constexpr int kPortalPluginHealthDefaultPower = 98;
+
+void COD4X_CALL CmdPortalPluginHealth();
+
+struct PluginCommandRegistration
+{
+    const char* Name;
+    xcommand_t Handler;
+    int DefaultPower;
+};
+
+constexpr PluginCommandRegistration kPluginCommandRegistrations[] = {
+    {portal_cod4x::kPortalPluginHealthCommandName.data(), &CmdPortalPluginHealth, kPortalPluginHealthDefaultPower},
+};
+
+void RegisterPluginCommands()
+{
+    for (const auto& command : kPluginCommandRegistrations)
+    {
+        Plugin_AddCommand(command.Name, command.Handler, command.DefaultPower);
+    }
+}
 
 std::string BuildShortDescription()
 {
@@ -247,21 +269,43 @@ public:
         return std::string(buffer.data());
     }
 
+    bool CanPlayerUseCommand(int slot, std::string_view commandName) const override
+    {
+        if (slot < 0)
+        {
+            return true;
+        }
+
+        return Plugin_CanPlayerUseCommand(slot, std::string(commandName).c_str()) == qtrue;
+    }
+
     std::int64_t GetUnixTimeSeconds() const override
     {
         return static_cast<std::int64_t>(std::time(nullptr));
     }
 };
+
+void COD4X_CALL CmdPortalPluginHealth()
+{
+    Cod4xHostAdapter host;
+    portal_cod4x::NotifyPortalPluginHealthCommand(host, Plugin_Cmd_GetInvokerSlot());
+}
 }
 
 PCL int COD4X_CALL OnInit()
 {
     Cod4xHostAdapter host;
-
-    return portal_cod4x::InitializePlugin(
+    const int initializeResult = portal_cod4x::InitializePlugin(
         host,
         portal_cod4x::kPluginSemanticVersion,
         portal_cod4x::kDefaultBotPrefix);
+
+    if (initializeResult == 0)
+    {
+        RegisterPluginCommands();
+    }
+
+    return initializeResult;
 }
 
 PCL void COD4X_CALL OnFrame()

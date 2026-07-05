@@ -38,6 +38,7 @@ public:
     std::unordered_map<int, std::uint64_t> PlayerSteamIds;
     std::unordered_map<int, std::string> PlayerNames;
     std::unordered_map<int, int> PlayerScores;
+    std::unordered_map<std::string, bool> CommandPermissions;
     std::unordered_map<std::string, std::string> CvarValues;
     std::int64_t CurrentTime = 0;
 
@@ -135,6 +136,12 @@ public:
     {
         const auto it = CvarValues.find(std::string(cvarName));
         return it == CvarValues.end() ? std::string() : it->second;
+    }
+
+    bool CanPlayerUseCommand(int, std::string_view commandName) const override
+    {
+        const auto it = CommandPermissions.find(std::string(commandName));
+        return it == CommandPermissions.end() ? true : it->second;
     }
 
     std::int64_t GetUnixTimeSeconds() const override
@@ -502,6 +509,75 @@ void Runtime_HandleClientCommand_DedupesCrossCallbackPath()
     Assert(host.PrivateMessages.size() == 2, "Later command should be handled outside cross-callback dedupe window");
 }
 
+void Runtime_HandleClientCommand_PortalPluginHealth_UsesConsoleAndTellFlow()
+{
+    FakeHost host;
+    portal_cod4x::PluginRuntime runtime;
+    host.CommandPermissions[std::string(portal_cod4x::kPortalPluginHealthCommandName)] = true;
+
+    host.CurrentTime = 111;
+    const int initializeResult = runtime.Initialize(host, "1.2.3", "^4[^1XI-BOT^4]^7");
+    Assert(initializeResult == 0, "PluginRuntime initialize should succeed");
+
+    runtime.HandleClientCommand(host, 7, "!portalpluginhealth");
+
+    bool hasConsay = false;
+    bool hasTell = false;
+    for (const auto& command : host.ExecutedCommands)
+    {
+        if (command.rfind("consay ", 0) == 0)
+        {
+            hasConsay = true;
+        }
+
+        if (command.find("tell 7 ") != std::string::npos)
+        {
+            hasTell = true;
+        }
+    }
+
+    Assert(hasConsay, "Expected !portalpluginhealth to emit consay console output for player invocations");
+    Assert(hasTell, "Expected !portalpluginhealth to send tell guidance to the requesting player");
+
+    bool hasHealthLogLine = false;
+    for (const auto& line : host.Logs)
+    {
+        if (line.find("portalpluginhealth report") != std::string::npos)
+        {
+            hasHealthLogLine = true;
+            break;
+        }
+    }
+
+    Assert(hasHealthLogLine, "Expected !portalpluginhealth to log console health report lines");
+}
+
+void Runtime_HandleClientCommand_PortalPluginHealth_RespectsCommandAuthorization()
+{
+    FakeHost host;
+    portal_cod4x::PluginRuntime runtime;
+    host.CommandPermissions[std::string(portal_cod4x::kPortalPluginHealthCommandName)] = false;
+
+    host.CurrentTime = 112;
+    const int initializeResult = runtime.Initialize(host, "1.2.3", "^4[^1XI-BOT^4]^7");
+    Assert(initializeResult == 0, "PluginRuntime initialize should succeed");
+
+    runtime.HandleClientCommand(host, 8, "!portalpluginhealth");
+
+    bool hasDenyMessage = false;
+    for (const auto& message : host.PrivateMessages)
+    {
+        if (message.Slot == 8 && message.Message.find("not authorized") != std::string::npos)
+        {
+            hasDenyMessage = true;
+            break;
+        }
+    }
+
+    Assert(hasDenyMessage, "Expected unauthorized response when player lacks portalpluginhealth command power.");
+    Assert(host.ExecutedCommands.empty(), "Unauthorized health command should not emit server commands.");
+}
+
 void Runtime_LoadsActiveBanCacheAndAnswersBanQuery()
 {
     const std::filesystem::path configPath = std::filesystem::temp_directory_path() / "portal-cod4x-plugin.bansync.test.json";
@@ -620,6 +696,8 @@ int main()
     Runtime_HandleChatMessage_AlsoExecutesCommandPath();
     Runtime_HandleClientCommand_DoesNotPrefixMatchLongerToken();
     Runtime_HandleClientCommand_DedupesCrossCallbackPath();
+    Runtime_HandleClientCommand_PortalPluginHealth_UsesConsoleAndTellFlow();
+    Runtime_HandleClientCommand_PortalPluginHealth_RespectsCommandAuthorization();
     Runtime_LoadsActiveBanCacheAndAnswersBanQuery();
     Runtime_PlayerBanMutationHintsUpdateCacheImmediately();
     InitializePlugin_EmitsLogAndBroadcast();

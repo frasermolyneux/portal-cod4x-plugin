@@ -2,6 +2,7 @@
 
 #include "portal_cod4x/plugin_version.h"
 
+#include <algorithm>
 #include <cstdarg>
 #include <cstdio>
 #include <cstdlib>
@@ -18,11 +19,20 @@ struct ChatMessage
     std::string message;
 };
 
+struct RegisteredCommand
+{
+    std::string Name;
+    xcommand_t Handler = nullptr;
+    int DefaultPower = 0;
+};
+
 std::vector<std::string> g_logs;
 std::vector<ChatMessage> g_chats;
 std::vector<std::string> g_commands;
+std::vector<RegisteredCommand> g_registered_commands;
 std::string g_player_name = "TestPlayer";
 std::uint64_t g_player_id = 76561198000000001ULL;
+int g_command_invoker_slot = 0;
 
 void AssertTrue(bool condition, const char* failureMessage)
 {
@@ -60,6 +70,21 @@ extern "C" void COD4X_CALL Plugin_ChatPrintf(int slot, const char* fmt, ...)
 extern "C" void COD4X_CALL Plugin_Cbuf_AddText(const char* text)
 {
     g_commands.emplace_back(text == nullptr ? "" : text);
+}
+
+extern "C" void COD4X_CALL Plugin_AddCommand(const char* name, xcommand_t command, int defaultpower)
+{
+    g_registered_commands.push_back(RegisteredCommand{name == nullptr ? "" : name, command, defaultpower});
+}
+
+extern "C" int COD4X_CALL Plugin_Cmd_GetInvokerSlot()
+{
+    return g_command_invoker_slot;
+}
+
+extern "C" qboolean COD4X_CALL Plugin_CanPlayerUseCommand(int, const char*)
+{
+    return qtrue;
 }
 
 extern "C" ftRequest_t* COD4X_CALL Plugin_HTTP_MakeHttpRequest(
@@ -173,6 +198,11 @@ void OnInfoRequest(pluginInfo_t* info);
 
 int main()
 {
+    g_logs.clear();
+    g_chats.clear();
+    g_commands.clear();
+    g_registered_commands.clear();
+
     pluginInfo_t info = {};
     OnInfoRequest(&info);
 
@@ -191,6 +221,69 @@ int main()
     AssertTrue(g_chats.front().slot == -1, "Startup broadcast should target all players with slot -1.");
     AssertTrue(g_chats.front().message.find("version") != std::string::npos, "Startup broadcast should contain a version string.");
     AssertTrue(!g_logs.empty(), "OnInit should emit at least one log message.");
+
+    const auto registeredHealthCommand = std::find_if(
+        g_registered_commands.begin(),
+        g_registered_commands.end(),
+        [](const RegisteredCommand& command) { return command.Name == "portalpluginhealth"; });
+
+    AssertTrue(registeredHealthCommand != g_registered_commands.end(), "Expected portalpluginhealth command to be registered.");
+    AssertTrue(registeredHealthCommand->DefaultPower == 98, "portalpluginhealth default power should be 98.");
+    AssertTrue(registeredHealthCommand->Handler != nullptr, "portalpluginhealth command handler should be registered.");
+
+    const std::size_t commandsBeforeHealth = g_commands.size();
+    g_command_invoker_slot = 0;
+    registeredHealthCommand->Handler();
+
+    bool foundConsay = false;
+    bool foundTell = false;
+    for (std::size_t i = commandsBeforeHealth; i < g_commands.size(); ++i)
+    {
+        if (g_commands[i].rfind("consay ", 0) == 0)
+        {
+            foundConsay = true;
+        }
+
+        if (g_commands[i].find("tell 0 ") != std::string::npos)
+        {
+            foundTell = true;
+        }
+    }
+
+    AssertTrue(foundConsay, "portalpluginhealth should emit console output through consay when invoked by a player.");
+    AssertTrue(foundTell, "portalpluginhealth should notify the invoker via tell to review console output.");
+
+    const std::size_t commandCountAfterPlayerInvoke = g_commands.size();
+    const std::size_t logCountBeforeRconInvoke = g_logs.size();
+    g_command_invoker_slot = -1;
+    registeredHealthCommand->Handler();
+    AssertTrue(
+        g_commands.size() == commandCountAfterPlayerInvoke,
+        "portalpluginhealth should not emit tell/consay server commands for RCON invocation.");
+
+    bool foundRconHealthReportLog = false;
+    for (std::size_t i = logCountBeforeRconInvoke; i < g_logs.size(); ++i)
+    {
+        if (g_logs[i].find("portalpluginhealth report") != std::string::npos)
+        {
+            foundRconHealthReportLog = true;
+            break;
+        }
+    }
+
+    AssertTrue(foundRconHealthReportLog, "RCON invocation should emit the same console health report lines.");
+
+    bool foundHealthReportLog = false;
+    for (const auto& logEntry : g_logs)
+    {
+        if (logEntry.find("portalpluginhealth report") != std::string::npos)
+        {
+            foundHealthReportLog = true;
+            break;
+        }
+    }
+
+    AssertTrue(foundHealthReportLog, "portalpluginhealth should emit health report lines to console output.");
 
     const std::size_t logCountAfterInit = g_logs.size();
     client_t fakeClient{};

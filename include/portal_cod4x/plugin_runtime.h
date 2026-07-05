@@ -76,12 +76,14 @@ public:
     virtual int GetSlotCount() const = 0;
     virtual int GetPlayerScore(int slot) const = 0;
     virtual std::string GetCvarString(std::string_view cvarName) const = 0;
+        virtual bool CanPlayerUseCommand(int slot, std::string_view commandName) const = 0;
 
     virtual std::int64_t GetUnixTimeSeconds() const = 0;
 };
 
 inline constexpr std::string_view kDefaultBotPrefix = "^4[^1XI-BOT^4]^7";
 inline constexpr std::string_view kDefaultConfigFilePath = "portal-cod4x-plugin.config.json";
+    inline constexpr std::string_view kPortalPluginHealthCommandName = "portalpluginhealth";
 
 class PluginRuntime
 {
@@ -96,6 +98,7 @@ public:
     void HandlePlayerDisconnected(ICod4xHost& host, int slot);
     void HandleChatMessage(ICod4xHost& host, int slot, std::string_view message, bool teamMessage);
     void HandleClientCommand(ICod4xHost& host, int slot, std::string_view command, bool fromChatMessage = false);
+    void HandlePortalPluginHealthCommand(ICod4xHost& host, int invokerSlot);
     void HandleServerSpawned(ICod4xHost& host);
     void HandleServerExited(ICod4xHost& host);
     void HandlePlayerBanAdded(std::uint64_t playerId, std::string_view reason);
@@ -246,6 +249,8 @@ private:
     static std::string Trim(std::string value);
     std::string BuildPrefixedChatMessage(std::string_view message) const;
     void SendPrivateChat(ICod4xHost& host, int slot, std::string_view message) const;
+    std::vector<std::string> BuildPortalPluginHealthReportLines(std::int64_t nowUnixSeconds) const;
+    static std::string FormatOptionalUnixTimestamp(std::int64_t unixSeconds);
     long long nextSequenceId = 1;
 
     bool TryLoadConfig(ICod4xHost& host, std::int64_t nowUnixSeconds);
@@ -262,6 +267,7 @@ void NotifyChatMessage(ICod4xHost& host, int slot, std::string_view message, boo
 void NotifyClientCommand(ICod4xHost& host, int slot, std::string_view command);
 void NotifyServerSpawned(ICod4xHost& host);
 void NotifyServerExited(ICod4xHost& host);
+void NotifyPortalPluginHealthCommand(ICod4xHost& host, int slot);
 void NotifyPlayerBanAdded(std::uint64_t playerId, std::string_view reason);
 void NotifyPlayerBanRemoved(std::uint64_t playerId);
 bool TryGetPlayerBanMessage(std::uint64_t playerId, std::string& message);

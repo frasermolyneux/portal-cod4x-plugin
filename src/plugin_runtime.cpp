@@ -43,6 +43,7 @@ constexpr std::string_view kRegisterCommandPrefix = "!register";
 constexpr std::string_view kFuCommandPrefix = "!fu";
 constexpr std::string_view kLikeCommandPrefix = "!like";
 constexpr std::string_view kDislikeCommandPrefix = "!dislike";
+constexpr std::string_view kPortalPluginHealthCommandPrefix = "!portalpluginhealth";
 
 std::string Trim(std::string value)
 {
@@ -605,7 +606,7 @@ void PluginRuntime::HandleClientCommand(ICod4xHost& host, int slot, std::string_
     if (EqualsIgnoreCase(commandToken, kCommandsCommandPrefix))
     {
         markHandled();
-        SendPrivateChat(host, slot, "Available commands: !commands, !whoami, !register, !fu, !like, !dislike");
+        SendPrivateChat(host, slot, "Available commands: !commands, !whoami, !register, !fu, !like, !dislike, !portalpluginhealth");
         return;
     }
 
@@ -641,7 +642,49 @@ void PluginRuntime::HandleClientCommand(ICod4xHost& host, int slot, std::string_
     {
         markHandled();
         SendPrivateChat(host, slot, "Map vote registered: dislike.");
+        return;
     }
+
+    if (EqualsIgnoreCase(commandToken, kPortalPluginHealthCommandPrefix))
+    {
+        markHandled();
+
+        if (!host.CanPlayerUseCommand(slot, kPortalPluginHealthCommandName))
+        {
+            SendPrivateChat(host, slot, "You are not authorized to run !portalpluginhealth.");
+            return;
+        }
+
+        HandlePortalPluginHealthCommand(host, slot);
+    }
+}
+
+void PluginRuntime::HandlePortalPluginHealthCommand(ICod4xHost& host, int invokerSlot)
+{
+    const std::int64_t nowUnixSeconds = host.GetUnixTimeSeconds();
+    const std::vector<std::string> reportLines = BuildPortalPluginHealthReportLines(nowUnixSeconds);
+
+    for (const auto& line : reportLines)
+    {
+        host.Log(line);
+    }
+
+    if (invokerSlot < 0)
+    {
+        return;
+    }
+
+    for (const auto& line : reportLines)
+    {
+        std::string commandText = line;
+        std::replace(commandText.begin(), commandText.end(), '\n', ' ');
+        std::replace(commandText.begin(), commandText.end(), '\r', ' ');
+        host.ExecuteServerCommand("consay " + commandText);
+    }
+
+    host.ExecuteServerCommand(
+        "tell " + std::to_string(invokerSlot) +
+        " Portal plugin health written to console output. Open your console for full details.");
 }
 
 void PluginRuntime::HandleServerSpawned(ICod4xHost& host)
@@ -1781,6 +1824,101 @@ std::string PluginRuntime::Trim(std::string value)
     return value;
 }
 
+std::vector<std::string> PluginRuntime::BuildPortalPluginHealthReportLines(std::int64_t nowUnixSeconds) const
+{
+    std::size_t activeBanCacheCount = 0;
+    {
+        std::lock_guard<std::mutex> guard(activeBanCacheMutex);
+        activeBanCacheCount = activeBanMessagesByPlayerGuid.size();
+    }
+
+    std::string ingestStageName = "Idle";
+    switch (ingestStage)
+    {
+        case IngestStage::AcquiringToken:
+            ingestStageName = "AcquiringToken";
+            break;
+        case IngestStage::PostingBatch:
+            ingestStageName = "PostingBatch";
+            break;
+        case IngestStage::Idle:
+        default:
+            break;
+    }
+
+    std::string banSyncStageName = "Idle";
+    switch (banSyncStage)
+    {
+        case BanSyncStage::AcquiringToken:
+            banSyncStageName = "AcquiringToken";
+            break;
+        case BanSyncStage::FetchingActiveBans:
+            banSyncStageName = "FetchingActiveBans";
+            break;
+        case BanSyncStage::Idle:
+        default:
+            break;
+    }
+
+    std::vector<std::string> lines;
+    lines.reserve(8);
+
+    lines.emplace_back("[portal-cod4x-plugin] portalpluginhealth report");
+
+    std::string identityLine = "pluginVersion=" + pluginVersion +
+        " loadedConfig=" + std::string(loadedConfig.has_value() ? "true" : "false") +
+        " gameServerId=" + serverContext.GameServerId;
+    if (loadedConfig.has_value() && !loadedConfig->GameType.empty())
+    {
+        identityLine += " gameType=" + loadedConfig->GameType;
+    }
+
+    lines.push_back(std::move(identityLine));
+
+    lines.push_back(
+        "repositoryTokenExpiresUtc=" + FormatOptionalUnixTimestamp(repositoryAccessTokenExpiresAtUnixSeconds) +
+        " repositoryTokenValid=" + std::string(IsRepositoryTokenValid(nowUnixSeconds) ? "true" : "false"));
+
+    lines.push_back(
+        "ingestTokenExpiresUtc=" + FormatOptionalUnixTimestamp(ingestAccessTokenExpiresAtUnixSeconds) +
+        " ingestTokenValid=" + std::string(IsIngestTokenValid(nowUnixSeconds) ? "true" : "false"));
+
+    lines.push_back(
+        "banSyncStage=" + banSyncStageName +
+        " nextBanSyncUtc=" + FormatOptionalUnixTimestamp(nextBanSyncUnixSeconds.load(std::memory_order_relaxed)) +
+        " activeBanCacheCount=" + std::to_string(activeBanCacheCount) +
+        " pendingBanCacheCount=" + std::to_string(pendingActiveBanMessagesByPlayerGuid.size()) +
+        " banSyncInFlight=" + std::string(banSyncRequest != nullptr ? "true" : "false"));
+
+    lines.push_back(
+        "ingestStage=" + ingestStageName +
+        " bufferedEventCount=" + std::to_string(bufferedEvents.size()) +
+        " ingestFailureCount=" + std::to_string(ingestConsecutiveFailureCount) +
+        " nextIngestAttemptUtc=" + FormatOptionalUnixTimestamp(nextIngestAttemptUnixSeconds) +
+        " ingestInFlight=" + std::string(ingestRequest != nullptr ? "true" : "false"));
+
+    lines.push_back(
+        "connectedPlayerCount=" + std::to_string(connectedPlayers.size()) +
+        " serverContextLastRefreshUtc=" + FormatOptionalUnixTimestamp(serverContext.LastRefreshUnixSeconds));
+
+    if (!lastConfigLoadError.empty())
+    {
+        lines.push_back("lastConfigLoadError=" + lastConfigLoadError);
+    }
+
+    return lines;
+}
+
+std::string PluginRuntime::FormatOptionalUnixTimestamp(std::int64_t unixSeconds)
+{
+    if (unixSeconds <= 0)
+    {
+        return "n/a";
+    }
+
+    return ToIso8601Utc(unixSeconds);
+}
+
 namespace
 {
 PluginRuntime g_runtime;
@@ -1834,6 +1972,11 @@ void NotifyServerSpawned(ICod4xHost& host)
 void NotifyServerExited(ICod4xHost& host)
 {
     g_runtime.HandleServerExited(host);
+}
+
+void NotifyPortalPluginHealthCommand(ICod4xHost& host, int slot)
+{
+    g_runtime.HandlePortalPluginHealthCommand(host, slot);
 }
 
 void NotifyPlayerBanAdded(std::uint64_t playerId, std::string_view reason)
