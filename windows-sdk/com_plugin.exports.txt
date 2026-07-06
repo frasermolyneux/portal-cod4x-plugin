@@ -4,6 +4,9 @@
 Plugin_Printf
 Plugin_ChatPrintf
 Plugin_Cbuf_AddText
+Plugin_AddCommand
+Plugin_Cmd_GetInvokerSlot
+Plugin_CanPlayerUseCommand
 Plugin_GetSlotCount
 Plugin_GetPlayerName
 Plugin_GetPlayerID
