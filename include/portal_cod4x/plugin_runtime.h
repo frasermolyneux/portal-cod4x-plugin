@@ -40,6 +40,8 @@ struct PluginConfig
     std::string GameServerId;
     std::string GameType;
     int RefreshIntervalSeconds = 120;
+    bool PortalPluginHealthEnabled = true;
+    int PortalPluginHealthMinPower = 98;
 };
 
 struct EffectiveServerContext
@@ -76,18 +78,26 @@ public:
     virtual int GetSlotCount() const = 0;
     virtual int GetPlayerScore(int slot) const = 0;
     virtual std::string GetCvarString(std::string_view cvarName) const = 0;
-        virtual bool CanPlayerUseCommand(int slot, std::string_view commandName) const = 0;
+    virtual bool CanPlayerUseCommand(int slot, std::string_view commandName) const = 0;
 
     virtual std::int64_t GetUnixTimeSeconds() const = 0;
 };
 
 inline constexpr std::string_view kDefaultBotPrefix = "^4[^1XI-BOT^4]^7";
 inline constexpr std::string_view kDefaultConfigFilePath = "portal-cod4x-plugin.config.json";
-    inline constexpr std::string_view kPortalPluginHealthCommandName = "portalpluginhealth";
+inline constexpr std::string_view kPortalPluginHealthCommandName = "portalpluginhealth";
+inline constexpr std::string_view kPortalPluginLogLevelCommandName = "portalpluginloglevel";
 
 class PluginRuntime
 {
 public:
+    enum class LogLevel : int
+    {
+        Debug = 1,
+        Info = 2,
+        Error = 3
+    };
+
     explicit PluginRuntime(std::string configPath = std::string(kDefaultConfigFilePath));
 
     int Initialize(ICod4xHost& host, std::string_view version, std::string_view prefix = kDefaultBotPrefix);
@@ -104,6 +114,10 @@ public:
     void HandlePlayerBanAdded(std::uint64_t playerId, std::string_view reason);
     void HandlePlayerBanRemoved(std::uint64_t playerId);
     bool TryGetPlayerBanMessage(std::uint64_t playerId, std::string& message) const;
+    bool TrySetLogLevel(ICod4xHost& host, int levelValue, bool announce = true);
+    bool TrySetLogLevel(ICod4xHost& host, std::string_view levelToken, bool announce = true);
+    [[nodiscard]] int GetLogLevelValue() const;
+    [[nodiscard]] std::string GetLogLevelName() const;
 
     [[nodiscard]] const EffectiveServerContext& GetServerContext() const;
 
@@ -176,6 +190,7 @@ private:
     std::int64_t repositoryAccessTokenExpiresAtUnixSeconds = 0;
     std::atomic<std::int64_t> nextBanSyncUnixSeconds = 0;
     std::size_t banSyncConsecutiveFailureCount = 0;
+    LogLevel logLevel = LogLevel::Info;
     int activeBanFetchSkipEntries = 0;
     bool repositoryConfigWarningLogged = false;
     std::unordered_map<std::string, std::string> pendingActiveBanMessagesByPlayerGuid;
@@ -249,6 +264,10 @@ private:
     static std::string Trim(std::string value);
     std::string BuildPrefixedChatMessage(std::string_view message) const;
     void SendPrivateChat(ICod4xHost& host, int slot, std::string_view message) const;
+    bool ShouldLog(LogLevel level) const;
+    void LogDebug(ICod4xHost& host, std::string_view message) const;
+    void LogInfo(ICod4xHost& host, std::string_view message) const;
+    void LogError(ICod4xHost& host, std::string_view message) const;
     std::vector<std::string> BuildPortalPluginHealthReportLines(std::int64_t nowUnixSeconds) const;
     static std::string FormatOptionalUnixTimestamp(std::int64_t unixSeconds);
     long long nextSequenceId = 1;
@@ -268,6 +287,10 @@ void NotifyClientCommand(ICod4xHost& host, int slot, std::string_view command);
 void NotifyServerSpawned(ICod4xHost& host);
 void NotifyServerExited(ICod4xHost& host);
 void NotifyPortalPluginHealthCommand(ICod4xHost& host, int slot);
+bool TrySetPluginLogLevel(ICod4xHost& host, int levelValue, bool announce = true);
+bool TrySetPluginLogLevel(ICod4xHost& host, std::string_view levelToken, bool announce = true);
+int GetPluginLogLevelValue();
+std::string GetPluginLogLevelName();
 void NotifyPlayerBanAdded(std::uint64_t playerId, std::string_view reason);
 void NotifyPlayerBanRemoved(std::uint64_t playerId);
 bool TryGetPlayerBanMessage(std::uint64_t playerId, std::string& message);

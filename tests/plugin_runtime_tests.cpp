@@ -582,6 +582,109 @@ void Runtime_HandleClientCommand_PortalPluginHealth_RespectsCommandAuthorization
     Assert(host.ExecutedCommands.empty(), "Unauthorized health command should not emit server commands.");
 }
 
+void Runtime_HandleClientCommand_PortalPluginHealth_RespectsPortalEnabledFlag()
+{
+    const std::filesystem::path configPath = std::filesystem::temp_directory_path() / "portal-cod4x-plugin.portalpluginhealth-disabled.test.json";
+
+    {
+        std::ofstream configFile(configPath);
+        configFile
+            << "{"
+            << "\"tenantId\":\"tenant-test\"," 
+            << "\"clientId\":\"client-test\"," 
+            << "\"clientSecret\":\"secret-test\"," 
+            << "\"repositoryApiBaseUrl\":\"https://example.test/repository\"," 
+            << "\"repositoryApiResource\":\"api://repository-test\"," 
+            << "\"gameServerId\":\"11111111-2222-3333-4444-555555555555\"," 
+            << "\"portalPluginHealthEnabled\":false"
+            << "}";
+    }
+
+    FakeHost host;
+    host.CommandPermissions[std::string(portal_cod4x::kPortalPluginHealthCommandName)] = true;
+    host.CurrentTime = 113;
+
+    portal_cod4x::PluginRuntime runtime(configPath.string());
+    const int initializeResult = runtime.Initialize(host, "1.2.3", "^4[^1XI-BOT^4]^7");
+    Assert(initializeResult == 0, "PluginRuntime initialize should succeed");
+
+    runtime.HandleClientCommand(host, 8, "!portalpluginhealth");
+
+    bool hasDisabledMessage = false;
+    for (const auto& message : host.PrivateMessages)
+    {
+        if (message.Slot == 8 && message.Message.find("currently disabled") != std::string::npos)
+        {
+            hasDisabledMessage = true;
+            break;
+        }
+    }
+
+    Assert(hasDisabledMessage, "Expected disabled response when portalpluginhealth is disabled in runtime config.");
+    Assert(host.ExecutedCommands.empty(), "Disabled health command should not emit server commands.");
+
+    std::error_code ignoreError;
+    std::filesystem::remove(configPath, ignoreError);
+}
+
+void Runtime_HandleClientCommand_PortalPluginHealth_IgnoresMalformedPortalEnabledFlag()
+{
+    const std::filesystem::path configPath =
+        std::filesystem::temp_directory_path() / "portal-cod4x-plugin.portalpluginhealth-malformed-enabled.test.json";
+
+    {
+        std::ofstream configFile(configPath);
+        configFile
+            << "{"
+            << "\"tenantId\":\"tenant-test\","
+            << "\"clientId\":\"client-test\","
+            << "\"clientSecret\":\"secret-test\","
+            << "\"repositoryApiBaseUrl\":\"https://example.test/repository\","
+            << "\"repositoryApiResource\":\"api://repository-test\","
+            << "\"gameServerId\":\"11111111-2222-3333-4444-555555555555\","
+            << "\"portalPluginHealthEnabled\":00"
+            << "}";
+    }
+
+    FakeHost host;
+    host.CommandPermissions[std::string(portal_cod4x::kPortalPluginHealthCommandName)] = true;
+    host.CurrentTime = 114;
+
+    portal_cod4x::PluginRuntime runtime(configPath.string());
+    const int initializeResult = runtime.Initialize(host, "1.2.3", "^4[^1XI-BOT^4]^7");
+    Assert(initializeResult == 0, "PluginRuntime initialize should succeed");
+
+    runtime.HandleClientCommand(host, 9, "!portalpluginhealth");
+
+    bool hasDisabledMessage = false;
+    for (const auto& message : host.PrivateMessages)
+    {
+        if (message.Slot == 9 && message.Message.find("currently disabled") != std::string::npos)
+        {
+            hasDisabledMessage = true;
+            break;
+        }
+    }
+
+    Assert(!hasDisabledMessage, "Malformed portalPluginHealthEnabled should not disable !portalpluginhealth.");
+    Assert(!host.ExecutedCommands.empty(), "Malformed portalPluginHealthEnabled should preserve default command behavior.");
+
+    bool hasHealthLogLine = false;
+    for (const auto& line : host.Logs)
+    {
+        if (line.find("portalpluginhealthEnabled=true") != std::string::npos)
+        {
+            hasHealthLogLine = true;
+            break;
+        }
+    }
+
+    Assert(hasHealthLogLine, "Expected malformed flag to fall back to enabled=true in health report output.");
+
+    std::error_code ignoreError;
+    std::filesystem::remove(configPath, ignoreError);
+}
+
 void Runtime_LoadsActiveBanCacheAndAnswersBanQuery()
 {
     const std::filesystem::path configPath = std::filesystem::temp_directory_path() / "portal-cod4x-plugin.bansync.test.json";
@@ -657,6 +760,137 @@ void Runtime_PlayerBanMutationHintsUpdateCacheImmediately()
     Assert(!isBanned, "Expected remove-ban hint to evict local ban cache entry");
 }
 
+void Runtime_LogLevelDefaultsAndParsing()
+{
+    FakeHost host;
+    portal_cod4x::PluginRuntime runtime;
+
+    const int initializeResult = runtime.Initialize(host, "1.2.3", "^4[^1XI-BOT^4]^7");
+    Assert(initializeResult == 0, "PluginRuntime initialize should succeed");
+
+    host.Logs.clear();
+
+    Assert(runtime.GetLogLevelValue() == 2, "Expected default plugin log level to be info (2)");
+    Assert(runtime.GetLogLevelName() == "info", "Expected default plugin log level name to be info");
+
+    const bool setDebugResult = runtime.TrySetLogLevel(host, "debug");
+    Assert(setDebugResult, "Expected debug log level token to be accepted");
+    Assert(runtime.GetLogLevelValue() == 1, "Expected debug token to map to level 1");
+    Assert(runtime.GetLogLevelName() == "debug", "Expected debug token to map to debug name");
+    Assert(!host.Logs.empty(), "Expected log-level change announcement when announce=true");
+    Assert(
+        host.Logs.back().find("plugin log level set to debug (1)") != std::string::npos,
+        "Expected debug change announcement to include debug level");
+
+    host.Logs.clear();
+    const bool setErrorResult = runtime.TrySetLogLevel(host, 3);
+    Assert(setErrorResult, "Expected numeric log level token to be accepted");
+    Assert(runtime.GetLogLevelValue() == 3, "Expected numeric level 3 to map to error");
+    Assert(runtime.GetLogLevelName() == "error", "Expected numeric level 3 to map to error name");
+    Assert(
+        !host.Logs.empty() && host.Logs.back().find("plugin log level set to error (3)") != std::string::npos,
+        "Expected numeric level change announcement to include error level");
+
+    host.Logs.clear();
+    const bool invalidSetResult = runtime.TrySetLogLevel(host, "verbose");
+    Assert(!invalidSetResult, "Expected unknown log level token to be rejected");
+    Assert(runtime.GetLogLevelValue() == 3, "Rejected token should preserve previous log level");
+    Assert(host.Logs.empty(), "Rejected token should not emit a change announcement");
+}
+
+void Runtime_LogLevelSetWithoutAnnouncement_DoesNotLog()
+{
+    FakeHost host;
+    portal_cod4x::PluginRuntime runtime;
+
+    const int initializeResult = runtime.Initialize(host, "1.2.3", "^4[^1XI-BOT^4]^7");
+    Assert(initializeResult == 0, "PluginRuntime initialize should succeed");
+
+    host.Logs.clear();
+
+    const bool setInfoWithoutAnnounce = runtime.TrySetLogLevel(host, "info", false);
+    Assert(setInfoWithoutAnnounce, "Expected info token to be accepted with announce disabled");
+    Assert(runtime.GetLogLevelValue() == 2, "Expected info token to keep level at 2");
+    Assert(host.Logs.empty(), "No log entry should be emitted when announce=false");
+}
+
+void Runtime_LogFilteringByLevel()
+{
+    const std::filesystem::path configPath = std::filesystem::temp_directory_path() / "portal-cod4x-plugin.log-filtering.test.json";
+
+    {
+        std::ofstream configFile(configPath);
+        configFile
+            << "{" 
+            << "\"tenantId\":\"tenant-test\"," 
+            << "\"clientId\":\"client-test\"," 
+            << "\"clientSecret\":\"secret-test\"," 
+            << "\"repositoryApiBaseUrl\":\"https://example.test/repository\"," 
+            << "\"repositoryApiResource\":\"api://repository-test\"," 
+            << "\"ingestBaseUrl\":\"https://example.test/ingest\"," 
+            << "\"ingestApiResource\":\"api://server-events-ingest\"," 
+            << "\"gameServerId\":\"11111111-2222-3333-4444-555555555555\"," 
+            << "\"gameType\":\"CallOfDuty4\"," 
+            << "\"refreshIntervalSeconds\":120"
+            << "}";
+    }
+
+    FakeHost host;
+    host.CurrentTime = 5000;
+
+    portal_cod4x::PluginRuntime runtime(configPath.string());
+    const int initializeResult = runtime.Initialize(host, "1.2.3", "^4[^1XI-BOT^4]^7");
+    Assert(initializeResult == 0, "PluginRuntime initialize should succeed");
+    runtime.HandleServerSpawned(host);
+
+    host.Logs.clear();
+    const bool setErrorResult = runtime.TrySetLogLevel(host, "error", false);
+    Assert(setErrorResult, "Expected error log level token to be accepted");
+
+    runtime.Tick(host);
+    runtime.Tick(host);
+
+    bool sawErrorMessage = false;
+    bool sawDebugMessageAtErrorLevel = false;
+    for (const auto& line : host.Logs)
+    {
+        if (line.find("ingest request failed") != std::string::npos)
+        {
+            sawErrorMessage = true;
+        }
+
+        if (line.find("starting ingest access-token request") != std::string::npos)
+        {
+            sawDebugMessageAtErrorLevel = true;
+        }
+    }
+
+    Assert(sawErrorMessage, "Expected error-level logs to remain visible at error log level");
+    Assert(!sawDebugMessageAtErrorLevel, "Expected debug logs to be suppressed at error log level");
+
+    host.Logs.clear();
+    const bool setDebugResult = runtime.TrySetLogLevel(host, "debug", false);
+    Assert(setDebugResult, "Expected debug log level token to be accepted");
+
+    host.CurrentTime += 30;
+    runtime.Tick(host);
+
+    bool sawDebugMessageAtDebugLevel = false;
+    for (const auto& line : host.Logs)
+    {
+        if (line.find("starting ingest access-token request") != std::string::npos)
+        {
+            sawDebugMessageAtDebugLevel = true;
+            break;
+        }
+    }
+
+    Assert(sawDebugMessageAtDebugLevel, "Expected debug logs to be visible at debug log level");
+
+    std::error_code ignoreError;
+    std::filesystem::remove(configPath, ignoreError);
+}
+
 void InitializePlugin_EmitsLogAndBroadcast()
 {
     FakeHost host;
@@ -702,8 +936,13 @@ int main()
     Runtime_HandleClientCommand_DedupesCrossCallbackPath();
     Runtime_HandleClientCommand_PortalPluginHealth_UsesConsoleAndTellFlow();
     Runtime_HandleClientCommand_PortalPluginHealth_RespectsCommandAuthorization();
+    Runtime_HandleClientCommand_PortalPluginHealth_RespectsPortalEnabledFlag();
+    Runtime_HandleClientCommand_PortalPluginHealth_IgnoresMalformedPortalEnabledFlag();
     Runtime_LoadsActiveBanCacheAndAnswersBanQuery();
     Runtime_PlayerBanMutationHintsUpdateCacheImmediately();
+    Runtime_LogLevelDefaultsAndParsing();
+    Runtime_LogLevelSetWithoutAnnouncement_DoesNotLog();
+    Runtime_LogFilteringByLevel();
     InitializePlugin_EmitsLogAndBroadcast();
     InitializePlugin_FallsBackWhenPrefixOrVersionMissing();
 

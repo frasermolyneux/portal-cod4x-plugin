@@ -15,8 +15,12 @@ namespace
 {
 constexpr int kBroadcastSlot = -1;
 constexpr int kPortalPluginHealthDefaultPower = 98;
+constexpr int kPortalPluginLogLevelDefaultPower = 98;
+constexpr std::string_view kPortalPluginLogLevelUsage =
+    "portalpluginloglevel <debug|info|error|1|2|3>";
 
 void COD4X_CALL CmdPortalPluginHealth();
+void COD4X_CALL CmdPortalPluginLogLevel();
 
 struct PluginCommandRegistration
 {
@@ -27,6 +31,7 @@ struct PluginCommandRegistration
 
 constexpr PluginCommandRegistration kPluginCommandRegistrations[] = {
     {portal_cod4x::kPortalPluginHealthCommandName.data(), &CmdPortalPluginHealth, kPortalPluginHealthDefaultPower},
+    {portal_cod4x::kPortalPluginLogLevelCommandName.data(), &CmdPortalPluginLogLevel, kPortalPluginLogLevelDefaultPower},
 };
 
 void RegisterPluginCommands()
@@ -289,6 +294,71 @@ void COD4X_CALL CmdPortalPluginHealth()
 {
     Cod4xHostAdapter host;
     portal_cod4x::NotifyPortalPluginHealthCommand(host, Plugin_Cmd_GetInvokerSlot());
+}
+
+void COD4X_CALL CmdPortalPluginLogLevel()
+{
+    Cod4xHostAdapter host;
+    const int invokerSlot = Plugin_Cmd_GetInvokerSlot();
+    const int argc = Plugin_Cmd_Argc();
+
+    const auto logCurrentLevel = [&]() {
+        const std::string summary = "plugin log level is " +
+            portal_cod4x::GetPluginLogLevelName() +
+            " (" + std::to_string(portal_cod4x::GetPluginLogLevelValue()) + ")";
+        host.Log(summary);
+        if (invokerSlot >= 0)
+        {
+            host.SendChat(invokerSlot, summary);
+        }
+    };
+
+    if (argc < 2)
+    {
+        logCurrentLevel();
+        host.Log("usage: " + std::string(kPortalPluginLogLevelUsage));
+        if (invokerSlot >= 0)
+        {
+            host.SendChat(invokerSlot, "Usage: " + std::string(kPortalPluginLogLevelUsage));
+        }
+
+        return;
+    }
+
+    if (argc > 2)
+    {
+        host.Log("too many arguments for portalpluginloglevel");
+        host.Log("usage: " + std::string(kPortalPluginLogLevelUsage));
+        if (invokerSlot >= 0)
+        {
+            host.SendChat(invokerSlot, "Too many arguments. Usage: " + std::string(kPortalPluginLogLevelUsage));
+        }
+
+        return;
+    }
+
+    const char* rawLevelToken = Plugin_Cmd_Argv(1);
+    const std::string levelToken = rawLevelToken == nullptr ? std::string() : std::string(rawLevelToken);
+    if (!portal_cod4x::TrySetPluginLogLevel(host, levelToken, true))
+    {
+        host.Log("invalid portalpluginloglevel value: " + levelToken);
+        host.Log("usage: " + std::string(kPortalPluginLogLevelUsage));
+        if (invokerSlot >= 0)
+        {
+            host.SendChat(invokerSlot, "Invalid log level. Usage: " + std::string(kPortalPluginLogLevelUsage));
+        }
+
+        return;
+    }
+
+    if (invokerSlot >= 0)
+    {
+        host.SendChat(
+            invokerSlot,
+            "plugin log level set to " +
+                portal_cod4x::GetPluginLogLevelName() +
+                " (" + std::to_string(portal_cod4x::GetPluginLogLevelValue()) + ")");
+    }
 }
 }
 

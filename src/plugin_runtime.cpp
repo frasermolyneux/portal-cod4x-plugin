@@ -51,6 +51,19 @@ std::string Trim(std::string value)
     return value;
 }
 
+std::string ToLowerInvariant(std::string_view value)
+{
+    std::string normalized;
+    normalized.reserve(value.size());
+
+    for (const unsigned char c : value)
+    {
+        normalized.push_back(static_cast<char>(std::tolower(c)));
+    }
+
+    return normalized;
+}
+
 bool TryReadFile(const std::string& path, std::string& content)
 {
     std::ifstream file(path, std::ios::in | std::ios::binary);
@@ -128,6 +141,140 @@ std::optional<int> ExtractJsonIntValue(const std::string& json, const std::strin
     return std::stoi(match[1].str());
 }
 
+bool IsJsonValueTerminator(const std::string& json, std::size_t index)
+{
+    while (index < json.size() && std::isspace(static_cast<unsigned char>(json[index])) != 0)
+    {
+        ++index;
+    }
+
+    return index >= json.size() || json[index] == ',' || json[index] == '}' || json[index] == ']';
+}
+
+bool StartsWithIgnoreCase(std::string_view value, std::size_t start, std::string_view token)
+{
+    if (start + token.size() > value.size())
+    {
+        return false;
+    }
+
+    for (std::size_t index = 0; index < token.size(); ++index)
+    {
+        const auto left = static_cast<unsigned char>(value[start + index]);
+        const auto right = static_cast<unsigned char>(token[index]);
+
+        if (std::tolower(left) != std::tolower(right))
+        {
+            return false;
+        }
+    }
+
+    return true;
+}
+
+std::optional<bool> ExtractJsonBoolValue(const std::string& json, const std::string& key)
+{
+    const std::string keyToken = "\"" + key + "\"";
+    const auto keyPosition = json.find(keyToken);
+    if (keyPosition == std::string::npos)
+    {
+        return std::nullopt;
+    }
+
+    const auto colonPosition = json.find(':', keyPosition + keyToken.size());
+    if (colonPosition == std::string::npos)
+    {
+        return std::nullopt;
+    }
+
+    auto valueStart = colonPosition + 1;
+    while (valueStart < json.size() && std::isspace(static_cast<unsigned char>(json[valueStart])) != 0)
+    {
+        ++valueStart;
+    }
+
+    if (valueStart >= json.size())
+    {
+        return std::nullopt;
+    }
+
+    if (json[valueStart] == '"')
+    {
+        auto valueEnd = valueStart + 1;
+        bool escaped = false;
+
+        while (valueEnd < json.size())
+        {
+            const auto current = json[valueEnd];
+            if (escaped)
+            {
+                escaped = false;
+                ++valueEnd;
+                continue;
+            }
+
+            if (current == '\\')
+            {
+                escaped = true;
+                ++valueEnd;
+                continue;
+            }
+
+            if (current == '"')
+            {
+                break;
+            }
+
+            ++valueEnd;
+        }
+
+        if (valueEnd >= json.size() || json[valueEnd] != '"')
+        {
+            return std::nullopt;
+        }
+
+        if (!IsJsonValueTerminator(json, valueEnd + 1))
+        {
+            return std::nullopt;
+        }
+
+        std::string token = ToLowerInvariant(Trim(json.substr(valueStart + 1, valueEnd - valueStart - 1)));
+        if (token == "true" || token == "1")
+        {
+            return true;
+        }
+
+        if (token == "false" || token == "0")
+        {
+            return false;
+        }
+
+        return std::nullopt;
+    }
+
+    if (StartsWithIgnoreCase(json, valueStart, "true") && IsJsonValueTerminator(json, valueStart + 4))
+    {
+        return true;
+    }
+
+    if (StartsWithIgnoreCase(json, valueStart, "false") && IsJsonValueTerminator(json, valueStart + 5))
+    {
+        return false;
+    }
+
+    if (json[valueStart] == '1' && IsJsonValueTerminator(json, valueStart + 1))
+    {
+        return true;
+    }
+
+    if (json[valueStart] == '0' && IsJsonValueTerminator(json, valueStart + 1))
+    {
+        return false;
+    }
+
+    return std::nullopt;
+}
+
 std::string UrlEncode(const std::string& value)
 {
     static constexpr auto kHexChars = "0123456789ABCDEF";
@@ -171,6 +318,8 @@ std::optional<PluginConfig> ParsePluginConfig(const std::string& configJson)
     auto ingestBaseUrl = ExtractJsonStringValue(configJson, "ingestBaseUrl");
     auto ingestApiResource = ExtractJsonStringValue(configJson, "ingestApiResource");
     auto gameType = ExtractJsonStringValue(configJson, "gameType");
+    auto portalPluginHealthEnabled = ExtractJsonBoolValue(configJson, "portalPluginHealthEnabled");
+    auto portalPluginHealthMinPower = ExtractJsonIntValue(configJson, "portalPluginHealthMinPower");
 
     if (!tenantId.has_value() || !clientId.has_value() || !clientSecret.has_value() || !repositoryApiBaseUrl.has_value() ||
         !repositoryApiResource.has_value() || !gameServerId.has_value())
@@ -205,6 +354,16 @@ std::optional<PluginConfig> ParsePluginConfig(const std::string& configJson)
     if (refreshInterval.has_value())
     {
         config.RefreshIntervalSeconds = std::clamp(*refreshInterval, 15, 900);
+    }
+
+    if (portalPluginHealthEnabled.has_value())
+    {
+        config.PortalPluginHealthEnabled = *portalPluginHealthEnabled;
+    }
+
+    if (portalPluginHealthMinPower.has_value())
+    {
+        config.PortalPluginHealthMinPower = std::clamp(*portalPluginHealthMinPower, 1, 100);
     }
 
     return config;
@@ -301,6 +460,95 @@ void PluginRuntime::SendPrivateChat(ICod4xHost& host, int slot, std::string_view
     host.SendChat(slot, BuildPrefixedChatMessage(message));
 }
 
+bool PluginRuntime::ShouldLog(LogLevel level) const
+{
+    return static_cast<int>(level) >= static_cast<int>(logLevel);
+}
+
+void PluginRuntime::LogDebug(ICod4xHost& host, std::string_view message) const
+{
+    if (ShouldLog(LogLevel::Debug))
+    {
+        host.Log(message);
+    }
+}
+
+void PluginRuntime::LogInfo(ICod4xHost& host, std::string_view message) const
+{
+    if (ShouldLog(LogLevel::Info))
+    {
+        host.Log(message);
+    }
+}
+
+void PluginRuntime::LogError(ICod4xHost& host, std::string_view message) const
+{
+    if (ShouldLog(LogLevel::Error))
+    {
+        host.Log(message);
+    }
+}
+
+bool PluginRuntime::TrySetLogLevel(ICod4xHost& host, int levelValue, bool announce)
+{
+    return TrySetLogLevel(host, std::to_string(levelValue), announce);
+}
+
+bool PluginRuntime::TrySetLogLevel(ICod4xHost& host, std::string_view levelToken, bool announce)
+{
+    const std::string normalizedToken = ToLowerInvariant(Trim(std::string(levelToken)));
+    if (normalizedToken.empty())
+    {
+        return false;
+    }
+
+    LogLevel parsedLogLevel = logLevel;
+    if (normalizedToken == "1" || normalizedToken == "debug")
+    {
+        parsedLogLevel = LogLevel::Debug;
+    }
+    else if (normalizedToken == "2" || normalizedToken == "info")
+    {
+        parsedLogLevel = LogLevel::Info;
+    }
+    else if (normalizedToken == "3" || normalizedToken == "error")
+    {
+        parsedLogLevel = LogLevel::Error;
+    }
+    else
+    {
+        return false;
+    }
+
+    logLevel = parsedLogLevel;
+
+    if (announce)
+    {
+        host.Log("plugin log level set to " + GetLogLevelName() + " (" + std::to_string(GetLogLevelValue()) + ")");
+    }
+
+    return true;
+}
+
+int PluginRuntime::GetLogLevelValue() const
+{
+    return static_cast<int>(logLevel);
+}
+
+std::string PluginRuntime::GetLogLevelName() const
+{
+    switch (logLevel)
+    {
+        case LogLevel::Debug:
+            return "debug";
+        case LogLevel::Error:
+            return "error";
+        case LogLevel::Info:
+        default:
+            return "info";
+    }
+}
+
 int PluginRuntime::Initialize(ICod4xHost& host, std::string_view version, std::string_view prefix)
 {
     const std::string onlineMessage = BuildOnlineBroadcastMessage(prefix, version);
@@ -308,7 +556,7 @@ int PluginRuntime::Initialize(ICod4xHost& host, std::string_view version, std::s
     chatPrefix = prefix.empty() ? std::string(kDefaultBotPrefix) : std::string(prefix);
     pluginVersion = normalizedVersion;
 
-    host.Log("Portal Plugin is online (version " + normalizedVersion + ")");
+    LogInfo(host, "Portal Plugin is online (version " + normalizedVersion + ")");
     host.BroadcastChat(onlineMessage);
 
     const std::int64_t nowUnixSeconds = host.GetUnixTimeSeconds();
@@ -604,6 +852,12 @@ void PluginRuntime::HandleClientCommand(ICod4xHost& host, int slot, std::string_
 
     markHandled();
 
+    if (loadedConfig.has_value() && !loadedConfig->PortalPluginHealthEnabled)
+    {
+        SendPrivateChat(host, slot, "The !portalpluginhealth command is currently disabled by portal configuration.");
+        return;
+    }
+
     if (!host.CanPlayerUseCommand(slot, kPortalPluginHealthCommandName))
     {
         SendPrivateChat(host, slot, "You are not authorized to run !portalpluginhealth.");
@@ -739,7 +993,7 @@ bool PluginRuntime::TryLoadConfig(ICod4xHost& host, std::int64_t nowUnixSeconds)
     const auto logConfigIssue = [&](const std::string& issue) {
         if (issue != lastConfigLoadError)
         {
-            host.Log(issue);
+            LogError(host, issue);
             lastConfigLoadError = issue;
         }
 
@@ -768,7 +1022,7 @@ bool PluginRuntime::TryLoadConfig(ICod4xHost& host, std::int64_t nowUnixSeconds)
     nextConfigLoadAttemptUnixSeconds = nowUnixSeconds;
     nextBanSyncUnixSeconds.store(nowUnixSeconds, std::memory_order_relaxed);
     repositoryConfigWarningLogged = false;
-    host.Log("plugin config loaded for gameServerId " + loadedConfig->GameServerId);
+    LogInfo(host, "plugin config loaded for gameServerId " + loadedConfig->GameServerId);
     return true;
 }
 
@@ -794,7 +1048,7 @@ void PluginRuntime::AdvanceIngest(ICod4xHost& host, std::int64_t nowUnixSeconds)
     {
         if (!ingestConfigWarningLogged)
         {
-            host.Log("ingest egress disabled; configure ingestBaseUrl, ingestApiResource, and gameType to enable event emission");
+            LogInfo(host, "ingest egress disabled; configure ingestBaseUrl, ingestApiResource, and gameType to enable event emission");
             ingestConfigWarningLogged = true;
         }
 
@@ -869,6 +1123,10 @@ void PluginRuntime::AdvanceIngest(ICod4xHost& host, std::int64_t nowUnixSeconds)
             if (response.StatusCode >= 200 && response.StatusCode < 300)
             {
                 DropBufferedEventsByIndex(ingestBatchIndices);
+                LogDebug(
+                    host,
+                    "ingest batch POST succeeded for queue " + ingestBatchQueueName +
+                        " eventCount=" + std::to_string(ingestBatchIndices.size()));
                 ingestBatchIndices.clear();
                 ingestBatchQueueName.clear();
                 ingestBatchPayload.clear();
@@ -893,7 +1151,7 @@ void PluginRuntime::AdvanceIngest(ICod4xHost& host, std::int64_t nowUnixSeconds)
                 std::min<std::size_t>(60, static_cast<std::size_t>(1) << std::min<std::size_t>(6, ingestConsecutiveFailureCount)));
 
             nextIngestAttemptUnixSeconds = nowUnixSeconds + backoffSeconds;
-            host.Log("ingest batch POST returned HTTP " + std::to_string(response.StatusCode) + " for queue " + ingestBatchQueueName);
+            LogError(host, "ingest batch POST returned HTTP " + std::to_string(response.StatusCode) + " for queue " + ingestBatchQueueName);
 
             ingestBatchIndices.clear();
             ingestBatchQueueName.clear();
@@ -942,6 +1200,7 @@ bool PluginRuntime::StartIngestTokenRequest(ICod4xHost& host, std::int64_t nowUn
         return false;
     }
 
+    LogDebug(host, "starting ingest access-token request");
     ingestRequestStartedUnixSeconds = nowUnixSeconds;
     ingestStage = IngestStage::AcquiringToken;
     return true;
@@ -980,6 +1239,11 @@ bool PluginRuntime::StartIngestBatchRequest(ICod4xHost& host, std::int64_t nowUn
     headers += "Content-Type: application/json\r\n";
 
     const std::string requestUrl = loadedConfig->IngestBaseUrl + QueueEndpointPath(ingestBatchQueueName);
+    LogDebug(
+        host,
+        "starting ingest batch POST to " + requestUrl +
+            " queue=" + ingestBatchQueueName +
+            " eventCount=" + std::to_string(ingestBatchIndices.size()));
     ingestRequest = host.BeginHttpRequest(requestUrl, "POST", ingestBatchPayload, headers);
     if (ingestRequest == nullptr)
     {
@@ -995,7 +1259,7 @@ void PluginRuntime::AbortIngest(ICod4xHost& host, std::int64_t nowUnixSeconds, s
 {
     if (!reason.empty())
     {
-        host.Log(std::string(reason));
+        LogError(host, std::string(reason));
     }
 
     if (ingestRequest != nullptr)
@@ -1049,7 +1313,7 @@ void PluginRuntime::AdvanceBanSync(ICod4xHost& host, std::int64_t nowUnixSeconds
     {
         if (!repositoryConfigWarningLogged)
         {
-            host.Log("repository active-ban sync disabled; configure repository API auth settings to enable plugin ban cache enforcement");
+            LogInfo(host, "repository active-ban sync disabled; configure repository API auth settings to enable plugin ban cache enforcement");
             repositoryConfigWarningLogged = true;
         }
 
@@ -1158,6 +1422,11 @@ void PluginRuntime::AdvanceBanSync(ICod4xHost& host, std::int64_t nowUnixSeconds
             const int intervalSeconds = configuredInterval > 0 ? configuredInterval : static_cast<int>(kDefaultBanSyncIntervalSeconds);
 
             nextBanSyncUnixSeconds.store(nowUnixSeconds + intervalSeconds, std::memory_order_relaxed);
+            LogDebug(
+                host,
+                "repository active-ban sync completed; cached bans=" +
+                    std::to_string(activeBanMessagesByPlayerGuid.size()) +
+                    " nextSyncInSeconds=" + std::to_string(intervalSeconds));
             banSyncStage = BanSyncStage::Idle;
             return;
         }
@@ -1205,6 +1474,7 @@ bool PluginRuntime::StartRepositoryTokenRequest(ICod4xHost& host, std::int64_t n
         return false;
     }
 
+    LogDebug(host, "starting repository access-token request for active-ban sync");
     banSyncRequestStartedUnixSeconds = nowUnixSeconds;
     banSyncStage = BanSyncStage::AcquiringToken;
     return true;
@@ -1221,6 +1491,9 @@ bool PluginRuntime::StartActiveBanFetchRequest(ICod4xHost& host, std::int64_t no
 
     std::string headers = BuildAuthorizationHeaders(repositoryAccessToken);
 
+    LogDebug(
+        host,
+        "starting repository active-ban request (skipEntries=" + std::to_string(skipEntries) + ") to " + requestUrl);
     banSyncRequest = host.BeginHttpRequest(requestUrl, "GET", "", headers);
     if (banSyncRequest == nullptr)
     {
@@ -1236,7 +1509,7 @@ void PluginRuntime::AbortBanSync(ICod4xHost& host, std::int64_t nowUnixSeconds, 
 {
     if (!reason.empty())
     {
-        host.Log(std::string(reason));
+        LogError(host, std::string(reason));
     }
 
     if (banSyncRequest != nullptr)
@@ -1559,7 +1832,8 @@ void PluginRuntime::PruneBufferedEvents(ICod4xHost& host, std::int64_t nowUnixSe
     const std::size_t droppedTotal = droppedByAttempts + droppedByAge;
     if (droppedTotal > 0)
     {
-        host.Log(
+        LogInfo(
+            host,
             "ingest buffer dropped " + std::to_string(droppedTotal) +
             " event(s) (attempt-threshold=" + std::to_string(droppedByAttempts) +
             ", age-threshold=" + std::to_string(droppedByAge) + ")");
@@ -1815,13 +2089,15 @@ std::vector<std::string> PluginRuntime::BuildPortalPluginHealthReportLines(std::
     }
 
     std::vector<std::string> lines;
-    lines.reserve(8);
+    lines.reserve(9);
 
     lines.emplace_back("[portal-cod4x-plugin] portalpluginhealth report");
 
     std::string identityLine = "pluginVersion=" + pluginVersion +
         " loadedConfig=" + std::string(loadedConfig.has_value() ? "true" : "false") +
-        " gameServerId=" + serverContext.GameServerId;
+        " gameServerId=" + serverContext.GameServerId +
+        " logLevel=" + GetLogLevelName() +
+        "(" + std::to_string(GetLogLevelValue()) + ")";
     if (loadedConfig.has_value() && !loadedConfig->GameType.empty())
     {
         identityLine += " gameType=" + loadedConfig->GameType;
@@ -1854,6 +2130,12 @@ std::vector<std::string> PluginRuntime::BuildPortalPluginHealthReportLines(std::
     lines.push_back(
         "connectedPlayerCount=" + std::to_string(connectedPlayers.size()) +
         " serverContextLastRefreshUtc=" + FormatOptionalUnixTimestamp(serverContext.LastRefreshUnixSeconds));
+
+    lines.push_back(
+        "portalpluginhealthEnabled=" +
+        std::string(!loadedConfig.has_value() || loadedConfig->PortalPluginHealthEnabled ? "true" : "false") +
+        " portalpluginhealthMinPower=" +
+        std::to_string(loadedConfig.has_value() ? loadedConfig->PortalPluginHealthMinPower : 98));
 
     if (!lastConfigLoadError.empty())
     {
@@ -1931,6 +2213,26 @@ void NotifyServerExited(ICod4xHost& host)
 void NotifyPortalPluginHealthCommand(ICod4xHost& host, int slot)
 {
     g_runtime.HandlePortalPluginHealthCommand(host, slot);
+}
+
+bool TrySetPluginLogLevel(ICod4xHost& host, int level, bool announce)
+{
+    return g_runtime.TrySetLogLevel(host, level, announce);
+}
+
+bool TrySetPluginLogLevel(ICod4xHost& host, std::string_view level, bool announce)
+{
+    return g_runtime.TrySetLogLevel(host, level, announce);
+}
+
+int GetPluginLogLevelValue()
+{
+    return g_runtime.GetLogLevelValue();
+}
+
+std::string GetPluginLogLevelName()
+{
+    return g_runtime.GetLogLevelName();
 }
 
 void NotifyPlayerBanAdded(std::uint64_t playerId, std::string_view reason)

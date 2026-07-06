@@ -30,6 +30,8 @@ std::vector<std::string> g_logs;
 std::vector<ChatMessage> g_chats;
 std::vector<std::string> g_commands;
 std::vector<RegisteredCommand> g_registered_commands;
+std::vector<std::string> g_command_arguments;
+std::string g_empty_command_argument;
 std::string g_player_name = "TestPlayer";
 std::uint64_t g_player_id = 76561198000000001ULL;
 int g_command_invoker_slot = 0;
@@ -80,6 +82,21 @@ extern "C" void COD4X_CALL Plugin_AddCommand(const char* name, xcommand_t comman
 extern "C" int COD4X_CALL Plugin_Cmd_GetInvokerSlot()
 {
     return g_command_invoker_slot;
+}
+
+extern "C" int COD4X_CALL Plugin_Cmd_Argc()
+{
+    return static_cast<int>(g_command_arguments.size());
+}
+
+extern "C" char* COD4X_CALL Plugin_Cmd_Argv(int arg)
+{
+    if (arg < 0 || static_cast<std::size_t>(arg) >= g_command_arguments.size())
+    {
+        return g_empty_command_argument.data();
+    }
+
+    return g_command_arguments[static_cast<std::size_t>(arg)].data();
 }
 
 extern "C" qboolean COD4X_CALL Plugin_CanPlayerUseCommand(int, const char*)
@@ -227,9 +244,17 @@ int main()
         g_registered_commands.end(),
         [](const RegisteredCommand& command) { return command.Name == "portalpluginhealth"; });
 
+    const auto registeredLogLevelCommand = std::find_if(
+        g_registered_commands.begin(),
+        g_registered_commands.end(),
+        [](const RegisteredCommand& command) { return command.Name == "portalpluginloglevel"; });
+
     AssertTrue(registeredHealthCommand != g_registered_commands.end(), "Expected portalpluginhealth command to be registered.");
     AssertTrue(registeredHealthCommand->DefaultPower == 98, "portalpluginhealth default power should be 98.");
     AssertTrue(registeredHealthCommand->Handler != nullptr, "portalpluginhealth command handler should be registered.");
+    AssertTrue(registeredLogLevelCommand != g_registered_commands.end(), "Expected portalpluginloglevel command to be registered.");
+    AssertTrue(registeredLogLevelCommand->DefaultPower == 98, "portalpluginloglevel default power should be 98.");
+    AssertTrue(registeredLogLevelCommand->Handler != nullptr, "portalpluginloglevel command handler should be registered.");
 
     const std::size_t commandsBeforeHealth = g_commands.size();
     g_command_invoker_slot = 0;
@@ -285,7 +310,112 @@ int main()
 
     AssertTrue(foundHealthReportLog, "portalpluginhealth should emit health report lines to console output.");
 
+    g_command_invoker_slot = -1;
+    g_command_arguments = {"portalpluginloglevel"};
+    const std::size_t logCountBeforeLevelQuery = g_logs.size();
+    registeredLogLevelCommand->Handler();
+
+    bool foundCurrentLevelLog = false;
+    bool foundUsageLog = false;
+    for (std::size_t i = logCountBeforeLevelQuery; i < g_logs.size(); ++i)
+    {
+        if (g_logs[i].find("plugin log level is info (2)") != std::string::npos)
+        {
+            foundCurrentLevelLog = true;
+        }
+
+        if (g_logs[i].find("usage: portalpluginloglevel <debug|info|error|1|2|3>") != std::string::npos)
+        {
+            foundUsageLog = true;
+        }
+    }
+
+    AssertTrue(foundCurrentLevelLog, "portalpluginloglevel with no arguments should report current level.");
+    AssertTrue(foundUsageLog, "portalpluginloglevel with no arguments should print usage guidance.");
+
+    g_command_invoker_slot = 0;
+    g_command_arguments = {"portalpluginloglevel", "debug"};
+    const std::size_t logCountBeforeDebugSet = g_logs.size();
+    const std::size_t chatCountBeforeDebugSet = g_chats.size();
+    registeredLogLevelCommand->Handler();
+
+    bool foundDebugSetLog = false;
+    for (std::size_t i = logCountBeforeDebugSet; i < g_logs.size(); ++i)
+    {
+        if (g_logs[i].find("plugin log level set to debug (1)") != std::string::npos)
+        {
+            foundDebugSetLog = true;
+            break;
+        }
+    }
+
+    AssertTrue(foundDebugSetLog, "portalpluginloglevel debug should update log level.");
+
+    bool foundDebugSetChat = false;
+    for (std::size_t i = chatCountBeforeDebugSet; i < g_chats.size(); ++i)
+    {
+        if (g_chats[i].slot == 0 && g_chats[i].message.find("plugin log level set to debug (1)") != std::string::npos)
+        {
+            foundDebugSetChat = true;
+            break;
+        }
+    }
+
+    AssertTrue(foundDebugSetChat, "portalpluginloglevel should notify a player invoker when level changes.");
+
+    g_command_invoker_slot = 0;
+    g_command_arguments = {"portalpluginloglevel", "info", "extra"};
+    const std::size_t logCountBeforeTooManyArgs = g_logs.size();
+    registeredLogLevelCommand->Handler();
+
+    bool foundTooManyArgsLog = false;
+    for (std::size_t i = logCountBeforeTooManyArgs; i < g_logs.size(); ++i)
+    {
+        if (g_logs[i].find("too many arguments for portalpluginloglevel") != std::string::npos)
+        {
+            foundTooManyArgsLog = true;
+            break;
+        }
+    }
+
+    AssertTrue(foundTooManyArgsLog, "portalpluginloglevel should reject extra arguments.");
+
+    g_command_invoker_slot = 0;
+    g_command_arguments = {"portalpluginloglevel", "banana"};
+    const std::size_t logCountBeforeInvalidLevel = g_logs.size();
+    registeredLogLevelCommand->Handler();
+
+    bool foundInvalidLevelLog = false;
+    for (std::size_t i = logCountBeforeInvalidLevel; i < g_logs.size(); ++i)
+    {
+        if (g_logs[i].find("invalid portalpluginloglevel value: banana") != std::string::npos)
+        {
+            foundInvalidLevelLog = true;
+            break;
+        }
+    }
+
+    AssertTrue(foundInvalidLevelLog, "portalpluginloglevel should reject unknown level values.");
+
+    g_command_invoker_slot = -1;
+    g_command_arguments = {"portalpluginloglevel", "3"};
+    const std::size_t logCountBeforeNumericLevel = g_logs.size();
+    registeredLogLevelCommand->Handler();
+
+    bool foundNumericSetLog = false;
+    for (std::size_t i = logCountBeforeNumericLevel; i < g_logs.size(); ++i)
+    {
+        if (g_logs[i].find("plugin log level set to error (3)") != std::string::npos)
+        {
+            foundNumericSetLog = true;
+            break;
+        }
+    }
+
+    AssertTrue(foundNumericSetLog, "portalpluginloglevel numeric input should map to known levels.");
+
     const std::size_t logCountAfterInit = g_logs.size();
+    const std::size_t chatCountBeforeNoopCallbacks = g_chats.size();
     client_t fakeClient{};
 
     OnFrame();
@@ -310,7 +440,7 @@ int main()
 
     AssertTrue(g_logs.size() >= logCountAfterInit, "OnFrame and OnClientAuthorized should be safe to invoke.");
     AssertTrue(
-        g_chats.size() == 1,
+        g_chats.size() == chatCountBeforeNoopCallbacks,
         "Plugin should not emit private chat responses for portal-owned commands like !commands.");
 
     baninfo_t banInfo{};

@@ -200,6 +200,8 @@ extern "C" void COD4X_CALL Plugin_ChatPrintf(int slot, const char* fmt, ...);
 extern "C" void COD4X_CALL Plugin_Cbuf_AddText(const char* text);
 extern "C" void COD4X_CALL Plugin_AddCommand(const char* name, xcommand_t command, int defaultpower);
 extern "C" int COD4X_CALL Plugin_Cmd_GetInvokerSlot();
+extern "C" int COD4X_CALL Plugin_Cmd_Argc();
+extern "C" char* COD4X_CALL Plugin_Cmd_Argv(int arg);
 extern "C" qboolean COD4X_CALL Plugin_CanPlayerUseCommand(int clientnum, const char* commandname);
 extern "C" int COD4X_CALL Plugin_GetSlotCount();
 extern "C" char* COD4X_CALL Plugin_GetPlayerName(int slot);
