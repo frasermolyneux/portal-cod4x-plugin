@@ -17,7 +17,7 @@ namespace portal_cod4x
 {
 namespace
 {
-constexpr std::int64_t kIngestRequestDeadlineSeconds = 20;
+constexpr std::int64_t kIngestRequestDeadlineSeconds = 60;
 constexpr std::int64_t kBanSyncRequestDeadlineSeconds = 20;
 constexpr std::int64_t kServerStatusIntervalSeconds = 60;
 constexpr std::int64_t kMaxBufferedEventAgeSeconds = 15 * 60;
