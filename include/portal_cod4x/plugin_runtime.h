@@ -202,6 +202,7 @@ private:
     void AdvanceIngest(ICod4xHost& host, std::int64_t nowUnixSeconds);
     bool StartIngestTokenRequest(ICod4xHost& host, std::int64_t nowUnixSeconds);
     bool StartIngestBatchRequest(ICod4xHost& host, std::int64_t nowUnixSeconds);
+    std::string BuildIngestRequestContext(std::int64_t nowUnixSeconds) const;
     void AbortIngest(ICod4xHost& host, std::int64_t nowUnixSeconds, std::string_view reason);
     void FlushServerStatusSnapshot(ICod4xHost& host, std::int64_t nowUnixSeconds);
 

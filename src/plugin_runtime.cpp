@@ -1076,7 +1076,8 @@ void PluginRuntime::AdvanceIngest(ICod4xHost& host, std::int64_t nowUnixSeconds)
         {
             if (nowUnixSeconds - ingestRequestStartedUnixSeconds >= kIngestRequestDeadlineSeconds)
             {
-                AbortIngest(host, nowUnixSeconds, "ingest request timed out");
+                const std::string timeoutMessage = "ingest request timed out" + BuildIngestRequestContext(nowUnixSeconds);
+                AbortIngest(host, nowUnixSeconds, timeoutMessage);
             }
 
             return;
@@ -1087,7 +1088,8 @@ void PluginRuntime::AdvanceIngest(ICod4xHost& host, std::int64_t nowUnixSeconds)
 
         if (status == HttpRequestStatus::Failed)
         {
-            AbortIngest(host, nowUnixSeconds, "ingest request failed");
+            const std::string failedMessage = "ingest request failed" + BuildIngestRequestContext(nowUnixSeconds);
+            AbortIngest(host, nowUnixSeconds, failedMessage);
             return;
         }
 
@@ -1125,8 +1127,7 @@ void PluginRuntime::AdvanceIngest(ICod4xHost& host, std::int64_t nowUnixSeconds)
                 DropBufferedEventsByIndex(ingestBatchIndices);
                 LogDebug(
                     host,
-                    "ingest batch POST succeeded for queue " + ingestBatchQueueName +
-                        " eventCount=" + std::to_string(ingestBatchIndices.size()));
+                    "ingest batch POST succeeded" + BuildIngestRequestContext(nowUnixSeconds));
                 ingestBatchIndices.clear();
                 ingestBatchQueueName.clear();
                 ingestBatchPayload.clear();
@@ -1151,7 +1152,7 @@ void PluginRuntime::AdvanceIngest(ICod4xHost& host, std::int64_t nowUnixSeconds)
                 std::min<std::size_t>(60, static_cast<std::size_t>(1) << std::min<std::size_t>(6, ingestConsecutiveFailureCount)));
 
             nextIngestAttemptUnixSeconds = nowUnixSeconds + backoffSeconds;
-            LogError(host, "ingest batch POST returned HTTP " + std::to_string(response.StatusCode) + " for queue " + ingestBatchQueueName);
+            LogError(host, "ingest batch POST returned HTTP " + std::to_string(response.StatusCode) + BuildIngestRequestContext(nowUnixSeconds));
 
             ingestBatchIndices.clear();
             ingestBatchQueueName.clear();
@@ -1200,7 +1201,7 @@ bool PluginRuntime::StartIngestTokenRequest(ICod4xHost& host, std::int64_t nowUn
         return false;
     }
 
-    LogDebug(host, "starting ingest access-token request");
+    LogDebug(host, "starting ingest access-token request to " + tokenUrl);
     ingestRequestStartedUnixSeconds = nowUnixSeconds;
     ingestStage = IngestStage::AcquiringToken;
     return true;
@@ -1253,6 +1254,50 @@ bool PluginRuntime::StartIngestBatchRequest(ICod4xHost& host, std::int64_t nowUn
     ingestRequestStartedUnixSeconds = nowUnixSeconds;
     ingestStage = IngestStage::PostingBatch;
     return true;
+}
+
+std::string PluginRuntime::BuildIngestRequestContext(std::int64_t nowUnixSeconds) const
+{
+    std::string context;
+
+    context += " stage=";
+    switch (ingestStage)
+    {
+        case IngestStage::Idle:
+            context += "idle";
+            break;
+        case IngestStage::AcquiringToken:
+            context += "acquiring-token";
+            break;
+        case IngestStage::PostingBatch:
+            context += "posting-batch";
+            break;
+    }
+
+    const std::int64_t elapsedSeconds = std::max<std::int64_t>(0, nowUnixSeconds - ingestRequestStartedUnixSeconds);
+    context += " elapsedSeconds=" + std::to_string(elapsedSeconds);
+
+    if (ingestStage == IngestStage::AcquiringToken && loadedConfig.has_value())
+    {
+        context += " tokenUrl=https://login.microsoftonline.com/" + loadedConfig->TenantId + "/oauth2/v2.0/token";
+    }
+
+    if (ingestStage == IngestStage::PostingBatch)
+    {
+        if (!ingestBatchQueueName.empty())
+        {
+            context += " queue=" + ingestBatchQueueName;
+        }
+
+        context += " eventCount=" + std::to_string(ingestBatchIndices.size());
+
+        if (loadedConfig.has_value() && !loadedConfig->IngestBaseUrl.empty() && !ingestBatchQueueName.empty())
+        {
+            context += " url=" + loadedConfig->IngestBaseUrl + QueueEndpointPath(ingestBatchQueueName);
+        }
+    }
+
+    return context;
 }
 
 void PluginRuntime::AbortIngest(ICod4xHost& host, std::int64_t nowUnixSeconds, std::string_view reason)
