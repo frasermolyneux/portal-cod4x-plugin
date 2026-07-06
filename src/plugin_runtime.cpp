@@ -1239,7 +1239,7 @@ bool PluginRuntime::StartIngestBatchRequest(ICod4xHost& host, std::int64_t nowUn
     std::string headers = BuildAuthorizationHeaders(ingestAccessToken);
     headers += "Content-Type: application/json\r\n";
 
-    const std::string requestUrl = loadedConfig->IngestBaseUrl + QueueEndpointPath(ingestBatchQueueName);
+    const std::string requestUrl = loadedConfig->IngestBaseUrl + QueueEndpointPath(loadedConfig->IngestBaseUrl, ingestBatchQueueName);
     LogDebug(
         host,
         "starting ingest batch POST to " + requestUrl +
@@ -1293,7 +1293,7 @@ std::string PluginRuntime::BuildIngestRequestContext(std::int64_t nowUnixSeconds
 
         if (loadedConfig.has_value() && !loadedConfig->IngestBaseUrl.empty() && !ingestBatchQueueName.empty())
         {
-            context += " url=" + loadedConfig->IngestBaseUrl + QueueEndpointPath(ingestBatchQueueName);
+            context += " url=" + loadedConfig->IngestBaseUrl + QueueEndpointPath(loadedConfig->IngestBaseUrl, ingestBatchQueueName);
         }
     }
 
@@ -2057,9 +2057,21 @@ std::string PluginRuntime::StampPublishedUtc(std::string payloadJson, std::int64
     return payloadJson;
 }
 
-std::string PluginRuntime::QueueEndpointPath(std::string_view queueName)
+std::string PluginRuntime::QueueEndpointPath(std::string_view ingestBaseUrl, std::string_view queueName)
 {
-    return "/events/" + std::string(queueName);
+    const std::string baseUrl = ToLowerInvariant(std::string(ingestBaseUrl));
+    const std::string ingestSuffix = "/ingest";
+
+    const bool baseContainsIngestSegment =
+        baseUrl.size() >= ingestSuffix.size() &&
+        baseUrl.compare(baseUrl.size() - ingestSuffix.size(), ingestSuffix.size(), ingestSuffix) == 0;
+
+    if (baseContainsIngestSegment)
+    {
+        return "/events/" + std::string(queueName);
+    }
+
+    return "/ingest/events/" + std::string(queueName);
 }
 
 std::string PluginRuntime::NormalizeIpAddress(std::string ipAddress)
@@ -2171,6 +2183,16 @@ std::vector<std::string> PluginRuntime::BuildPortalPluginHealthReportLines(std::
         " ingestFailureCount=" + std::to_string(ingestConsecutiveFailureCount) +
         " nextIngestAttemptUtc=" + FormatOptionalUnixTimestamp(nextIngestAttemptUnixSeconds) +
         " ingestInFlight=" + std::string(ingestRequest != nullptr ? "true" : "false"));
+
+    if (loadedConfig.has_value() && ingestStage == IngestStage::PostingBatch && !ingestBatchQueueName.empty())
+    {
+        const std::int64_t elapsedSeconds = std::max<std::int64_t>(0, nowUnixSeconds - ingestRequestStartedUnixSeconds);
+        lines.push_back(
+            "ingestRequestUrl=" + loadedConfig->IngestBaseUrl + QueueEndpointPath(loadedConfig->IngestBaseUrl, ingestBatchQueueName) +
+            " ingestElapsedSeconds=" + std::to_string(elapsedSeconds) +
+            " ingestBatchQueue=" + ingestBatchQueueName +
+            " ingestBatchEventCount=" + std::to_string(ingestBatchIndices.size()));
+    }
 
     lines.push_back(
         "connectedPlayerCount=" + std::to_string(connectedPlayers.size()) +

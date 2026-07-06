@@ -260,7 +260,7 @@ private:
     static std::string JsonEscape(std::string_view value);
     static std::string ToIso8601Utc(std::int64_t unixSeconds);
     static std::string StampPublishedUtc(std::string payloadJson, std::int64_t nowUnixSeconds);
-    static std::string QueueEndpointPath(std::string_view queueName);
+    static std::string QueueEndpointPath(std::string_view ingestBaseUrl, std::string_view queueName);
     static std::string NormalizeIpAddress(std::string ipAddress);
     static std::string Trim(std::string value);
     std::string BuildPrefixedChatMessage(std::string_view message) const;
