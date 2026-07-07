@@ -183,8 +183,10 @@ public:
         const int transferResult = Plugin_HTTP_SendReceiveData(request);
         if (transferResult == 0)
         {
+            const bool debugLoggingEnabled =
+                portal_cod4x::GetPluginLogLevelValue() <= static_cast<int>(portal_cod4x::PluginRuntime::LogLevel::Debug);
             const bool isIngestRequest = std::string_view(request->url).find("/ingest/") != std::string_view::npos;
-            if (isIngestRequest)
+            if (debugLoggingEnabled && isIngestRequest)
             {
                 const std::int64_t nowUnixSeconds = static_cast<std::int64_t>(std::time(nullptr));
                 auto [deadlineIt, inserted] = g_pendingIngestLogDeadlineByRequest.emplace(request, nowUnixSeconds + 5);
