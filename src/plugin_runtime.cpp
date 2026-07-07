@@ -569,6 +569,7 @@ int PluginRuntime::Initialize(ICod4xHost& host, std::string_view version, std::s
 void PluginRuntime::Tick(ICod4xHost& host)
 {
     const std::int64_t nowUnixSeconds = host.GetUnixTimeSeconds();
+    lastTickUnixSeconds = nowUnixSeconds;
 
     if (!loadedConfig.has_value())
     {
@@ -2197,6 +2198,11 @@ std::vector<std::string> PluginRuntime::BuildPortalPluginHealthReportLines(std::
     lines.push_back(
         "connectedPlayerCount=" + std::to_string(connectedPlayers.size()) +
         " serverContextLastRefreshUtc=" + FormatOptionalUnixTimestamp(serverContext.LastRefreshUnixSeconds));
+
+    lines.push_back(
+        "lastTickUtc=" + FormatOptionalUnixTimestamp(lastTickUnixSeconds) +
+        " secondsSinceLastTick=" +
+        (lastTickUnixSeconds > 0 ? std::to_string(std::max<std::int64_t>(0, nowUnixSeconds - lastTickUnixSeconds)) : std::string("n/a")));
 
     lines.push_back(
         "portalpluginhealthEnabled=" +

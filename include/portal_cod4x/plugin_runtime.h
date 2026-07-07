@@ -165,6 +165,7 @@ private:
     bool lastHandledCommandFromChat = false;
     std::optional<PluginConfig> loadedConfig;
     EffectiveServerContext serverContext;
+    std::int64_t lastTickUnixSeconds = 0;
     std::int64_t nextConfigLoadAttemptUnixSeconds = 0;
     std::string lastConfigLoadError;
 
