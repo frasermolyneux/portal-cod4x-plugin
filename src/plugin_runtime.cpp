@@ -1985,10 +1985,12 @@ std::string PluginRuntime::GenerateMessageId()
 
 std::string PluginRuntime::JsonEscape(std::string_view value)
 {
-    std::string escaped;
-    escaped.reserve(value.size());
+    static constexpr char kHexDigits[] = "0123456789ABCDEF";
 
-    for (const char c : value)
+    std::string escaped;
+    escaped.reserve(value.size() * 2);
+
+    for (const unsigned char c : value)
     {
         switch (c)
         {
@@ -2014,7 +2016,16 @@ std::string PluginRuntime::JsonEscape(std::string_view value)
                 escaped += "\\t";
                 break;
             default:
-                escaped.push_back(c);
+                if (c < 0x20 || c > 0x7E)
+                {
+                    escaped += "\\u00";
+                    escaped.push_back(kHexDigits[(c >> 4) & 0x0F]);
+                    escaped.push_back(kHexDigits[c & 0x0F]);
+                }
+                else
+                {
+                    escaped.push_back(static_cast<char>(c));
+                }
                 break;
         }
     }
