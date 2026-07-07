@@ -193,11 +193,8 @@ void Runtime_LoadsConfigAndStoresServerContext()
         std::ofstream configFile(configPath);
         configFile
             << "{"
-            << "\"tenantId\":\"tenant-test\","
-            << "\"clientId\":\"client-test\","
-            << "\"clientSecret\":\"secret-test\","
-            << "\"repositoryApiBaseUrl\":\"https://example.test/repository\","
-            << "\"repositoryApiResource\":\"api://repository-test\","
+            << "\"ingestBaseUrl\":\"https://example.test/ingest\","
+            << "\"ingestSubscriptionKey\":\"sub-key-test\","
             << "\"gameServerId\":\"11111111-2222-3333-4444-555555555555\","
             << "\"refreshIntervalSeconds\":120"
             << "}";
@@ -242,15 +239,10 @@ void Runtime_EmitsAndFlushesPlayerConnectedEvent()
         std::ofstream configFile(configPath);
         configFile
             << "{"
-            << "\"tenantId\":\"tenant-test\"," 
-            << "\"clientId\":\"client-test\"," 
-            << "\"clientSecret\":\"secret-test\"," 
-            << "\"repositoryApiBaseUrl\":\"https://example.test/repository\"," 
-            << "\"repositoryApiResource\":\"api://repository-test\"," 
-            << "\"ingestBaseUrl\":\"https://example.test/ingest\"," 
-            << "\"ingestApiResource\":\"api://server-events-ingest\"," 
-            << "\"gameServerId\":\"11111111-2222-3333-4444-555555555555\"," 
-            << "\"gameType\":\"CallOfDuty4\"," 
+            << "\"ingestBaseUrl\":\"https://example.test/ingest\","
+            << "\"ingestSubscriptionKey\":\"sub-key-test\","
+            << "\"gameServerId\":\"11111111-2222-3333-4444-555555555555\","
+            << "\"gameType\":\"CallOfDuty4\","
             << "\"refreshIntervalSeconds\":120"
             << "}";
     }
@@ -308,13 +300,8 @@ void Runtime_AuthorizedIdentity_AllowsDisconnectEventWhenPlayerIdUnavailableAtDi
         std::ofstream configFile(configPath);
         configFile
             << "{"
-            << "\"tenantId\":\"tenant-test\","
-            << "\"clientId\":\"client-test\","
-            << "\"clientSecret\":\"secret-test\","
-            << "\"repositoryApiBaseUrl\":\"https://example.test/repository\","
-            << "\"repositoryApiResource\":\"api://repository-test\","
             << "\"ingestBaseUrl\":\"https://example.test/ingest\","
-            << "\"ingestApiResource\":\"api://server-events-ingest\","
+            << "\"ingestSubscriptionKey\":\"sub-key-test\","
             << "\"gameServerId\":\"11111111-2222-3333-4444-555555555555\","
             << "\"gameType\":\"CallOfDuty4\","
             << "\"refreshIntervalSeconds\":120"
@@ -374,13 +361,8 @@ void Runtime_DropsPoisonEventsAndUnblocksOtherQueues()
         std::ofstream configFile(configPath);
         configFile
             << "{"
-            << "\"tenantId\":\"tenant-test\","
-            << "\"clientId\":\"client-test\","
-            << "\"clientSecret\":\"secret-test\","
-            << "\"repositoryApiBaseUrl\":\"https://example.test/repository\","
-            << "\"repositoryApiResource\":\"api://repository-test\","
             << "\"ingestBaseUrl\":\"https://example.test/ingest\","
-            << "\"ingestApiResource\":\"api://server-events-ingest\","
+            << "\"ingestSubscriptionKey\":\"sub-key-test\","
             << "\"gameServerId\":\"11111111-2222-3333-4444-555555555555\","
             << "\"gameType\":\"CallOfDuty4\","
             << "\"refreshIntervalSeconds\":120"
@@ -590,12 +572,9 @@ void Runtime_HandleClientCommand_PortalPluginHealth_RespectsPortalEnabledFlag()
         std::ofstream configFile(configPath);
         configFile
             << "{"
-            << "\"tenantId\":\"tenant-test\"," 
-            << "\"clientId\":\"client-test\"," 
-            << "\"clientSecret\":\"secret-test\"," 
-            << "\"repositoryApiBaseUrl\":\"https://example.test/repository\"," 
-            << "\"repositoryApiResource\":\"api://repository-test\"," 
-            << "\"gameServerId\":\"11111111-2222-3333-4444-555555555555\"," 
+            << "\"ingestBaseUrl\":\"https://example.test/ingest\","
+            << "\"ingestSubscriptionKey\":\"sub-key-test\","
+            << "\"gameServerId\":\"11111111-2222-3333-4444-555555555555\","
             << "\"portalPluginHealthEnabled\":false"
             << "}";
     }
@@ -636,11 +615,8 @@ void Runtime_HandleClientCommand_PortalPluginHealth_IgnoresMalformedPortalEnable
         std::ofstream configFile(configPath);
         configFile
             << "{"
-            << "\"tenantId\":\"tenant-test\","
-            << "\"clientId\":\"client-test\","
-            << "\"clientSecret\":\"secret-test\","
-            << "\"repositoryApiBaseUrl\":\"https://example.test/repository\","
-            << "\"repositoryApiResource\":\"api://repository-test\","
+            << "\"ingestBaseUrl\":\"https://example.test/ingest\","
+            << "\"ingestSubscriptionKey\":\"sub-key-test\","
             << "\"gameServerId\":\"11111111-2222-3333-4444-555555555555\","
             << "\"portalPluginHealthEnabled\":00"
             << "}";
@@ -692,14 +668,11 @@ void Runtime_LoadsActiveBanCacheAndAnswersBanQuery()
     {
         std::ofstream configFile(configPath);
         configFile
-            << "{" 
-            << "\"tenantId\":\"tenant-test\"," 
-            << "\"clientId\":\"client-test\"," 
-            << "\"clientSecret\":\"secret-test\"," 
-            << "\"repositoryApiBaseUrl\":\"https://example.test/repository\"," 
-            << "\"repositoryApiResource\":\"api://repository-test\"," 
-            << "\"gameServerId\":\"11111111-2222-3333-4444-555555555555\"," 
-            << "\"gameType\":\"CallOfDuty4x\"," 
+            << "{"
+            << "\"ingestBaseUrl\":\"https://example.test/ingest\","
+            << "\"ingestSubscriptionKey\":\"sub-key-test\","
+            << "\"gameServerId\":\"11111111-2222-3333-4444-555555555555\","
+            << "\"gameType\":\"CallOfDuty4x\","
             << "\"refreshIntervalSeconds\":120"
             << "}";
     }
@@ -707,11 +680,7 @@ void Runtime_LoadsActiveBanCacheAndAnswersBanQuery()
     FakeHost host;
     host.CurrentTime = 4000;
 
-    host.Responses["POST https://login.microsoftonline.com/tenant-test/oauth2/v2.0/token"] = {
-        200,
-        "{\"access_token\":\"repo-token\",\"expires_in\":3600}"};
-
-    host.Responses["GET https://example.test/repository/v1.0/admin-actions?gameType=CallOfDuty4x&filter=ActiveBans&skipEntries=0&takeEntries=200&order=CreatedDesc"] = {
+    host.Responses["GET https://example.test/ingest/active-bans?gameType=CallOfDuty4x&skipEntries=0&takeEntries=200"] = {
         200,
         "{\"data\":{\"items\":[{\"player\":{\"guid\":\"76561198000000001\"}}]}}"};
 
@@ -821,16 +790,11 @@ void Runtime_LogFilteringByLevel()
     {
         std::ofstream configFile(configPath);
         configFile
-            << "{" 
-            << "\"tenantId\":\"tenant-test\"," 
-            << "\"clientId\":\"client-test\"," 
-            << "\"clientSecret\":\"secret-test\"," 
-            << "\"repositoryApiBaseUrl\":\"https://example.test/repository\"," 
-            << "\"repositoryApiResource\":\"api://repository-test\"," 
-            << "\"ingestBaseUrl\":\"https://example.test/ingest\"," 
-            << "\"ingestApiResource\":\"api://server-events-ingest\"," 
-            << "\"gameServerId\":\"11111111-2222-3333-4444-555555555555\"," 
-            << "\"gameType\":\"CallOfDuty4\"," 
+            << "{"
+            << "\"ingestBaseUrl\":\"https://example.test/ingest\","
+            << "\"ingestSubscriptionKey\":\"sub-key-test\","
+            << "\"gameServerId\":\"11111111-2222-3333-4444-555555555555\","
+            << "\"gameType\":\"CallOfDuty4\","
             << "\"refreshIntervalSeconds\":120"
             << "}";
     }
@@ -859,7 +823,7 @@ void Runtime_LogFilteringByLevel()
             sawErrorMessage = true;
         }
 
-        if (line.find("starting ingest access-token request") != std::string::npos)
+        if (line.find("starting ingest batch POST") != std::string::npos)
         {
             sawDebugMessageAtErrorLevel = true;
         }
@@ -878,7 +842,7 @@ void Runtime_LogFilteringByLevel()
     bool sawDebugMessageAtDebugLevel = false;
     for (const auto& line : host.Logs)
     {
-        if (line.find("starting ingest access-token request") != std::string::npos)
+        if (line.find("starting ingest batch POST") != std::string::npos)
         {
             sawDebugMessageAtDebugLevel = true;
             break;

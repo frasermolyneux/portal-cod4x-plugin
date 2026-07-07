@@ -13,16 +13,13 @@ The plugin reads a local JSON file named `portal-cod4x-plugin.config.json`.
 
 Required fields:
 
-- `tenantId`
-- `clientId`
-- `clientSecret`
-- `repositoryApiBaseUrl`
-- `repositoryApiResource`
 - `ingestBaseUrl`
-- `ingestApiResource`
+- `ingestSubscriptionKey`
 - `gameServerId`
 - `gameType` (`CallOfDuty4x`)
 - `refreshIntervalSeconds` (15-900, default 120)
+
+The plugin authenticates to APIM with the short `ingestSubscriptionKey` (sent as the `Ocp-Apim-Subscription-Key` header). APIM's managed identity forwards events to Service Bus and proxies active-ban reads to the Repository API, so the plugin no longer needs an Entra ID app registration or client secret.
 
 An example file is provided at `portal-cod4x-plugin.config.example.json`.
 
@@ -30,13 +27,8 @@ An example file is provided at `portal-cod4x-plugin.config.example.json`.
 
 Values are sourced from `portal-environments` Terraform outputs and shared Key Vault secrets:
 
-- secret `azuread-app-tenant-id-cod4x-plugin`
-- secret `azuread-app-client-id-cod4x-plugin`
-- secret `azuread-app-password-cod4x-plugin`
-- secret `cod4x-plugin-repository-api-endpoint`
-- secret `cod4x-plugin-ingest-api-endpoint`
-- Terraform output `repository_api.application.primary_identifier_uri` for `repositoryApiResource`
-- Terraform output `server_events_api.application.primary_identifier_uri` for `ingestApiResource`
+- secret `cod4x-plugin-ingest-api-endpoint` for `ingestBaseUrl`
+- secret `cod4x-plugin-ingest-subscription-key` for `ingestSubscriptionKey`
 - Terraform output `server_events_api.api_management.endpoint` for ingest endpoint fallback
 
 ## Generate config file
@@ -51,8 +43,7 @@ Use the helper script:
   -OutputPath "./portal-cod4x-plugin.config.json"
 ```
 
-If Terraform output access is not available, pass `-RepositoryApiResource` and `-IngestApiResource` directly.
-If the ingest endpoint secret is unavailable in Key Vault, pass `-IngestBaseUrl` directly as well.
+If Terraform output access is not available, pass `-IngestBaseUrl` directly.
 
 ## Deploy config to CoD4x host
 

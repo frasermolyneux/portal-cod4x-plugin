@@ -183,7 +183,7 @@ public:
         const int transferResult = Plugin_HTTP_SendReceiveData(request);
         if (transferResult == 0)
         {
-            const bool isIngestRequest = std::string_view(request->url).find("/ingest/events/") != std::string_view::npos;
+            const bool isIngestRequest = std::string_view(request->url).find("/ingest/") != std::string_view::npos;
             if (isIngestRequest)
             {
                 const std::int64_t nowUnixSeconds = static_cast<std::int64_t>(std::time(nullptr));

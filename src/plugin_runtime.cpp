@@ -309,41 +309,22 @@ std::string NormalizeBaseUrl(std::string baseUrl)
 
 std::optional<PluginConfig> ParsePluginConfig(const std::string& configJson)
 {
-    auto tenantId = ExtractJsonStringValue(configJson, "tenantId");
-    auto clientId = ExtractJsonStringValue(configJson, "clientId");
-    auto clientSecret = ExtractJsonStringValue(configJson, "clientSecret");
-    auto repositoryApiBaseUrl = ExtractJsonStringValue(configJson, "repositoryApiBaseUrl");
-    auto repositoryApiResource = ExtractJsonStringValue(configJson, "repositoryApiResource");
     auto gameServerId = ExtractJsonStringValue(configJson, "gameServerId");
     auto ingestBaseUrl = ExtractJsonStringValue(configJson, "ingestBaseUrl");
-    auto ingestApiResource = ExtractJsonStringValue(configJson, "ingestApiResource");
+    auto ingestSubscriptionKey = ExtractJsonStringValue(configJson, "ingestSubscriptionKey");
     auto gameType = ExtractJsonStringValue(configJson, "gameType");
     auto portalPluginHealthEnabled = ExtractJsonBoolValue(configJson, "portalPluginHealthEnabled");
     auto portalPluginHealthMinPower = ExtractJsonIntValue(configJson, "portalPluginHealthMinPower");
 
-    if (!tenantId.has_value() || !clientId.has_value() || !clientSecret.has_value() || !repositoryApiBaseUrl.has_value() ||
-        !repositoryApiResource.has_value() || !gameServerId.has_value())
+    if (!gameServerId.has_value() || !ingestBaseUrl.has_value() || !ingestSubscriptionKey.has_value())
     {
         return std::nullopt;
     }
 
     PluginConfig config;
-    config.TenantId = Trim(*tenantId);
-    config.ClientId = Trim(*clientId);
-    config.ClientSecret = Trim(*clientSecret);
-    config.RepositoryApiBaseUrl = NormalizeBaseUrl(Trim(*repositoryApiBaseUrl));
-    config.RepositoryApiResource = Trim(*repositoryApiResource);
     config.GameServerId = Trim(*gameServerId);
-
-    if (ingestBaseUrl.has_value())
-    {
-        config.IngestBaseUrl = NormalizeBaseUrl(Trim(*ingestBaseUrl));
-    }
-
-    if (ingestApiResource.has_value())
-    {
-        config.IngestApiResource = Trim(*ingestApiResource);
-    }
+    config.IngestBaseUrl = NormalizeBaseUrl(Trim(*ingestBaseUrl));
+    config.IngestSubscriptionKey = Trim(*ingestSubscriptionKey);
 
     if (gameType.has_value())
     {
@@ -369,9 +350,9 @@ std::optional<PluginConfig> ParsePluginConfig(const std::string& configJson)
     return config;
 }
 
-std::string BuildAuthorizationHeaders(const std::string& accessToken)
+std::string BuildSubscriptionKeyHeaders(const std::string& subscriptionKey)
 {
-    return "Authorization: Bearer " + accessToken + "\r\nAccept: application/json\r\n";
+    return "Ocp-Apim-Subscription-Key: " + subscriptionKey + "\r\nAccept: application/json\r\n";
 }
 
 bool EqualsIgnoreCase(std::string_view left, std::string_view right)
@@ -1029,13 +1010,8 @@ bool PluginRuntime::TryLoadConfig(ICod4xHost& host, std::int64_t nowUnixSeconds)
 
 bool PluginRuntime::IsIngestConfigured() const
 {
-    return loadedConfig.has_value() && !loadedConfig->IngestBaseUrl.empty() && !loadedConfig->IngestApiResource.empty() &&
+    return loadedConfig.has_value() && !loadedConfig->IngestBaseUrl.empty() && !loadedConfig->IngestSubscriptionKey.empty() &&
         !loadedConfig->GameType.empty();
-}
-
-bool PluginRuntime::IsIngestTokenValid(std::int64_t nowUnixSeconds) const
-{
-    return !ingestAccessToken.empty() && nowUnixSeconds + 30 < ingestAccessTokenExpiresAtUnixSeconds;
 }
 
 void PluginRuntime::AdvanceIngest(ICod4xHost& host, std::int64_t nowUnixSeconds)
@@ -1049,7 +1025,7 @@ void PluginRuntime::AdvanceIngest(ICod4xHost& host, std::int64_t nowUnixSeconds)
     {
         if (!ingestConfigWarningLogged)
         {
-            LogInfo(host, "ingest egress disabled; configure ingestBaseUrl, ingestApiResource, and gameType to enable event emission");
+            LogInfo(host, "ingest egress disabled; configure ingestBaseUrl, ingestSubscriptionKey, and gameType to enable event emission");
             ingestConfigWarningLogged = true;
         }
 
@@ -1091,33 +1067,6 @@ void PluginRuntime::AdvanceIngest(ICod4xHost& host, std::int64_t nowUnixSeconds)
         {
             const std::string failedMessage = "ingest request failed" + BuildIngestRequestContext(nowUnixSeconds);
             AbortIngest(host, nowUnixSeconds, failedMessage);
-            return;
-        }
-
-        if (ingestStage == IngestStage::AcquiringToken)
-        {
-            if (response.StatusCode != 200)
-            {
-                AbortIngest(host, nowUnixSeconds, "failed to acquire ingest access token");
-                return;
-            }
-
-            const auto parsedAccessToken = ExtractJsonStringValue(response.Body, "access_token");
-            if (!parsedAccessToken.has_value() || parsedAccessToken->empty())
-            {
-                AbortIngest(host, nowUnixSeconds, "ingest token response missing access_token");
-                return;
-            }
-
-            const int expiresInSeconds = ExtractJsonIntValue(response.Body, "expires_in").value_or(3600);
-            ingestAccessToken = *parsedAccessToken;
-            ingestAccessTokenExpiresAtUnixSeconds = nowUnixSeconds + std::max(0, expiresInSeconds - 30);
-
-            if (!StartIngestBatchRequest(host, nowUnixSeconds))
-            {
-                AbortIngest(host, nowUnixSeconds, "failed to start ingest batch request");
-            }
-
             return;
         }
 
@@ -1168,44 +1117,10 @@ void PluginRuntime::AdvanceIngest(ICod4xHost& host, std::int64_t nowUnixSeconds)
         return;
     }
 
-    if (!IsIngestTokenValid(nowUnixSeconds))
-    {
-        if (!StartIngestTokenRequest(host, nowUnixSeconds))
-        {
-            AbortIngest(host, nowUnixSeconds, "failed to start ingest access token request");
-        }
-
-        return;
-    }
-
     if (!StartIngestBatchRequest(host, nowUnixSeconds))
     {
         AbortIngest(host, nowUnixSeconds, "failed to start ingest batch request");
     }
-}
-
-bool PluginRuntime::StartIngestTokenRequest(ICod4xHost& host, std::int64_t nowUnixSeconds)
-{
-    const std::string tokenUrl = "https://login.microsoftonline.com/" + loadedConfig->TenantId + "/oauth2/v2.0/token";
-    const std::string tokenBody = "grant_type=client_credentials&client_id=" + UrlEncode(loadedConfig->ClientId) +
-        "&client_secret=" + UrlEncode(loadedConfig->ClientSecret) +
-        "&scope=" + UrlEncode(loadedConfig->IngestApiResource + "/.default");
-
-    ingestRequest = host.BeginHttpRequest(
-        tokenUrl,
-        "POST",
-        tokenBody,
-        "Content-Type: application/x-www-form-urlencoded\r\nAccept: application/json\r\n");
-
-    if (ingestRequest == nullptr)
-    {
-        return false;
-    }
-
-    LogDebug(host, "starting ingest access-token request to " + tokenUrl);
-    ingestRequestStartedUnixSeconds = nowUnixSeconds;
-    ingestStage = IngestStage::AcquiringToken;
-    return true;
 }
 
 bool PluginRuntime::StartIngestBatchRequest(ICod4xHost& host, std::int64_t nowUnixSeconds)
@@ -1237,9 +1152,8 @@ bool PluginRuntime::StartIngestBatchRequest(ICod4xHost& host, std::int64_t nowUn
 
     ingestBatchPayload.push_back(']');
 
-    std::string headers = BuildAuthorizationHeaders(ingestAccessToken);
+    std::string headers = BuildSubscriptionKeyHeaders(loadedConfig->IngestSubscriptionKey);
     headers += "Content-Type: application/json\r\n";
-    headers += "Connection: close\r\n";
 
     const std::string requestUrl = loadedConfig->IngestBaseUrl + QueueEndpointPath(loadedConfig->IngestBaseUrl, ingestBatchQueueName);
     LogDebug(
@@ -1270,9 +1184,6 @@ std::string PluginRuntime::BuildIngestRequestContext(std::int64_t nowUnixSeconds
         case IngestStage::Idle:
             context += "idle";
             break;
-        case IngestStage::AcquiringToken:
-            context += "acquiring-token";
-            break;
         case IngestStage::PostingBatch:
             context += "posting-batch";
             break;
@@ -1280,11 +1191,6 @@ std::string PluginRuntime::BuildIngestRequestContext(std::int64_t nowUnixSeconds
 
     const std::int64_t elapsedSeconds = std::max<std::int64_t>(0, nowUnixSeconds - ingestRequestStartedUnixSeconds);
     context += " elapsedSeconds=" + std::to_string(elapsedSeconds);
-
-    if (ingestStage == IngestStage::AcquiringToken && loadedConfig.has_value())
-    {
-        context += " tokenUrl=https://login.microsoftonline.com/" + loadedConfig->TenantId + "/oauth2/v2.0/token";
-    }
 
     if (ingestStage == IngestStage::PostingBatch)
     {
@@ -1343,13 +1249,8 @@ void PluginRuntime::AbortIngest(ICod4xHost& host, std::int64_t nowUnixSeconds, s
 
 bool PluginRuntime::IsRepositoryConfigured() const
 {
-    return loadedConfig.has_value() && !loadedConfig->RepositoryApiBaseUrl.empty() && !loadedConfig->RepositoryApiResource.empty() &&
-        !loadedConfig->TenantId.empty() && !loadedConfig->ClientId.empty() && !loadedConfig->ClientSecret.empty();
-}
-
-bool PluginRuntime::IsRepositoryTokenValid(std::int64_t nowUnixSeconds) const
-{
-    return !repositoryAccessToken.empty() && nowUnixSeconds + 30 < repositoryAccessTokenExpiresAtUnixSeconds;
+    return loadedConfig.has_value() && !loadedConfig->IngestBaseUrl.empty() &&
+        !loadedConfig->IngestSubscriptionKey.empty() && !loadedConfig->GameServerId.empty();
 }
 
 void PluginRuntime::AdvanceBanSync(ICod4xHost& host, std::int64_t nowUnixSeconds)
@@ -1398,35 +1299,6 @@ void PluginRuntime::AdvanceBanSync(ICod4xHost& host, std::int64_t nowUnixSeconds
         if (status == HttpRequestStatus::Failed)
         {
             AbortBanSync(host, nowUnixSeconds, "active-ban sync request failed");
-            return;
-        }
-
-        if (banSyncStage == BanSyncStage::AcquiringToken)
-        {
-            if (response.StatusCode != 200)
-            {
-                AbortBanSync(host, nowUnixSeconds, "failed to acquire repository API access token");
-                return;
-            }
-
-            const auto parsedAccessToken = ExtractJsonStringValue(response.Body, "access_token");
-            if (!parsedAccessToken.has_value() || parsedAccessToken->empty())
-            {
-                AbortBanSync(host, nowUnixSeconds, "repository token response missing access_token");
-                return;
-            }
-
-            const int expiresInSeconds = ExtractJsonIntValue(response.Body, "expires_in").value_or(3600);
-            repositoryAccessToken = *parsedAccessToken;
-            repositoryAccessTokenExpiresAtUnixSeconds = nowUnixSeconds + std::max(0, expiresInSeconds - 30);
-            activeBanFetchSkipEntries = 0;
-            pendingActiveBanMessagesByPlayerGuid.clear();
-
-            if (!StartActiveBanFetchRequest(host, nowUnixSeconds, activeBanFetchSkipEntries))
-            {
-                AbortBanSync(host, nowUnixSeconds, "failed to start repository active-ban request");
-            }
-
             return;
         }
 
@@ -1487,16 +1359,6 @@ void PluginRuntime::AdvanceBanSync(ICod4xHost& host, std::int64_t nowUnixSeconds
         return;
     }
 
-    if (!IsRepositoryTokenValid(nowUnixSeconds))
-    {
-        if (!StartRepositoryTokenRequest(host, nowUnixSeconds))
-        {
-            AbortBanSync(host, nowUnixSeconds, "failed to start repository token request");
-        }
-
-        return;
-    }
-
     activeBanFetchSkipEntries = 0;
     pendingActiveBanMessagesByPlayerGuid.clear();
 
@@ -1506,44 +1368,19 @@ void PluginRuntime::AdvanceBanSync(ICod4xHost& host, std::int64_t nowUnixSeconds
     }
 }
 
-bool PluginRuntime::StartRepositoryTokenRequest(ICod4xHost& host, std::int64_t nowUnixSeconds)
-{
-    const std::string tokenUrl = "https://login.microsoftonline.com/" + loadedConfig->TenantId + "/oauth2/v2.0/token";
-    const std::string tokenBody = "grant_type=client_credentials&client_id=" + UrlEncode(loadedConfig->ClientId) +
-        "&client_secret=" + UrlEncode(loadedConfig->ClientSecret) +
-        "&scope=" + UrlEncode(loadedConfig->RepositoryApiResource + "/.default");
-
-    banSyncRequest = host.BeginHttpRequest(
-        tokenUrl,
-        "POST",
-        tokenBody,
-        "Content-Type: application/x-www-form-urlencoded\r\nAccept: application/json\r\n");
-
-    if (banSyncRequest == nullptr)
-    {
-        return false;
-    }
-
-    LogDebug(host, "starting repository access-token request for active-ban sync");
-    banSyncRequestStartedUnixSeconds = nowUnixSeconds;
-    banSyncStage = BanSyncStage::AcquiringToken;
-    return true;
-}
-
 bool PluginRuntime::StartActiveBanFetchRequest(ICod4xHost& host, std::int64_t nowUnixSeconds, int skipEntries)
 {
     const std::string gameType = loadedConfig->GameType.empty() ? "CallOfDuty4x" : loadedConfig->GameType;
-    const std::string requestUrl = loadedConfig->RepositoryApiBaseUrl +
-        "/v1.0/admin-actions?gameType=" + UrlEncode(gameType) +
-        "&filter=ActiveBans&skipEntries=" + std::to_string(skipEntries) +
-        "&takeEntries=" + std::to_string(kActiveBanPageSize) +
-        "&order=CreatedDesc";
+    const std::string requestUrl = loadedConfig->IngestBaseUrl +
+        "/active-bans?gameType=" + UrlEncode(gameType) +
+        "&skipEntries=" + std::to_string(skipEntries) +
+        "&takeEntries=" + std::to_string(kActiveBanPageSize);
 
-    std::string headers = BuildAuthorizationHeaders(repositoryAccessToken);
+    std::string headers = BuildSubscriptionKeyHeaders(loadedConfig->IngestSubscriptionKey);
 
     LogDebug(
         host,
-        "starting repository active-ban request (skipEntries=" + std::to_string(skipEntries) + ") to " + requestUrl);
+        "starting active-ban request (skipEntries=" + std::to_string(skipEntries) + ") to " + requestUrl);
     banSyncRequest = host.BeginHttpRequest(requestUrl, "GET", "", headers);
     if (banSyncRequest == nullptr)
     {
@@ -2136,9 +1973,6 @@ std::vector<std::string> PluginRuntime::BuildPortalPluginHealthReportLines(std::
     std::string ingestStageName = "Idle";
     switch (ingestStage)
     {
-        case IngestStage::AcquiringToken:
-            ingestStageName = "AcquiringToken";
-            break;
         case IngestStage::PostingBatch:
             ingestStageName = "PostingBatch";
             break;
@@ -2150,9 +1984,6 @@ std::vector<std::string> PluginRuntime::BuildPortalPluginHealthReportLines(std::
     std::string banSyncStageName = "Idle";
     switch (banSyncStage)
     {
-        case BanSyncStage::AcquiringToken:
-            banSyncStageName = "AcquiringToken";
-            break;
         case BanSyncStage::FetchingActiveBans:
             banSyncStageName = "FetchingActiveBans";
             break;
@@ -2177,14 +2008,6 @@ std::vector<std::string> PluginRuntime::BuildPortalPluginHealthReportLines(std::
     }
 
     lines.push_back(std::move(identityLine));
-
-    lines.push_back(
-        "repositoryTokenExpiresUtc=" + FormatOptionalUnixTimestamp(repositoryAccessTokenExpiresAtUnixSeconds) +
-        " repositoryTokenValid=" + std::string(IsRepositoryTokenValid(nowUnixSeconds) ? "true" : "false"));
-
-    lines.push_back(
-        "ingestTokenExpiresUtc=" + FormatOptionalUnixTimestamp(ingestAccessTokenExpiresAtUnixSeconds) +
-        " ingestTokenValid=" + std::string(IsIngestTokenValid(nowUnixSeconds) ? "true" : "false"));
 
     lines.push_back(
         "banSyncStage=" + banSyncStageName +

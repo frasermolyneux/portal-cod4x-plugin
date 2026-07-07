@@ -30,13 +30,8 @@ enum class HttpRequestStatus
 
 struct PluginConfig
 {
-    std::string TenantId;
-    std::string ClientId;
-    std::string ClientSecret;
-    std::string RepositoryApiBaseUrl;
-    std::string RepositoryApiResource;
     std::string IngestBaseUrl;
-    std::string IngestApiResource;
+    std::string IngestSubscriptionKey;
     std::string GameServerId;
     std::string GameType;
     int RefreshIntervalSeconds = 120;
@@ -125,14 +120,12 @@ private:
     enum class IngestStage
     {
         Idle,
-        AcquiringToken,
         PostingBatch
     };
 
     enum class BanSyncStage
     {
         Idle,
-        AcquiringToken,
         FetchingActiveBans
     };
 
@@ -172,8 +165,6 @@ private:
     IngestStage ingestStage = IngestStage::Idle;
     HttpRequestHandle ingestRequest = nullptr;
     std::int64_t ingestRequestStartedUnixSeconds = 0;
-    std::string ingestAccessToken;
-    std::int64_t ingestAccessTokenExpiresAtUnixSeconds = 0;
     std::int64_t nextIngestAttemptUnixSeconds = 0;
     std::int64_t nextServerStatusUnixSeconds = 0;
     std::size_t ingestConsecutiveFailureCount = 0;
@@ -187,8 +178,6 @@ private:
     BanSyncStage banSyncStage = BanSyncStage::Idle;
     HttpRequestHandle banSyncRequest = nullptr;
     std::int64_t banSyncRequestStartedUnixSeconds = 0;
-    std::string repositoryAccessToken;
-    std::int64_t repositoryAccessTokenExpiresAtUnixSeconds = 0;
     std::atomic<std::int64_t> nextBanSyncUnixSeconds = 0;
     std::size_t banSyncConsecutiveFailureCount = 0;
     LogLevel logLevel = LogLevel::Info;
@@ -199,18 +188,14 @@ private:
     mutable std::mutex activeBanCacheMutex;
 
     bool IsIngestConfigured() const;
-    bool IsIngestTokenValid(std::int64_t nowUnixSeconds) const;
     void AdvanceIngest(ICod4xHost& host, std::int64_t nowUnixSeconds);
-    bool StartIngestTokenRequest(ICod4xHost& host, std::int64_t nowUnixSeconds);
     bool StartIngestBatchRequest(ICod4xHost& host, std::int64_t nowUnixSeconds);
     std::string BuildIngestRequestContext(std::int64_t nowUnixSeconds) const;
     void AbortIngest(ICod4xHost& host, std::int64_t nowUnixSeconds, std::string_view reason);
     void FlushServerStatusSnapshot(ICod4xHost& host, std::int64_t nowUnixSeconds);
 
     bool IsRepositoryConfigured() const;
-    bool IsRepositoryTokenValid(std::int64_t nowUnixSeconds) const;
     void AdvanceBanSync(ICod4xHost& host, std::int64_t nowUnixSeconds);
-    bool StartRepositoryTokenRequest(ICod4xHost& host, std::int64_t nowUnixSeconds);
     bool StartActiveBanFetchRequest(ICod4xHost& host, std::int64_t nowUnixSeconds, int skipEntries);
     void AbortBanSync(ICod4xHost& host, std::int64_t nowUnixSeconds, std::string_view reason);
     std::size_t CountActiveBanItems(const std::string& responseBody) const;

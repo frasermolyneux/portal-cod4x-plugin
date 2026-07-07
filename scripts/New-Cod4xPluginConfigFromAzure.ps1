@@ -7,13 +7,7 @@ param(
     [string]$GameServerId,
 
     [Parameter(Mandatory = $false)]
-    [string]$RepositoryApiResource,
-
-    [Parameter(Mandatory = $false)]
     [string]$IngestBaseUrl,
-
-    [Parameter(Mandatory = $false)]
-    [string]$IngestApiResource,
 
     [Parameter(Mandatory = $false)]
     [ValidateSet("CallOfDuty4x")]
@@ -90,10 +84,7 @@ function Get-TerraformOutputValue {
 
 Get-RequiredCommand -Name "az"
 
-$tenantId = Get-KeyVaultSecretValue -VaultName $SharedKeyVaultName -SecretName "azuread-app-tenant-id-cod4x-plugin"
-$clientId = Get-KeyVaultSecretValue -VaultName $SharedKeyVaultName -SecretName "azuread-app-client-id-cod4x-plugin"
-$clientSecret = Get-KeyVaultSecretValue -VaultName $SharedKeyVaultName -SecretName "azuread-app-password-cod4x-plugin"
-$repositoryApiBaseUrl = Get-KeyVaultSecretValue -VaultName $SharedKeyVaultName -SecretName "cod4x-plugin-repository-api-endpoint"
+$ingestSubscriptionKey = Get-KeyVaultSecretValue -VaultName $SharedKeyVaultName -SecretName "cod4x-plugin-ingest-subscription-key"
 
 if ([string]::IsNullOrWhiteSpace($IngestBaseUrl)) {
     try {
@@ -106,34 +97,14 @@ if ([string]::IsNullOrWhiteSpace($IngestBaseUrl)) {
     }
 }
 
-if ([string]::IsNullOrWhiteSpace($RepositoryApiResource) -or [string]::IsNullOrWhiteSpace($IngestApiResource) -or [string]::IsNullOrWhiteSpace($IngestBaseUrl)) {
-    if ([string]::IsNullOrWhiteSpace($PortalEnvironmentsPath)) {
-        throw "RepositoryApiResource, IngestApiResource, and IngestBaseUrl require PortalEnvironmentsPath when not supplied directly."
-    }
-
-    Get-RequiredCommand -Name "terraform"
-}
-
-if ([string]::IsNullOrWhiteSpace($RepositoryApiResource)) {
-    $RepositoryApiResource = Get-TerraformOutputValue -Path $PortalEnvironmentsPath -Name "repository_api" -JsonPath "application.primary_identifier_uri"
-}
-
-if ([string]::IsNullOrWhiteSpace($IngestApiResource)) {
-    $IngestApiResource = Get-TerraformOutputValue -Path $PortalEnvironmentsPath -Name "server_events_api" -JsonPath "application.primary_identifier_uri"
-}
-
 if ([string]::IsNullOrWhiteSpace($IngestBaseUrl)) {
+    Get-RequiredCommand -Name "terraform"
     $IngestBaseUrl = Get-TerraformOutputValue -Path $PortalEnvironmentsPath -Name "server_events_api" -JsonPath "api_management.endpoint"
 }
 
 $configObject = [ordered]@{
-    tenantId               = $tenantId
-    clientId               = $clientId
-    clientSecret           = $clientSecret
-    repositoryApiBaseUrl   = $repositoryApiBaseUrl
-    repositoryApiResource  = $RepositoryApiResource
     ingestBaseUrl          = $IngestBaseUrl
-    ingestApiResource      = $IngestApiResource
+    ingestSubscriptionKey  = $ingestSubscriptionKey
     gameServerId           = $GameServerId
     gameType               = $GameType
     refreshIntervalSeconds = $RefreshIntervalSeconds
@@ -157,9 +128,6 @@ Set-Content -Path $OutputPath -Value $configJson -Encoding utf8NoBOM
 Write-Host "Wrote plugin config to $OutputPath"
 Write-Host "GameServerId: $GameServerId"
 Write-Host "GameType: $GameType"
-Write-Host "Repository API base URL: $repositoryApiBaseUrl"
-Write-Host "Repository API resource: $RepositoryApiResource"
 Write-Host "Ingest API base URL: $IngestBaseUrl"
-Write-Host "Ingest API resource: $IngestApiResource"
 Write-Host "Refresh interval: $RefreshIntervalSeconds seconds"
-Write-Host "Client secret was written to disk; secure this file on the host."
+Write-Host "Ingest subscription key was written to disk; secure this file on the host."
