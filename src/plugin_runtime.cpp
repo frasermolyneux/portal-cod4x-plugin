@@ -586,15 +586,19 @@ void PluginRuntime::HandlePlayerConnect(ICod4xHost& host, int slot, std::string_
 
     ConnectedPlayerState& playerState = connectedPlayers[slot];
     playerState.SlotId = slot;
-    playerState.IpAddress = NormalizeIpAddress(std::string(ipAddress));
+
+    // Only overwrite a previously captured IP when we have a real address for this slot.
+    // Never fabricate a placeholder (e.g. "0.0.0.0") — an unknown IP must stay empty so the
+    // downstream processors skip persistence rather than polluting the player record.
+    const std::string normalizedIp = NormalizeIpAddress(std::string(ipAddress));
+    if (!normalizedIp.empty())
+    {
+        playerState.IpAddress = normalizedIp;
+    }
+
     if (playerState.ConnectedAtUnixSeconds == 0)
     {
         playerState.ConnectedAtUnixSeconds = host.GetUnixTimeSeconds();
-    }
-
-    if (playerState.IpAddress.empty())
-    {
-        playerState.IpAddress = "0.0.0.0";
     }
 
     if (playerState.Username.empty())
@@ -625,11 +629,10 @@ void PluginRuntime::HandlePlayerConnected(ICod4xHost& host, int slot)
     playerState.Score = host.GetPlayerScore(slot);
     playerState.ConnectedAtUnixSeconds = nowUnixSeconds;
 
-    if (playerState.IpAddress.empty())
-    {
-        playerState.IpAddress = "0.0.0.0";
-    }
-
+    // playerState.IpAddress may be empty when this slot never fired OnPlayerConnect under the
+    // plugin (e.g. hot-load onto a populated server, or a slot re-entering the world after a map
+    // rotation). Leave it empty rather than fabricating "0.0.0.0"; downstream treats empty as
+    // "IP unknown" and skips persistence.
     if (playerState.Username.empty())
     {
         return;
@@ -1583,7 +1586,7 @@ std::string PluginRuntime::BuildServerStatusPayload(std::int64_t nowUnixSeconds,
 
         payload += "{\"playerGuid\":\"" + JsonEscape(state.PlayerGuid) + "\"";
         payload += ",\"username\":\"" + JsonEscape(state.Username) + "\"";
-        payload += ",\"ipAddress\":\"" + JsonEscape(state.IpAddress.empty() ? "0.0.0.0" : state.IpAddress) + "\"";
+        payload += ",\"ipAddress\":\"" + JsonEscape(state.IpAddress) + "\"";
         payload += ",\"slotId\":" + std::to_string(state.SlotId);
         payload += ",\"connectedAtUtc\":\"" + ToIso8601Utc(state.ConnectedAtUnixSeconds) + "\"";
         payload += ",\"score\":" + std::to_string(state.Score);

@@ -292,6 +292,66 @@ void Runtime_EmitsAndFlushesPlayerConnectedEvent()
     std::filesystem::remove(configPath, ignoreError);
 }
 
+void Runtime_EmitsEmptyIpWhenConnectAddressUnavailable()
+{
+    const std::filesystem::path configPath = std::filesystem::temp_directory_path() / "portal-cod4x-plugin.noip.test.json";
+
+    {
+        std::ofstream configFile(configPath);
+        configFile
+            << "{"
+            << "\"ingestBaseUrl\":\"https://example.test/ingest\","
+            << "\"ingestSubscriptionKey\":\"sub-key-test\","
+            << "\"gameServerId\":\"11111111-2222-3333-4444-555555555555\","
+            << "\"gameType\":\"CallOfDuty4\","
+            << "\"refreshIntervalSeconds\":120"
+            << "}";
+    }
+
+    FakeHost host;
+    host.CurrentTime = 2000;
+    host.PlayerIds[2] = 76561198000000001ULL;
+    host.PlayerSteamIds[2] = 76561198000000001ULL;
+    host.PlayerNames[2] = "PlayerOne";
+
+    host.Responses["POST https://login.microsoftonline.com/tenant-test/oauth2/v2.0/token"] = {
+        200,
+        "{\"access_token\":\"token-1\",\"expires_in\":3600}"};
+    host.Responses["GET https://example.test/repository/v1.0/configurations/cod4xCommands"] = {404, ""};
+    host.Responses["GET https://example.test/repository/v1.0/game-servers/11111111-2222-3333-4444-555555555555/configurations/cod4xCommands"] = {404, ""};
+    host.Responses["POST https://example.test/ingest/events/player-connected"] = {202, ""};
+
+    portal_cod4x::PluginRuntime runtime(configPath.string());
+    const int initializeResult = runtime.Initialize(host, "1.2.3", "^4[^1XI-BOT^4]^7");
+    Assert(initializeResult == 0, "PluginRuntime initialize should succeed");
+
+    // Simulate a slot entering the world without a prior OnPlayerConnect (e.g. plugin hot-loaded
+    // onto a populated server, or a map rotation re-entering the world). No real IP was captured.
+    runtime.HandlePlayerConnected(host, 2);
+
+    for (int i = 0; i < 8; ++i)
+    {
+        runtime.Tick(host);
+    }
+
+    bool foundIngestPost = false;
+    for (const auto& request : host.Requests)
+    {
+        if (request.Method == "POST" && request.Url == "https://example.test/ingest/events/player-connected")
+        {
+            foundIngestPost = true;
+            Assert(request.Body.find("\"ipAddress\":\"\"") != std::string::npos, "Expected empty ipAddress when connect address unavailable");
+            Assert(request.Body.find("0.0.0.0") == std::string::npos, "Must never fabricate a 0.0.0.0 placeholder IP");
+            break;
+        }
+    }
+
+    Assert(foundIngestPost, "Expected a player-connected ingest POST request");
+
+    std::error_code ignoreError;
+    std::filesystem::remove(configPath, ignoreError);
+}
+
 void Runtime_AuthorizedIdentity_AllowsDisconnectEventWhenPlayerIdUnavailableAtDisconnect()
 {
     const std::filesystem::path configPath = std::filesystem::temp_directory_path() / "portal-cod4x-plugin.authorized.test.json";
@@ -892,6 +952,7 @@ int main()
     BuildMessage_FallsBackWhenPrefixOrVersionMissing();
     Runtime_LoadsConfigAndStoresServerContext();
     Runtime_EmitsAndFlushesPlayerConnectedEvent();
+    Runtime_EmitsEmptyIpWhenConnectAddressUnavailable();
     Runtime_AuthorizedIdentity_AllowsDisconnectEventWhenPlayerIdUnavailableAtDisconnect();
     Runtime_DropsPoisonEventsAndUnblocksOtherQueues();
     Runtime_HandleClientCommand_IgnoresPortalOwnedCommands();
