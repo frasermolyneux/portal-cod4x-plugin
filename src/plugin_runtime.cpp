@@ -1239,13 +1239,16 @@ bool PluginRuntime::StartIngestBatchRequest(ICod4xHost& host, std::int64_t nowUn
 
     std::string headers = BuildAuthorizationHeaders(ingestAccessToken);
     headers += "Content-Type: application/json\r\n";
+    headers += "Connection: close\r\n";
 
     const std::string requestUrl = loadedConfig->IngestBaseUrl + QueueEndpointPath(loadedConfig->IngestBaseUrl, ingestBatchQueueName);
     LogDebug(
         host,
         "starting ingest batch POST to " + requestUrl +
             " queue=" + ingestBatchQueueName +
-            " eventCount=" + std::to_string(ingestBatchIndices.size()));
+            " eventCount=" + std::to_string(ingestBatchIndices.size()) +
+            " payloadBytes=" + std::to_string(ingestBatchPayload.size()));
+
     ingestRequest = host.BeginHttpRequest(requestUrl, "POST", ingestBatchPayload, headers);
     if (ingestRequest == nullptr)
     {
@@ -1291,6 +1294,7 @@ std::string PluginRuntime::BuildIngestRequestContext(std::int64_t nowUnixSeconds
         }
 
         context += " eventCount=" + std::to_string(ingestBatchIndices.size());
+        context += " payloadBytes=" + std::to_string(ingestBatchPayload.size());
 
         if (loadedConfig.has_value() && !loadedConfig->IngestBaseUrl.empty() && !ingestBatchQueueName.empty())
         {

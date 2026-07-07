@@ -10,6 +10,7 @@
 #include <optional>
 #include <string>
 #include <string_view>
+#include <unordered_map>
 
 namespace
 {
@@ -33,6 +34,8 @@ constexpr PluginCommandRegistration kPluginCommandRegistrations[] = {
     {portal_cod4x::kPortalPluginHealthCommandName.data(), &CmdPortalPluginHealth, kPortalPluginHealthDefaultPower},
     {portal_cod4x::kPortalPluginLogLevelCommandName.data(), &CmdPortalPluginLogLevel, kPortalPluginLogLevelDefaultPower},
 };
+
+std::unordered_map<const ftRequest_t*, std::int64_t> g_pendingIngestLogDeadlineByRequest;
 
 void RegisterPluginCommands()
 {
@@ -180,8 +183,30 @@ public:
         const int transferResult = Plugin_HTTP_SendReceiveData(request);
         if (transferResult == 0)
         {
+            const bool isIngestRequest = std::string_view(request->url).find("/ingest/events/") != std::string_view::npos;
+            if (isIngestRequest)
+            {
+                const std::int64_t nowUnixSeconds = static_cast<std::int64_t>(std::time(nullptr));
+                auto [deadlineIt, inserted] = g_pendingIngestLogDeadlineByRequest.emplace(request, nowUnixSeconds + 5);
+                if (inserted || nowUnixSeconds >= deadlineIt->second)
+                {
+                    std::string logMessage = "ingest transport pending url=";
+                    logMessage += request->url;
+                    logMessage += " socketReady=" + std::to_string(request->socketReady ? 1 : 0);
+                    logMessage += " sendRemainingBytes=" + std::to_string(std::max(0, request->sendmsg.cursize));
+                    logMessage += " totalReceivedBytes=" + std::to_string(std::max(0, request->totalreceivedbytes));
+                    logMessage += " httpCode=" + std::to_string(request->code);
+                    logMessage += " headerLength=" + std::to_string(std::max(0, request->headerLength));
+                    logMessage += " contentLength=" + std::to_string(std::max(0, request->contentLength));
+                    Plugin_Printf("%s\n", logMessage.c_str());
+                    deadlineIt->second = nowUnixSeconds + 5;
+                }
+            }
+
             return portal_cod4x::HttpRequestStatus::Pending;
         }
+
+        g_pendingIngestLogDeadlineByRequest.erase(request);
 
         if (transferResult < 0)
         {
@@ -217,6 +242,7 @@ public:
         auto* request = static_cast<ftRequest_t*>(handle);
         if (request != nullptr)
         {
+            g_pendingIngestLogDeadlineByRequest.erase(request);
             Plugin_HTTP_FreeObj(request);
         }
     }
