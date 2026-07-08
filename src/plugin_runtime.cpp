@@ -51,6 +51,18 @@ std::string Trim(std::string value)
     return value;
 }
 
+std::string StripLeadingControlCharacters(std::string value)
+{
+    // CoD4x's OnMessageSent hook delivers chat with a leading 0x15 control byte (the engine's say
+    // marker; reference plugins such as adminplugin/sourcebansplugin strip it the same way). Remove
+    // leading C0/DEL control bytes so command detection and the emitted chat-message payload are clean.
+    const auto isControl = [](unsigned char c) { return c < 0x20 || c == 0x7F; };
+
+    value.erase(value.begin(), std::find_if(value.begin(), value.end(), [&](unsigned char c) { return !isControl(c); }));
+
+    return value;
+}
+
 std::string ToLowerInvariant(std::string_view value)
 {
     std::string normalized;
@@ -739,7 +751,7 @@ void PluginRuntime::HandleChatMessage(ICod4xHost& host, int slot, std::string_vi
         return;
     }
 
-    const std::string trimmedMessage = Trim(std::string(message));
+    const std::string trimmedMessage = Trim(StripLeadingControlCharacters(std::string(message)));
     if (trimmedMessage.empty())
     {
         return;

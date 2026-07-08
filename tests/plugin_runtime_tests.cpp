@@ -944,6 +944,66 @@ void InitializePlugin_FallsBackWhenPrefixOrVersionMissing()
     Assert(host.BroadcastMessages.front() == expectedBroadcast, "Fallback broadcast should match expected startup format");
     Assert(host.Logs.front() == expectedLog, "First fallback startup log should match expected startup format");
 }
+
+void Runtime_HandleChatMessage_StripsLeadingControlByteFromPayload()
+{
+    const std::filesystem::path configPath = std::filesystem::temp_directory_path() / "portal-cod4x-plugin.chatstrip.test.json";
+
+    {
+        std::ofstream configFile(configPath);
+        configFile
+            << "{"
+            << "\"ingestBaseUrl\":\"https://example.test/ingest\","
+            << "\"ingestSubscriptionKey\":\"sub-key-test\","
+            << "\"gameServerId\":\"11111111-2222-3333-4444-555555555555\","
+            << "\"gameType\":\"CallOfDuty4\","
+            << "\"refreshIntervalSeconds\":120"
+            << "}";
+    }
+
+    FakeHost host;
+    host.CurrentTime = 4000;
+    host.PlayerIds[2] = 76561198000000001ULL;
+    host.PlayerNames[2] = "PlayerOne";
+
+    host.Responses["POST https://login.microsoftonline.com/tenant-test/oauth2/v2.0/token"] = {
+        200,
+        "{\"access_token\":\"token-1\",\"expires_in\":3600}"};
+    host.Responses["GET https://example.test/repository/v1.0/configurations/cod4xCommands"] = {404, ""};
+    host.Responses["GET https://example.test/repository/v1.0/game-servers/11111111-2222-3333-4444-555555555555/configurations/cod4xCommands"] = {404, ""};
+    host.Responses["POST https://example.test/ingest/events/chat-message"] = {202, ""};
+
+    portal_cod4x::PluginRuntime runtime(configPath.string());
+    const int initializeResult = runtime.Initialize(host, "1.2.3", "^4[^1XI-BOT^4]^7");
+    Assert(initializeResult == 0, "PluginRuntime initialize should succeed");
+
+    std::string rawMessage;
+    rawMessage.push_back(static_cast<char>(0x15));
+    rawMessage += "!fu Bob";
+    runtime.HandleChatMessage(host, 2, rawMessage, false);
+
+    for (int i = 0; i < 8; ++i)
+    {
+        runtime.Tick(host);
+    }
+
+    bool foundChatPost = false;
+    for (const auto& request : host.Requests)
+    {
+        if (request.Method == "POST" && request.Url == "https://example.test/ingest/events/chat-message")
+        {
+            foundChatPost = true;
+            Assert(request.Body.find("\"message\":\"!fu Bob\"") != std::string::npos,
+                "Expected chat payload message with the leading control byte stripped");
+            break;
+        }
+    }
+
+    Assert(foundChatPost, "Expected a chat-message ingest POST request");
+
+    std::error_code ignoreError;
+    std::filesystem::remove(configPath, ignoreError);
+}
 }
 
 int main()
@@ -957,6 +1017,7 @@ int main()
     Runtime_DropsPoisonEventsAndUnblocksOtherQueues();
     Runtime_HandleClientCommand_IgnoresPortalOwnedCommands();
     Runtime_HandleChatMessage_DoesNotInterceptPortalOwnedCommands();
+    Runtime_HandleChatMessage_StripsLeadingControlByteFromPayload();
     Runtime_HandleClientCommand_DoesNotPrefixMatchLongerToken();
     Runtime_HandleClientCommand_DedupesCrossCallbackPath();
     Runtime_HandleClientCommand_PortalPluginHealth_UsesConsoleAndTellFlow();
