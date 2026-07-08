@@ -8,6 +8,7 @@
 #include <string>
 #include <string_view>
 #include <unordered_map>
+#include <unordered_set>
 #include <vector>
 
 namespace portal_cod4x
@@ -174,6 +175,11 @@ private:
     std::vector<std::size_t> ingestBatchIndices;
     std::deque<BufferedEvent> bufferedEvents;
     std::unordered_map<int, ConnectedPlayerState> connectedPlayers;
+
+    // Player GUIDs for which a player-connected event has already been emitted this session.
+    // Keyed by GUID (not slot) so it survives the map-rotation boundary (OnExitLevel clears the
+    // per-slot map); reset only on genuine disconnect and pruned on level exit.
+    std::unordered_set<std::string> connectEmittedGuids;
 
     BanSyncStage banSyncStage = BanSyncStage::Idle;
     HttpRequestHandle banSyncRequest = nullptr;

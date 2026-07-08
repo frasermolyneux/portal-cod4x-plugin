@@ -633,9 +633,21 @@ void PluginRuntime::HandlePlayerConnected(ICod4xHost& host, int slot)
     }
 
     const std::int64_t nowUnixSeconds = host.GetUnixTimeSeconds();
+    const std::string currentGuid = std::to_string(playerId);
+
+    // Emit player-connected at most once per connection. OnClientEnterWorld re-fires for every
+    // player on each map rotation (OnExitLevel clears the per-slot map) with no intervening
+    // OnPlayerDC, so the guard is keyed on the player's session GUID and survives the level
+    // boundary. connectEmittedGuids is reset only on genuine disconnect (HandlePlayerDisconnected)
+    // and pruned on level exit (HandleServerExited), so a real reconnect re-emits.
+    if (connectEmittedGuids.count(currentGuid) != 0)
+    {
+        return;
+    }
+
     ConnectedPlayerState& playerState = connectedPlayers[slot];
     playerState.SlotId = slot;
-    playerState.PlayerGuid = std::to_string(playerId);
+    playerState.PlayerGuid = currentGuid;
     playerState.SteamId = host.GetPlayerSteamId(slot);
     playerState.Username = Trim(host.GetPlayerName(slot));
     playerState.Score = host.GetPlayerScore(slot);
@@ -663,6 +675,8 @@ void PluginRuntime::HandlePlayerConnected(ICod4xHost& host, int slot)
             slot),
         messageId,
         nowUnixSeconds);
+
+    connectEmittedGuids.insert(currentGuid);
 }
 
 void PluginRuntime::HandleClientAuthorized(ICod4xHost& host)
@@ -723,6 +737,12 @@ void PluginRuntime::HandlePlayerDisconnected(ICod4xHost& host, int slot)
         {
             state.PlayerGuid = std::to_string(playerId);
         }
+    }
+
+    // Reset the once-per-connection guard so a genuine reconnect for this player emits again.
+    if (!state.PlayerGuid.empty())
+    {
+        connectEmittedGuids.erase(state.PlayerGuid);
     }
 
     if (state.Username.empty())
@@ -920,6 +940,31 @@ void PluginRuntime::HandleServerSpawned(ICod4xHost& host)
 
 void PluginRuntime::HandleServerExited(ICod4xHost&)
 {
+    // Preserve the once-per-connection guard across the level boundary (players carry over a map
+    // rotation without an OnPlayerDC), but prune GUIDs no longer present (e.g. a missed OnPlayerDC)
+    // so the set cannot grow unbounded.
+    std::unordered_set<std::string> stillConnected;
+    stillConnected.reserve(connectedPlayers.size());
+    for (const auto& entry : connectedPlayers)
+    {
+        if (!entry.second.PlayerGuid.empty())
+        {
+            stillConnected.insert(entry.second.PlayerGuid);
+        }
+    }
+
+    for (auto it = connectEmittedGuids.begin(); it != connectEmittedGuids.end();)
+    {
+        if (stillConnected.count(*it) != 0)
+        {
+            ++it;
+        }
+        else
+        {
+            it = connectEmittedGuids.erase(it);
+        }
+    }
+
     connectedPlayers.clear();
 }
 
