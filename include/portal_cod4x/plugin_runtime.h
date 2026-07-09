@@ -107,9 +107,18 @@ public:
     void HandlePortalPluginHealthCommand(ICod4xHost& host, int invokerSlot);
     void HandleServerSpawned(ICod4xHost& host);
     void HandleServerExited(ICod4xHost& host);
-    void HandlePlayerBanAdded(std::uint64_t playerId, std::string_view reason);
+    void HandlePlayerBanAdded(
+        std::uint64_t playerId,
+        std::string_view reason,
+        std::uint64_t adminSteamId = 0,
+        std::string_view playerName = {},
+        std::int64_t expireUnixSeconds = -1);
     void HandlePlayerBanRemoved(std::uint64_t playerId);
     bool TryGetPlayerBanMessage(std::uint64_t playerId, std::string& message) const;
+    // Renders the pending server-originated ban list in the cod4x `dumpbanlist` output format so
+    // the agent's RCON reconcile can import bans created directly on the server. Prunes expired
+    // temporary bans as a side effect.
+    [[nodiscard]] std::string RenderServerBanListDump();
     bool TrySetLogLevel(ICod4xHost& host, int levelValue, bool announce = true);
     bool TrySetLogLevel(ICod4xHost& host, std::string_view levelToken, bool announce = true);
     [[nodiscard]] int GetLogLevelValue() const;
@@ -148,6 +157,15 @@ private:
         int Score = 0;
         std::uint64_t SteamId = 0;
         std::int64_t ConnectedAtUnixSeconds = 0;
+    };
+
+    struct ServerOriginatedBan
+    {
+        std::string PlayerGuid;
+        std::string PlayerName;
+        std::string AdminSteamId;
+        std::string Reason;
+        std::int64_t ExpireUnixSeconds = -1; // -1 => permanent (Never)
     };
 
     std::string configPath;
@@ -191,6 +209,11 @@ private:
     bool repositoryConfigWarningLogged = false;
     std::unordered_map<std::string, std::string> pendingActiveBanMessagesByPlayerGuid;
     std::unordered_map<std::string, std::string> activeBanMessagesByPlayerGuid;
+    // Bans created directly on the server (native permban/tempban, observed via OnPlayerAddBan).
+    // Held durably here — separate from the portal-synced cache, which is replaced wholesale on
+    // each sync — so they survive until the agent imports them into the portal (confirmed when the
+    // guid appears in a subsequent active-bans response).
+    std::unordered_map<std::string, ServerOriginatedBan> serverOriginatedBansByPlayerGuid;
     mutable std::mutex activeBanCacheMutex;
 
     bool IsIngestConfigured() const;
@@ -284,8 +307,14 @@ bool TrySetPluginLogLevel(ICod4xHost& host, int levelValue, bool announce = true
 bool TrySetPluginLogLevel(ICod4xHost& host, std::string_view levelToken, bool announce = true);
 int GetPluginLogLevelValue();
 std::string GetPluginLogLevelName();
-void NotifyPlayerBanAdded(std::uint64_t playerId, std::string_view reason);
+void NotifyPlayerBanAdded(
+    std::uint64_t playerId,
+    std::string_view reason,
+    std::uint64_t adminSteamId = 0,
+    std::string_view playerName = {},
+    std::int64_t expireUnixSeconds = -1);
 void NotifyPlayerBanRemoved(std::uint64_t playerId);
 bool TryGetPlayerBanMessage(std::uint64_t playerId, std::string& message);
+std::string RenderServerBanListDump();
 const EffectiveServerContext& GetServerContext();
 }

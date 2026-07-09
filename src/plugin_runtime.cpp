@@ -51,6 +51,22 @@ std::string Trim(std::string value)
     return value;
 }
 
+std::string SanitiseBanField(std::string value)
+{
+    // Newlines/carriage returns would split a single dumpbanlist entry across lines and break the
+    // agent's line-based parse; other control bytes are stripped to keep the RCON output clean.
+    for (char& c : value)
+    {
+        const unsigned char uc = static_cast<unsigned char>(c);
+        if (uc == '\r' || uc == '\n' || uc < 0x20)
+        {
+            c = ' ';
+        }
+    }
+
+    return Trim(std::move(value));
+}
+
 std::string StripLeadingControlCharacters(std::string value)
 {
     // CoD4x's OnMessageSent hook delivers chat with a leading 0x15 control byte (the engine's say
@@ -976,7 +992,12 @@ void PluginRuntime::HandleServerExited(ICod4xHost&)
     connectedPlayers.clear();
 }
 
-void PluginRuntime::HandlePlayerBanAdded(std::uint64_t playerId, std::string_view reason)
+void PluginRuntime::HandlePlayerBanAdded(
+    std::uint64_t playerId,
+    std::string_view reason,
+    std::uint64_t adminSteamId,
+    std::string_view playerName,
+    std::int64_t expireUnixSeconds)
 {
     const std::string playerGuid = BuildPlayerGuidKey(playerId);
     if (playerGuid.empty())
@@ -984,18 +1005,25 @@ void PluginRuntime::HandlePlayerBanAdded(std::uint64_t playerId, std::string_vie
         return;
     }
 
-    std::string renderedReason = Trim(std::string(reason));
-    if (renderedReason.empty())
+    ServerOriginatedBan ban;
+    ban.PlayerGuid = playerGuid;
+    ban.PlayerName = SanitiseBanField(std::string(playerName));
+    // The nick is player-controlled; strip the field delimiter so a crafted name cannot shift the
+    // agent's dumpbanlist parse into a later field (e.g. forging the [PORTAL-BAN] import-skip marker).
+    std::replace(ban.PlayerName.begin(), ban.PlayerName.end(), ';', ' ');
+    ban.AdminSteamId = adminSteamId != 0 ? std::to_string(adminSteamId) : std::string("System/Rcon");
+    ban.Reason = SanitiseBanField(std::string(reason));
+    if (ban.Reason.empty())
     {
-        renderedReason = std::string(kDefaultBanMessage);
+        ban.Reason = std::string(kDefaultBanMessage);
     }
+    // A native permban reports expire as -1 (or 0); a tempban reports a future unix timestamp.
+    ban.ExpireUnixSeconds = expireUnixSeconds > 0 ? expireUnixSeconds : -1;
 
     {
         std::lock_guard<std::mutex> guard(activeBanCacheMutex);
-        activeBanMessagesByPlayerGuid[playerGuid] = std::move(renderedReason);
+        serverOriginatedBansByPlayerGuid[playerGuid] = std::move(ban);
     }
-
-    nextBanSyncUnixSeconds.store(0, std::memory_order_relaxed);
 }
 
 void PluginRuntime::HandlePlayerBanRemoved(std::uint64_t playerId)
@@ -1009,6 +1037,7 @@ void PluginRuntime::HandlePlayerBanRemoved(std::uint64_t playerId)
     {
         std::lock_guard<std::mutex> guard(activeBanCacheMutex);
         activeBanMessagesByPlayerGuid.erase(playerGuid);
+        serverOriginatedBansByPlayerGuid.erase(playerGuid);
     }
 
     nextBanSyncUnixSeconds.store(0, std::memory_order_relaxed);
@@ -1023,14 +1052,94 @@ bool PluginRuntime::TryGetPlayerBanMessage(std::uint64_t playerId, std::string& 
     }
 
     std::lock_guard<std::mutex> guard(activeBanCacheMutex);
-    const auto it = activeBanMessagesByPlayerGuid.find(playerGuid);
-    if (it == activeBanMessagesByPlayerGuid.end())
+
+    const auto portalIt = activeBanMessagesByPlayerGuid.find(playerGuid);
+    if (portalIt != activeBanMessagesByPlayerGuid.end())
     {
-        return false;
+        message = portalIt->second.empty() ? std::string(kDefaultBanMessage) : portalIt->second;
+        return true;
     }
 
-    message = it->second.empty() ? std::string(kDefaultBanMessage) : it->second;
-    return true;
+    const auto serverIt = serverOriginatedBansByPlayerGuid.find(playerGuid);
+    if (serverIt != serverOriginatedBansByPlayerGuid.end())
+    {
+        const ServerOriginatedBan& serverBan = serverIt->second;
+
+        // An expired temporary server-side ban must stop being enforced (the native ban has already
+        // lapsed); it is pruned lazily by RenderServerBanListDump / evicted on portal import.
+        const std::int64_t nowUnixSeconds = static_cast<std::int64_t>(std::time(nullptr));
+        if (serverBan.ExpireUnixSeconds > 0 && serverBan.ExpireUnixSeconds <= nowUnixSeconds)
+        {
+            return false;
+        }
+
+        message = serverBan.Reason.empty() ? std::string(kDefaultBanMessage) : serverBan.Reason;
+        return true;
+    }
+
+    return false;
+}
+
+std::string PluginRuntime::RenderServerBanListDump()
+{
+    const std::int64_t nowUnixSeconds = static_cast<std::int64_t>(std::time(nullptr));
+
+    std::string output;
+    int index = 0;
+
+    std::lock_guard<std::mutex> guard(activeBanCacheMutex);
+
+    // Prune expired temporary bans first so they are neither reported nor re-imported.
+    for (auto it = serverOriginatedBansByPlayerGuid.begin(); it != serverOriginatedBansByPlayerGuid.end();)
+    {
+        if (it->second.ExpireUnixSeconds > 0 && it->second.ExpireUnixSeconds <= nowUnixSeconds)
+        {
+            it = serverOriginatedBansByPlayerGuid.erase(it);
+        }
+        else
+        {
+            ++it;
+        }
+    }
+
+    for (const auto& [playerGuid, ban] : serverOriginatedBansByPlayerGuid)
+    {
+        std::string expireToken = "Never";
+        if (ban.ExpireUnixSeconds > 0)
+        {
+            const std::time_t expireTime = static_cast<std::time_t>(ban.ExpireUnixSeconds);
+            std::array<char, 32> buffer{};
+            std::tm utc{};
+#if defined(_WIN32)
+            gmtime_s(&utc, &expireTime);
+#else
+            gmtime_r(&expireTime, &utc);
+#endif
+            if (std::strftime(buffer.data(), buffer.size(), "%Y-%m-%dT%H:%M:%SZ", &utc) > 0)
+            {
+                expireToken = buffer.data();
+            }
+        }
+
+        output += std::to_string(index);
+        output += " playerid: ";
+        output += playerGuid;
+        output += "; nick: ";
+        output += ban.PlayerName;
+        output += "; adminsteamid: ";
+        output += ban.AdminSteamId.empty() ? std::string("System/Rcon") : ban.AdminSteamId;
+        output += "; expire: ";
+        output += expireToken;
+        output += "; reason: ";
+        output += ban.Reason;
+        output += "\n";
+        ++index;
+    }
+
+    output += std::to_string(index);
+    output += " Active bans\n";
+
+    return output;
 }
 
 const EffectiveServerContext& PluginRuntime::GetServerContext() const
@@ -1402,6 +1511,21 @@ void PluginRuntime::AdvanceBanSync(ICod4xHost& host, std::int64_t nowUnixSeconds
             {
                 std::lock_guard<std::mutex> guard(activeBanCacheMutex);
                 activeBanMessagesByPlayerGuid = std::move(pendingActiveBanMessagesByPlayerGuid);
+
+                // Drop any server-originated pending ban the portal now reports as active — it has
+                // been imported by the agent's reconcile, so it no longer needs surfacing via
+                // dumpbanlist (it is now enforced from the portal-synced cache).
+                for (auto it = serverOriginatedBansByPlayerGuid.begin(); it != serverOriginatedBansByPlayerGuid.end();)
+                {
+                    if (activeBanMessagesByPlayerGuid.find(it->first) != activeBanMessagesByPlayerGuid.end())
+                    {
+                        it = serverOriginatedBansByPlayerGuid.erase(it);
+                    }
+                    else
+                    {
+                        ++it;
+                    }
+                }
             }
 
             pendingActiveBanMessagesByPlayerGuid.clear();
@@ -2254,9 +2378,14 @@ std::string GetPluginLogLevelName()
     return g_runtime.GetLogLevelName();
 }
 
-void NotifyPlayerBanAdded(std::uint64_t playerId, std::string_view reason)
+void NotifyPlayerBanAdded(
+    std::uint64_t playerId,
+    std::string_view reason,
+    std::uint64_t adminSteamId,
+    std::string_view playerName,
+    std::int64_t expireUnixSeconds)
 {
-    g_runtime.HandlePlayerBanAdded(playerId, reason);
+    g_runtime.HandlePlayerBanAdded(playerId, reason, adminSteamId, playerName, expireUnixSeconds);
 }
 
 void NotifyPlayerBanRemoved(std::uint64_t playerId)
@@ -2267,6 +2396,11 @@ void NotifyPlayerBanRemoved(std::uint64_t playerId)
 bool TryGetPlayerBanMessage(std::uint64_t playerId, std::string& message)
 {
     return g_runtime.TryGetPlayerBanMessage(playerId, message);
+}
+
+std::string RenderServerBanListDump()
+{
+    return g_runtime.RenderServerBanListDump();
 }
 
 const EffectiveServerContext& GetServerContext()

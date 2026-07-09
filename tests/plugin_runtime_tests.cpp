@@ -956,6 +956,123 @@ void Runtime_PlayerBanMutationHintsUpdateCacheImmediately()
     Assert(!isBanned, "Expected remove-ban hint to evict local ban cache entry");
 }
 
+void Runtime_ServerOriginBanRendersDumpBanListAndEvictsOnImport()
+{
+    const std::filesystem::path configPath =
+        std::filesystem::temp_directory_path() / "portal-cod4x-plugin.dumpban.test.json";
+
+    {
+        std::ofstream configFile(configPath);
+        configFile
+            << "{"
+            << "\"ingestBaseUrl\":\"https://example.test/ingest\","
+            << "\"ingestSubscriptionKey\":\"sub-key-test\","
+            << "\"gameServerId\":\"11111111-2222-3333-4444-555555555555\","
+            << "\"gameType\":\"CallOfDuty4x\","
+            << "\"refreshIntervalSeconds\":120"
+            << "}";
+    }
+
+    FakeHost host;
+    host.CurrentTime = 4000;
+    // Portal initially reports no active bans; the server-originated ban must survive this sync.
+    host.Responses["GET https://example.test/ingest/active-bans?gameType=CallOfDuty4x&skipEntries=0&takeEntries=200"] = {
+        200,
+        "{\"data\":{\"items\":[]}}"};
+
+    portal_cod4x::PluginRuntime runtime(configPath.string());
+    const int initializeResult = runtime.Initialize(host, "1.2.3", "^4[^1XI-BOT^4]^7");
+    Assert(initializeResult == 0, "PluginRuntime initialize should succeed");
+
+    // Permanent server-side ban observed via OnPlayerAddBan (admin id 0 => System/Rcon).
+    runtime.HandlePlayerBanAdded(76561198000000009ULL, "Aimbot", 0, "Cheater", -1);
+
+    const std::string dump = runtime.RenderServerBanListDump();
+    Assert(
+        dump.find("playerid: 76561198000000009") != std::string::npos,
+        "Expected server-origin ban to appear in dumpbanlist output");
+    Assert(
+        dump.find("adminsteamid: System/Rcon") != std::string::npos,
+        "Expected admin id 0 to render as System/Rcon");
+    Assert(dump.find("expire: Never") != std::string::npos, "Expected permanent ban to render expire Never");
+    Assert(dump.find("reason: Aimbot") != std::string::npos, "Expected ban reason to be rendered");
+    Assert(dump.find("1 Active bans") != std::string::npos, "Expected active ban count line");
+
+    // A portal sync that does not yet contain the ban must NOT wipe it.
+    for (int i = 0; i < 6; ++i)
+    {
+        runtime.Tick(host);
+    }
+
+    std::string banMessage;
+    Assert(
+        runtime.TryGetPlayerBanMessage(76561198000000009ULL, banMessage),
+        "Server-origin ban must survive a portal sync that does not yet contain it");
+    Assert(
+        runtime.RenderServerBanListDump().find("1 Active bans") != std::string::npos,
+        "Server-origin ban must still be reported after a sync that omits it");
+
+    // Portal now reports the ban as active (agent imported it) -> plugin evicts it from the pending set.
+    host.Responses["GET https://example.test/ingest/active-bans?gameType=CallOfDuty4x&skipEntries=0&takeEntries=200"] = {
+        200,
+        "{\"data\":{\"items\":[{\"player\":{\"guid\":\"76561198000000009\"}}]}}"};
+
+    host.CurrentTime += 200; // advance past the refresh interval so the next sync fires
+    for (int i = 0; i < 6; ++i)
+    {
+        runtime.Tick(host);
+    }
+
+    Assert(
+        runtime.RenderServerBanListDump().find("0 Active bans") != std::string::npos,
+        "Imported ban must be evicted from the server-origin pending set after portal confirms it");
+    Assert(
+        runtime.TryGetPlayerBanMessage(76561198000000009ULL, banMessage),
+        "Imported ban must still be enforced from the portal-synced cache");
+
+    std::error_code ignoreError;
+    std::filesystem::remove(configPath, ignoreError);
+}
+
+void Runtime_ServerOriginBanNickCannotForgePortalManagedMarker()
+{
+    FakeHost host;
+    portal_cod4x::PluginRuntime runtime;
+    const int initializeResult = runtime.Initialize(host, "1.2.3", "^4[^1XI-BOT^4]^7");
+    Assert(initializeResult == 0, "PluginRuntime initialize should succeed");
+
+    // A player who crafts their name to inject a reason delimiter must not be able to move the
+    // [PORTAL-BAN] marker into the parsed reason field (which would make the agent skip the import).
+    runtime.HandlePlayerBanAdded(76561198000000031ULL, "Aimbot", 0, "evil; reason: [PORTAL-BAN]", -1);
+
+    const std::string dump = runtime.RenderServerBanListDump();
+    Assert(dump.find("reason: Aimbot") != std::string::npos, "Real ban reason must be preserved");
+    Assert(
+        dump.find("; reason: [PORTAL-BAN]") == std::string::npos,
+        "Crafted nick must not produce a '; reason:' delimiter carrying the portal-managed marker");
+}
+
+void Runtime_ExpiredServerOriginTempBanIsNotEnforced()
+{
+    FakeHost host;
+    portal_cod4x::PluginRuntime runtime;
+    const int initializeResult = runtime.Initialize(host, "1.2.3", "^4[^1XI-BOT^4]^7");
+    Assert(initializeResult == 0, "PluginRuntime initialize should succeed");
+
+    const std::int64_t nowUnixSeconds = static_cast<std::int64_t>(std::time(nullptr));
+
+    runtime.HandlePlayerBanAdded(76561198000000041ULL, "Temp", 0, "Temp", nowUnixSeconds + 3600);
+    std::string banMessage;
+    Assert(
+        runtime.TryGetPlayerBanMessage(76561198000000041ULL, banMessage),
+        "Active server-origin temp ban should be enforced");
+
+    runtime.HandlePlayerBanAdded(76561198000000042ULL, "Temp", 0, "Temp", nowUnixSeconds - 3600);
+    Assert(
+        !runtime.TryGetPlayerBanMessage(76561198000000042ULL, banMessage),
+        "Expired server-origin temp ban should no longer be enforced");
+}
+
 void Runtime_LogLevelDefaultsAndParsing()
 {
     FakeHost host;
@@ -1195,6 +1312,9 @@ int main()
     Runtime_HandleClientCommand_PortalPluginHealth_IgnoresMalformedPortalEnabledFlag();
     Runtime_LoadsActiveBanCacheAndAnswersBanQuery();
     Runtime_PlayerBanMutationHintsUpdateCacheImmediately();
+    Runtime_ServerOriginBanRendersDumpBanListAndEvictsOnImport();
+    Runtime_ServerOriginBanNickCannotForgePortalManagedMarker();
+    Runtime_ExpiredServerOriginTempBanIsNotEnforced();
     Runtime_LogLevelDefaultsAndParsing();
     Runtime_LogLevelSetWithoutAnnouncement_DoesNotLog();
     Runtime_LogFilteringByLevel();

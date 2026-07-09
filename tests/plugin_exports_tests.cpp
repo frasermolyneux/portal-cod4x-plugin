@@ -453,6 +453,40 @@ int main()
     OnPlayerGetBanStatus(&banInfo, banMessage, static_cast<int>(sizeof(banMessage)));
     AssertTrue(std::strlen(banMessage) > 0, "OnPlayerGetBanStatus should return a ban message for cached ban entries.");
 
+    const RegisteredCommand* registeredDumpBanListCommand = nullptr;
+    for (const auto& command : g_registered_commands)
+    {
+        if (command.Name == "dumpbanlist")
+        {
+            registeredDumpBanListCommand = &command;
+            break;
+        }
+    }
+
+    AssertTrue(registeredDumpBanListCommand != nullptr, "dumpbanlist command should be registered.");
+
+    const std::size_t logCountBeforeDump = g_logs.size();
+    registeredDumpBanListCommand->Handler();
+
+    bool foundDumpEntry = false;
+    bool foundDumpCount = false;
+    for (std::size_t i = logCountBeforeDump; i < g_logs.size(); ++i)
+    {
+        if (g_logs[i].find("playerid: ") != std::string::npos &&
+            g_logs[i].find("reason: Portal callback ban reason") != std::string::npos)
+        {
+            foundDumpEntry = true;
+        }
+
+        if (g_logs[i].find("1 Active bans") != std::string::npos)
+        {
+            foundDumpCount = true;
+        }
+    }
+
+    AssertTrue(foundDumpEntry, "dumpbanlist should emit the server-origin ban entry in simplebanlist format.");
+    AssertTrue(foundDumpCount, "dumpbanlist should emit the active ban count line.");
+
     OnPlayerRemoveBan(&banInfo);
 
     char clearedBanMessage[256] = {};
