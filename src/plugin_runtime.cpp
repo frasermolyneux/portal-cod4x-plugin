@@ -1508,8 +1508,19 @@ void PluginRuntime::AdvanceBanSync(ICod4xHost& host, std::int64_t nowUnixSeconds
                 return;
             }
 
+            std::vector<std::string> liftedBanGuids;
             {
                 std::lock_guard<std::mutex> guard(activeBanCacheMutex);
+
+                // Snapshot the previously enforced portal bans so we can detect portal-side lifts
+                // (bans present last sync but absent now) and clear their residual server-side state.
+                std::unordered_set<std::string> previousPortalBanGuids;
+                previousPortalBanGuids.reserve(activeBanMessagesByPlayerGuid.size());
+                for (const auto& [playerGuid, banMessage] : activeBanMessagesByPlayerGuid)
+                {
+                    previousPortalBanGuids.insert(playerGuid);
+                }
+
                 activeBanMessagesByPlayerGuid = std::move(pendingActiveBanMessagesByPlayerGuid);
 
                 // Drop any server-originated pending ban the portal now reports as active — it has
@@ -1526,6 +1537,41 @@ void PluginRuntime::AdvanceBanSync(ICod4xHost& host, std::int64_t nowUnixSeconds
                         ++it;
                     }
                 }
+
+                // A ban enforced from the portal cache last sync that is now absent — and is not a
+                // still-pending server-origin ban — was lifted on the portal (portal is the only
+                // place a ban can be unbanned). Issue a native `unban` for it below so the engine's
+                // residual short-lived IP ban is cleared and the lift takes effect immediately.
+                for (const auto& playerGuid : previousPortalBanGuids)
+                {
+                    if (activeBanMessagesByPlayerGuid.find(playerGuid) == activeBanMessagesByPlayerGuid.end() &&
+                        serverOriginatedBansByPlayerGuid.find(playerGuid) == serverOriginatedBansByPlayerGuid.end())
+                    {
+                        liftedBanGuids.push_back(playerGuid);
+                    }
+                }
+            }
+
+            // Bound the number of native unbans issued in a single sync so a spurious wholesale
+            // clear (e.g. a transient empty portal response) cannot flood the command buffer; any
+            // residual engine IP bans not cleared here self-expire (banlist_maxipbantime).
+            constexpr std::size_t kMaxLiftUnbansPerSync = 25;
+            if (liftedBanGuids.size() > kMaxLiftUnbansPerSync)
+            {
+                LogInfo(
+                    host,
+                    "portal reported " + std::to_string(liftedBanGuids.size()) +
+                        " lifted bans in a single sync; capping native unban commands at " +
+                        std::to_string(kMaxLiftUnbansPerSync));
+                liftedBanGuids.resize(kMaxLiftUnbansPerSync);
+            }
+
+            for (const auto& playerGuid : liftedBanGuids)
+            {
+                // Deferred via the engine command buffer; safe/idempotent (silent if no record) and
+                // also clears the short-lived engine IP ban associated with the original ban.
+                host.ExecuteServerCommand("unban " + playerGuid);
+                LogDebug(host, "issued native unban for portal-lifted ban " + playerGuid);
             }
 
             pendingActiveBanMessagesByPlayerGuid.clear();

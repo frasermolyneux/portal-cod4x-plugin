@@ -1030,6 +1030,110 @@ void Runtime_ServerOriginBanRendersDumpBanListAndEvictsOnImport()
         runtime.TryGetPlayerBanMessage(76561198000000009ULL, banMessage),
         "Imported ban must still be enforced from the portal-synced cache");
 
+    for (const auto& command : host.ExecutedCommands)
+    {
+        Assert(
+            command.rfind("unban ", 0) != 0,
+            "Importing a server-origin ban must not issue a native unban");
+    }
+
+    // Lift the imported ban on the portal -> the imported-then-lifted path must issue a native unban.
+    host.Responses["GET https://example.test/ingest/active-bans?gameType=CallOfDuty4x&skipEntries=0&takeEntries=200"] = {
+        200,
+        "{\"data\":{\"items\":[]}}"};
+
+    host.CurrentTime += 200;
+    const std::size_t commandCountBeforeImportLift = host.ExecutedCommands.size();
+    for (int i = 0; i < 6; ++i)
+    {
+        runtime.Tick(host);
+    }
+
+    Assert(
+        !runtime.TryGetPlayerBanMessage(76561198000000009ULL, banMessage),
+        "Imported-then-lifted ban must no longer be enforced");
+
+    bool issuedUnbanAfterImportLift = false;
+    for (std::size_t i = commandCountBeforeImportLift; i < host.ExecutedCommands.size(); ++i)
+    {
+        if (host.ExecutedCommands[i] == "unban 76561198000000009")
+        {
+            issuedUnbanAfterImportLift = true;
+            break;
+        }
+    }
+
+    Assert(issuedUnbanAfterImportLift, "Ban lifted on portal after import must issue a native unban");
+
+    std::error_code ignoreError;
+    std::filesystem::remove(configPath, ignoreError);
+}
+
+void Runtime_PortalLiftedBanIssuesNativeUnban()
+{
+    const std::filesystem::path configPath =
+        std::filesystem::temp_directory_path() / "portal-cod4x-plugin.liftunban.test.json";
+
+    {
+        std::ofstream configFile(configPath);
+        configFile
+            << "{"
+            << "\"ingestBaseUrl\":\"https://example.test/ingest\","
+            << "\"ingestSubscriptionKey\":\"sub-key-test\","
+            << "\"gameServerId\":\"11111111-2222-3333-4444-555555555555\","
+            << "\"gameType\":\"CallOfDuty4x\","
+            << "\"refreshIntervalSeconds\":120"
+            << "}";
+    }
+
+    FakeHost host;
+    host.CurrentTime = 4000;
+    host.Responses["GET https://example.test/ingest/active-bans?gameType=CallOfDuty4x&skipEntries=0&takeEntries=200"] = {
+        200,
+        "{\"data\":{\"items\":[{\"player\":{\"guid\":\"76561198000000051\"}}]}}"};
+
+    portal_cod4x::PluginRuntime runtime(configPath.string());
+    const int initializeResult = runtime.Initialize(host, "1.2.3", "^4[^1XI-BOT^4]^7");
+    Assert(initializeResult == 0, "PluginRuntime initialize should succeed");
+
+    for (int i = 0; i < 6; ++i)
+    {
+        runtime.Tick(host);
+    }
+
+    std::string banMessage;
+    Assert(
+        runtime.TryGetPlayerBanMessage(76561198000000051ULL, banMessage),
+        "Ban should be enforced after the first sync");
+
+    // Portal lifts the ban -> the next sync returns an empty active-ban list.
+    host.Responses["GET https://example.test/ingest/active-bans?gameType=CallOfDuty4x&skipEntries=0&takeEntries=200"] = {
+        200,
+        "{\"data\":{\"items\":[]}}"};
+
+    host.CurrentTime += 200;
+    const std::size_t commandCountBeforeLift = host.ExecutedCommands.size();
+    for (int i = 0; i < 6; ++i)
+    {
+        runtime.Tick(host);
+    }
+
+    Assert(
+        !runtime.TryGetPlayerBanMessage(76561198000000051ULL, banMessage),
+        "Lifted ban should no longer be enforced");
+
+    bool issuedUnban = false;
+    for (std::size_t i = commandCountBeforeLift; i < host.ExecutedCommands.size(); ++i)
+    {
+        if (host.ExecutedCommands[i] == "unban 76561198000000051")
+        {
+            issuedUnban = true;
+            break;
+        }
+    }
+
+    Assert(issuedUnban, "Portal-lifted ban should trigger a native unban to clear residual server state");
+
     std::error_code ignoreError;
     std::filesystem::remove(configPath, ignoreError);
 }
@@ -1313,6 +1417,7 @@ int main()
     Runtime_LoadsActiveBanCacheAndAnswersBanQuery();
     Runtime_PlayerBanMutationHintsUpdateCacheImmediately();
     Runtime_ServerOriginBanRendersDumpBanListAndEvictsOnImport();
+    Runtime_PortalLiftedBanIssuesNativeUnban();
     Runtime_ServerOriginBanNickCannotForgePortalManagedMarker();
     Runtime_ExpiredServerOriginTempBanIsNotEnforced();
     Runtime_LogLevelDefaultsAndParsing();
