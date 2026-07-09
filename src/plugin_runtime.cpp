@@ -635,28 +635,36 @@ void PluginRuntime::HandlePlayerConnected(ICod4xHost& host, int slot)
     const std::int64_t nowUnixSeconds = host.GetUnixTimeSeconds();
     const std::string currentGuid = std::to_string(playerId);
 
-    // Emit player-connected at most once per connection. OnClientEnterWorld re-fires for every
-    // player on each map rotation (OnExitLevel clears the per-slot map) with no intervening
-    // OnPlayerDC, so the guard is keyed on the player's session GUID and survives the level
-    // boundary. connectEmittedGuids is reset only on genuine disconnect (HandlePlayerDisconnected)
-    // and pruned on level exit (HandleServerExited), so a real reconnect re-emits.
-    if (connectEmittedGuids.count(currentGuid) != 0)
-    {
-        return;
-    }
-
+    // Always keep the roster state in sync with the live slot, even for a player who carried across
+    // a map rotation. OnClientEnterWorld re-fires for every player on each map rotation (OnExitLevel
+    // clears the per-slot map) with no intervening OnPlayerDC; populating connectedPlayers here (and
+    // not only for freshly connecting GUIDs) ensures carried-over players remain in the periodic
+    // server-status snapshot rather than silently dropping out until they next chat.
     ConnectedPlayerState& playerState = connectedPlayers[slot];
     playerState.SlotId = slot;
     playerState.PlayerGuid = currentGuid;
     playerState.SteamId = host.GetPlayerSteamId(slot);
     playerState.Username = Trim(host.GetPlayerName(slot));
     playerState.Score = host.GetPlayerScore(slot);
-    playerState.ConnectedAtUnixSeconds = nowUnixSeconds;
+    if (playerState.ConnectedAtUnixSeconds == 0)
+    {
+        playerState.ConnectedAtUnixSeconds = nowUnixSeconds;
+    }
 
     // playerState.IpAddress may be empty when this slot never fired OnPlayerConnect under the
     // plugin (e.g. hot-load onto a populated server, or a slot re-entering the world after a map
     // rotation). Leave it empty rather than fabricating "0.0.0.0"; downstream treats empty as
     // "IP unknown" and skips persistence.
+
+    // Emit player-connected at most once per connection. The guard is keyed on the player's session
+    // GUID and survives the level boundary. connectEmittedGuids is reset only on genuine disconnect
+    // (HandlePlayerDisconnected) and pruned on level exit (HandleServerExited), so a real reconnect
+    // re-emits.
+    if (connectEmittedGuids.count(currentGuid) != 0)
+    {
+        return;
+    }
+
     if (playerState.Username.empty())
     {
         return;
@@ -1516,20 +1524,60 @@ void PluginRuntime::FlushServerStatusSnapshot(ICod4xHost& host, std::int64_t now
         return;
     }
 
+    // Reconcile the tracked roster against the live server slots so the snapshot is authoritative
+    // regardless of missed or re-fired connect callbacks (map rotation) or a hot-load onto a
+    // populated server. RCON status reads the engine directly; enumerating slots here keeps the
+    // periodic snapshot in agreement with it instead of reflecting only event-observed players.
+    const int slotCount = host.GetSlotCount();
+    for (int slot = 0; slot < slotCount; ++slot)
+    {
+        const std::uint64_t playerId = host.GetPlayerId(slot);
+        if (playerId == 0)
+        {
+            // Empty slot or bot (bots report id 0) — drop any stale entry for this slot.
+            connectedPlayers.erase(slot);
+            continue;
+        }
+
+        const std::string currentGuid = std::to_string(playerId);
+
+        ConnectedPlayerState& state = connectedPlayers[slot];
+
+        // If the slot is now occupied by a different player (e.g. a missed OnPlayerDC/OnPlayerConnect
+        // pair reused the slot), discard the previous occupant's identity and captured IP so we
+        // never bind the old username/steamId/address to the new player's GUID.
+        if (!state.PlayerGuid.empty() && state.PlayerGuid != currentGuid)
+        {
+            state = ConnectedPlayerState{};
+        }
+
+        state.SlotId = slot;
+        state.PlayerGuid = currentGuid;
+        if (state.Username.empty())
+        {
+            state.Username = Trim(host.GetPlayerName(slot));
+        }
+        if (state.SteamId == 0)
+        {
+            state.SteamId = host.GetPlayerSteamId(slot);
+        }
+        if (state.ConnectedAtUnixSeconds == 0)
+        {
+            state.ConnectedAtUnixSeconds = nowUnixSeconds;
+        }
+        state.Score = host.GetPlayerScore(slot);
+    }
+
+    // Prune slots that remain unresolved (no GUID/username) so the snapshot never advertises a
+    // half-populated player. BuildServerStatusPayload applies the same filter defensively.
     for (auto it = connectedPlayers.begin(); it != connectedPlayers.end();)
     {
-        if (it->second.PlayerGuid.empty())
+        if (it->second.PlayerGuid.empty() || it->second.Username.empty())
         {
             it = connectedPlayers.erase(it);
             continue;
         }
 
-        if (it->second.Username.empty())
-        {
-            it->second.Username = Trim(host.GetPlayerName(it->first));
-        }
-
-        it->second.Score = host.GetPlayerScore(it->first);
         ++it;
     }
 

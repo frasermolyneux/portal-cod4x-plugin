@@ -371,6 +371,94 @@ void Runtime_EmitsPlayerConnectedOncePerConnection()
     std::filesystem::remove(configPath, ignoreError);
 }
 
+void Runtime_ServerStatusSnapshot_ReconcilesLiveSlotsAcrossMapRotation()
+{
+    const std::filesystem::path configPath = std::filesystem::temp_directory_path() / "portal-cod4x-plugin.serverstatus.test.json";
+
+    {
+        std::ofstream configFile(configPath);
+        configFile
+            << "{"
+            << "\"ingestBaseUrl\":\"https://example.test/ingest\","
+            << "\"ingestSubscriptionKey\":\"sub-key-test\","
+            << "\"gameServerId\":\"11111111-2222-3333-4444-555555555555\","
+            << "\"gameType\":\"CallOfDuty4\","
+            << "\"refreshIntervalSeconds\":120"
+            << "}";
+    }
+
+    FakeHost host;
+    host.CurrentTime = 2000;
+
+    // Three players occupying live slots. GetPlayerId/GetPlayerName are what RCON status reads;
+    // the reconcile must surface all three regardless of which connect callbacks the plugin saw.
+    host.PlayerIds[2] = 76561198000000001ULL;
+    host.PlayerNames[2] = "PlayerOne";
+    host.PlayerIds[3] = 76561198000000002ULL;
+    host.PlayerNames[3] = "PlayerTwo";
+    host.PlayerIds[4] = 76561198000000003ULL;
+    host.PlayerNames[4] = "PlayerThree";
+
+    host.Responses["POST https://login.microsoftonline.com/tenant-test/oauth2/v2.0/token"] = {
+        200,
+        "{\"access_token\":\"token-1\",\"expires_in\":3600}"};
+    host.Responses["GET https://example.test/repository/v1.0/configurations/cod4xCommands"] = {404, ""};
+    host.Responses["GET https://example.test/repository/v1.0/game-servers/11111111-2222-3333-4444-555555555555/configurations/cod4xCommands"] = {404, ""};
+    host.Responses["POST https://example.test/ingest/events/player-connected"] = {202, ""};
+    host.Responses["POST https://example.test/ingest/events/server-status"] = {202, ""};
+
+    portal_cod4x::PluginRuntime runtime(configPath.string());
+    Assert(runtime.Initialize(host, "1.2.3", "^4[^1XI-BOT^4]^7") == 0, "PluginRuntime initialize should succeed");
+
+    // All three connect normally under the plugin.
+    for (const int slot : {2, 3, 4})
+    {
+        runtime.HandlePlayerConnect(host, slot, "192.168.0.10");
+        runtime.HandlePlayerConnected(host, slot);
+    }
+
+    // Map rotation: OnExitLevel clears the tracked roster. The players remain on the server (their
+    // slots still resolve a player id) but no connect callback re-populates the roster here.
+    runtime.HandleServerExited(host);
+
+    // Advance well past the server-status interval so a snapshot is built and delivered.
+    for (int i = 0; i < 20; ++i)
+    {
+        for (int frame = 0; frame < 6; ++frame)
+        {
+            runtime.Tick(host);
+        }
+
+        host.CurrentTime += 65;
+    }
+
+    std::string lastServerStatusBody;
+    for (const auto& request : host.Requests)
+    {
+        if (request.Method == "POST" && request.Url == "https://example.test/ingest/events/server-status")
+        {
+            lastServerStatusBody = request.Body;
+        }
+    }
+
+    Assert(!lastServerStatusBody.empty(), "Expected a server-status ingest POST after a map rotation");
+    Assert(
+        lastServerStatusBody.find("\"playerCount\":3") != std::string::npos,
+        "Expected server-status snapshot to report all three players carried across the map rotation");
+    Assert(
+        lastServerStatusBody.find("\"playerGuid\":\"76561198000000001\"") != std::string::npos,
+        "Expected PlayerOne in the reconciled server-status snapshot");
+    Assert(
+        lastServerStatusBody.find("\"playerGuid\":\"76561198000000002\"") != std::string::npos,
+        "Expected PlayerTwo in the reconciled server-status snapshot");
+    Assert(
+        lastServerStatusBody.find("\"playerGuid\":\"76561198000000003\"") != std::string::npos,
+        "Expected PlayerThree in the reconciled server-status snapshot");
+
+    std::error_code ignoreError;
+    std::filesystem::remove(configPath, ignoreError);
+}
+
 void Runtime_EmitsEmptyIpWhenConnectAddressUnavailable()
 {
     const std::filesystem::path configPath = std::filesystem::temp_directory_path() / "portal-cod4x-plugin.noip.test.json";
@@ -1092,6 +1180,7 @@ int main()
     Runtime_LoadsConfigAndStoresServerContext();
     Runtime_EmitsAndFlushesPlayerConnectedEvent();
     Runtime_EmitsPlayerConnectedOncePerConnection();
+    Runtime_ServerStatusSnapshot_ReconcilesLiveSlotsAcrossMapRotation();
     Runtime_EmitsEmptyIpWhenConnectAddressUnavailable();
     Runtime_AuthorizedIdentity_AllowsDisconnectEventWhenPlayerIdUnavailableAtDisconnect();
     Runtime_DropsPoisonEventsAndUnblocksOtherQueues();
