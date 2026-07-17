@@ -42,6 +42,7 @@ public:
     std::unordered_map<std::string, bool> CommandPermissions;
     std::unordered_map<std::string, std::string> CvarValues;
     std::int64_t CurrentTime = 0;
+    bool ExecuteServerCommandSucceeds = true;
 
     void BroadcastChat(std::string_view message) override
     {
@@ -61,7 +62,7 @@ public:
     bool ExecuteServerCommand(std::string_view command) override
     {
         ExecutedCommands.emplace_back(command);
-        return true;
+        return ExecuteServerCommandSucceeds;
     }
 
     portal_cod4x::HttpRequestHandle BeginHttpRequest(
@@ -1442,6 +1443,9 @@ void Runtime_VpnProtectionBan_ExecutesVerifiedCommand()
     Assert(std::find(host.ExecutedCommands.begin(), host.ExecutedCommands.end(),
         "banClient 2 \"VPN Protection\"") != host.ExecutedCommands.end(),
         "Expected verified VPN Protection banClient command");
+    Assert(std::find(host.Logs.begin(), host.Logs.end(),
+        "VPN Protection executed ban for player 76561198000000001") != host.Logs.end(),
+        "Expected successful VPN Protection ban in the plugin log");
     const auto request = std::find_if(host.Requests.begin(), host.Requests.end(), [](const FakeHost::RequestRecord& item) {
         return item.Url == "https://example.test/ingest/vpn-protection/evaluate";
     });
@@ -1473,6 +1477,35 @@ void Runtime_VpnProtectionKick_ExecutesOnlyKick()
     Assert(std::find(host.ExecutedCommands.begin(), host.ExecutedCommands.end(),
         "onlykick 2 \"High risk VPN\"") != host.ExecutedCommands.end(),
         "Expected verified VPN Protection onlykick command");
+    Assert(std::find(host.Logs.begin(), host.Logs.end(),
+        "VPN Protection executed kick for player 76561198000000001") != host.Logs.end(),
+        "Expected successful VPN Protection kick in the plugin log");
+    RemoveTestConfig(configPath);
+}
+
+void Runtime_VpnProtectionCommandFailure_LogsErrorWithoutSuccess()
+{
+    const auto configPath = WriteVpnProtectionConfig("command-failure");
+    FakeHost host;
+    ConfigureVpnProtectionPlayer(host);
+    host.ExecuteServerCommandSucceeds = false;
+    host.Responses["POST https://example.test/ingest/vpn-protection/evaluate"] = {
+        200,
+        "{\"matched\":true,\"action\":\"Kick\",\"reason\":\"High risk VPN\"}"};
+
+    portal_cod4x::PluginRuntime runtime(configPath.string());
+    runtime.Initialize(host, "0.2.0");
+    runtime.HandlePlayerConnect(host, 2, "198.51.100.10");
+    runtime.HandlePlayerConnected(host, 2);
+    runtime.Tick(host);
+    runtime.Tick(host);
+
+    Assert(std::find(host.Logs.begin(), host.Logs.end(),
+        "VPN Protection failed to execute kick for player 76561198000000001") != host.Logs.end(),
+        "Expected failed VPN Protection kick in the plugin log");
+    Assert(std::find(host.Logs.begin(), host.Logs.end(),
+        "VPN Protection executed kick for player 76561198000000001") == host.Logs.end(),
+        "Failed VPN Protection kick must not emit a success log");
     RemoveTestConfig(configPath);
 }
 
@@ -1616,6 +1649,7 @@ int main()
     Runtime_HandleChatMessage_StripsLeadingControlByteFromPayload();
     Runtime_VpnProtectionBan_ExecutesVerifiedCommand();
     Runtime_VpnProtectionKick_ExecutesOnlyKick();
+    Runtime_VpnProtectionCommandFailure_LogsErrorWithoutSuccess();
     Runtime_VpnProtectionNoMatch_DoesNotExecuteCommand();
     Runtime_VpnProtectionTransportFailure_FailsOpen();
     Runtime_VpnProtectionSlotReuse_IgnoresDecision();

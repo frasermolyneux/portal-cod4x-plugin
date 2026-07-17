@@ -1640,6 +1640,12 @@ void PluginRuntime::CompleteVpnEvaluation(ICod4xHost& host, const HttpResponse& 
             host,
             "VPN Protection executed " + normalizedAction + " for player " + evaluation.PlayerGuid);
     }
+    else
+    {
+        LogError(
+            host,
+            "VPN Protection failed to execute " + normalizedAction + " for player " + evaluation.PlayerGuid);
+    }
 }
 
 void PluginRuntime::ResetVpnEvaluation(ICod4xHost& host)
