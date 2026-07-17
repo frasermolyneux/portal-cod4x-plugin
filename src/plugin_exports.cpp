@@ -19,6 +19,7 @@ constexpr int kPortalPluginHealthDefaultPower = 98;
 constexpr int kPortalPluginLogLevelDefaultPower = 98;
 constexpr int kDumpBanListDefaultPower = 30;
 constexpr int kDumpPortalBanListDefaultPower = 30;
+constexpr std::size_t kAuthRejectMessageCapacity = 1024;
 constexpr std::string_view kPortalPluginLogLevelUsage =
     "portalpluginloglevel <debug|info|error|1|2|3>";
 
@@ -156,6 +157,17 @@ public:
         Plugin_Cbuf_AddText(payload.c_str());
         Plugin_Cbuf_AddText("\n");
         return true;
+    }
+
+    void DropPlayer(int slot, std::string_view reason) override
+    {
+        if (slot < 0)
+        {
+            return;
+        }
+
+        const std::string payload(reason);
+        Plugin_DropClient(static_cast<unsigned int>(slot), payload.c_str());
     }
 
     portal_cod4x::HttpRequestHandle BeginHttpRequest(
@@ -508,6 +520,28 @@ PCL void COD4X_CALL OnClientAuthorized()
     Cod4xHostAdapter host;
     portal_cod4x::NotifyClientAuthorized(host);
     portal_cod4x::TickPlugin(host);
+}
+
+PCL void COD4X_CALL OnPlayerGotAuthInfo(
+    netadr_t*,
+    std::uint64_t* playerId,
+    std::uint64_t*,
+    char* rejectMessage,
+    qboolean*,
+    client_t*)
+{
+    if (playerId == nullptr || rejectMessage == nullptr || rejectMessage[0] != '\0')
+    {
+        return;
+    }
+
+    std::string banMessage;
+    if (!portal_cod4x::TryGetAuthenticatedPlayerBanMessage(*playerId, banMessage))
+    {
+        return;
+    }
+
+    CopyToBuffer(rejectMessage, kAuthRejectMessageCapacity, banMessage);
 }
 
 PCL void COD4X_CALL OnClientCommand(client_t* client, const char* command)

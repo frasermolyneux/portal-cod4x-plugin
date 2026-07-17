@@ -111,7 +111,7 @@ jobs:
             exit 1
           fi
 
-          for symbol in OnInfoRequest OnInit OnTerminate; do
+          for symbol in OnInfoRequest OnInit OnTerminate OnPlayerGotAuthInfo OnPlayerGetBanStatus; do
             if ! nm -D --defined-only "$PLUGIN_PATH" | grep -Eq "[[:space:]]${symbol}$"; then
               echo "Required export symbol '${symbol}' was not found in ${PLUGIN_PATH}." >&2
               exit 1
@@ -237,7 +237,7 @@ jobs:
           }
 
           $exports = & "${{ steps.windows-build-inputs.outputs.dumpbin_path }}" /nologo /exports $pluginPath | Out-String
-          foreach ($symbol in @("OnInfoRequest", "OnInit", "OnTerminate")) {
+          foreach ($symbol in @("OnInfoRequest", "OnInit", "OnTerminate", "OnPlayerGotAuthInfo", "OnPlayerGetBanStatus")) {
             if ($exports -notmatch "\b$symbol\b") {
               throw "Required export symbol '$symbol' was not found in $pluginPath."
             }

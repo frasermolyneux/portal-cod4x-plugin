@@ -197,6 +197,7 @@ typedef void (COD4X_CALL *xcommand_t)(void);
 
 extern "C" void COD4X_CALL Plugin_Printf(const char* fmt, ...);
 extern "C" void COD4X_CALL Plugin_ChatPrintf(int slot, const char* fmt, ...);
+extern "C" void COD4X_CALL Plugin_DropClient(unsigned int clientnum, const char* reason);
 extern "C" void COD4X_CALL Plugin_Cbuf_AddText(const char* text);
 extern "C" void COD4X_CALL Plugin_AddCommand(const char* name, xcommand_t command, int defaultpower);
 extern "C" int COD4X_CALL Plugin_Cmd_GetInvokerSlot();

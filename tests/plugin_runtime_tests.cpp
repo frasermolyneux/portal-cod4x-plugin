@@ -29,10 +29,17 @@ public:
         std::string Headers;
     };
 
+    struct DroppedPlayer
+    {
+        int Slot;
+        std::string Reason;
+    };
+
     std::vector<std::string> BroadcastMessages;
     std::vector<PrivateChatMessage> PrivateMessages;
     std::vector<std::string> Logs;
     std::vector<std::string> ExecutedCommands;
+    std::vector<DroppedPlayer> DroppedPlayers;
     std::vector<RequestRecord> Requests;
     std::unordered_map<std::string, portal_cod4x::HttpResponse> Responses;
     std::unordered_map<int, std::uint64_t> PlayerIds;
@@ -63,6 +70,11 @@ public:
     {
         ExecutedCommands.emplace_back(command);
         return ExecuteServerCommandSucceeds;
+    }
+
+    void DropPlayer(int slot, std::string_view reason) override
+    {
+        DroppedPlayers.push_back(DroppedPlayer{slot, std::string(reason)});
     }
 
     portal_cod4x::HttpRequestHandle BeginHttpRequest(
@@ -976,6 +988,90 @@ void Runtime_LoadsActiveBanCacheAndAnswersBanQuery()
     std::filesystem::remove(configPath, ignoreError);
 }
 
+void Runtime_ActiveBanSyncProactivelyDropsConnectedBannedPlayer()
+{
+    const auto configPath = WriteVpnProtectionConfig("proactive-ban-drop");
+    FakeHost host;
+    host.CurrentTime = 4000;
+    host.PlayerIds[4] = 76561198000000004ULL;
+    host.PlayerNames[4] = "BannedPlayer";
+    host.Responses["GET https://example.test/ingest/active-bans?gameType=CallOfDuty4x&skipEntries=0&takeEntries=200"] = {
+        200,
+        "{\"data\":{\"items\":[{\"adminActionId\":\"44444444-4444-4444-4444-444444444444\","
+        "\"player\":{\"guid\":\"76561198000000004\"}}]}}"};
+
+    portal_cod4x::PluginRuntime runtime(configPath.string());
+    Assert(runtime.Initialize(host, "1.2.3") == 0, "PluginRuntime initialize should succeed");
+
+    runtime.Tick(host);
+    runtime.Tick(host);
+
+    Assert(host.DroppedPlayers.size() == 1, "Active-ban refresh should proactively drop the connected banned player");
+    Assert(host.DroppedPlayers.front().Slot == 4, "Proactive ban drop should target the matching live slot");
+    Assert(
+        host.DroppedPlayers.front().Reason == "You are banned from this server.",
+        "Proactive ban drop should use the cached portal ban reason");
+
+    runtime.HandlePortalPluginHealthCommand(host, -1);
+    Assert(
+        std::any_of(host.Logs.begin(), host.Logs.end(), [](const std::string& line) {
+            return line.find("proactiveDropAttempts=1") != std::string::npos;
+        }),
+        "Health report should expose the proactive drop attempt count");
+
+    std::string authenticatedBanMessage;
+    Assert(
+        runtime.TryGetAuthenticatedPlayerBanMessage(76561198000000004ULL, authenticatedBanMessage),
+        "Authenticated callback should reject an ID loaded from the portal active-ban cache");
+    Assert(
+        authenticatedBanMessage == "You are banned from this server.",
+        "Authenticated portal-cache rejection should use the synchronized ban reason");
+
+    RemoveTestConfig(configPath);
+}
+
+void Runtime_AuthenticatedBanChecksExposeHitMissAndZeroIdCounters()
+{
+    FakeHost host;
+    portal_cod4x::PluginRuntime runtime;
+    Assert(runtime.Initialize(host, "1.2.3") == 0, "PluginRuntime initialize should succeed");
+    runtime.HandlePlayerBanAdded(76561198000000005ULL, "Cached ban");
+
+    std::string message;
+    Assert(
+        runtime.TryGetAuthenticatedPlayerBanMessage(76561198000000005ULL, message),
+        "Authenticated callback should find a cached player ban");
+    Assert(
+        !runtime.TryGetAuthenticatedPlayerBanMessage(76561198000000006ULL, message),
+        "Authenticated callback should miss an uncached player ban");
+    Assert(
+        !runtime.TryGetAuthenticatedPlayerBanMessage(0, message),
+        "Authenticated callback should reject a zero player ID lookup");
+    Assert(
+        runtime.TryGetPlayerBanMessage(76561198000000005ULL, message),
+        "Ban-status callback should find a cached player ban");
+    Assert(
+        !runtime.TryGetPlayerBanMessage(76561198000000006ULL, message),
+        "Ban-status callback should miss an uncached player ban");
+    Assert(
+        !runtime.TryGetPlayerBanMessage(0, message),
+        "Ban-status callback should reject a zero player ID lookup");
+
+    runtime.HandlePortalPluginHealthCommand(host, -1);
+    Assert(
+        std::any_of(host.Logs.begin(), host.Logs.end(), [](const std::string& line) {
+            return line.find("banEnforcementStatusChecks=3") != std::string::npos &&
+                line.find("statusHits=1") != std::string::npos &&
+                line.find("statusMisses=2") != std::string::npos &&
+                line.find("statusZeroPlayerIds=1") != std::string::npos &&
+                line.find("authenticatedChecks=3") != std::string::npos &&
+                line.find("authenticatedHits=1") != std::string::npos &&
+                line.find("authenticatedMisses=2") != std::string::npos &&
+                line.find("authenticatedZeroPlayerIds=1") != std::string::npos;
+        }),
+        "Health report should expose ban-status and authenticated ban-check diagnostics");
+}
+
 void Runtime_PlayerBanMutationHintsUpdateCacheImmediately()
 {
     FakeHost host;
@@ -1675,6 +1771,8 @@ int main()
     Runtime_HandleClientCommand_PortalPluginHealth_RespectsPortalEnabledFlag();
     Runtime_HandleClientCommand_PortalPluginHealth_IgnoresMalformedPortalEnabledFlag();
     Runtime_LoadsActiveBanCacheAndAnswersBanQuery();
+    Runtime_ActiveBanSyncProactivelyDropsConnectedBannedPlayer();
+    Runtime_AuthenticatedBanChecksExposeHitMissAndZeroIdCounters();
     Runtime_PlayerBanMutationHintsUpdateCacheImmediately();
     Runtime_ServerOriginBanRendersDumpBanListAndEvictsOnImport();
     Runtime_PortalLiftedBanIssuesNativeUnban();

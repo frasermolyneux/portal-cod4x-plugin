@@ -1090,7 +1090,7 @@ void PluginRuntime::HandlePlayerBanRemoved(std::uint64_t playerId)
     nextBanSyncUnixSeconds.store(0, std::memory_order_relaxed);
 }
 
-bool PluginRuntime::TryGetPlayerBanMessage(std::uint64_t playerId, std::string& message) const
+bool PluginRuntime::TryFindPlayerBanMessage(std::uint64_t playerId, std::string& message) const
 {
     const std::string playerGuid = BuildPlayerGuidKey(playerId);
     if (playerGuid.empty())
@@ -1125,6 +1125,36 @@ bool PluginRuntime::TryGetPlayerBanMessage(std::uint64_t playerId, std::string& 
     }
 
     return false;
+}
+
+bool PluginRuntime::TryGetPlayerBanMessage(std::uint64_t playerId, std::string& message) const
+{
+    banStatusCheckCount.fetch_add(1, std::memory_order_relaxed);
+    if (playerId == 0)
+    {
+        banStatusZeroPlayerIdCount.fetch_add(1, std::memory_order_relaxed);
+        banStatusMissCount.fetch_add(1, std::memory_order_relaxed);
+        return false;
+    }
+
+    const bool found = TryFindPlayerBanMessage(playerId, message);
+    (found ? banStatusHitCount : banStatusMissCount).fetch_add(1, std::memory_order_relaxed);
+    return found;
+}
+
+bool PluginRuntime::TryGetAuthenticatedPlayerBanMessage(std::uint64_t playerId, std::string& message) const
+{
+    authenticatedBanCheckCount.fetch_add(1, std::memory_order_relaxed);
+    if (playerId == 0)
+    {
+        authenticatedBanZeroPlayerIdCount.fetch_add(1, std::memory_order_relaxed);
+        authenticatedBanMissCount.fetch_add(1, std::memory_order_relaxed);
+        return false;
+    }
+
+    const bool found = TryFindPlayerBanMessage(playerId, message);
+    (found ? authenticatedBanHitCount : authenticatedBanMissCount).fetch_add(1, std::memory_order_relaxed);
+    return found;
 }
 
 std::string PluginRuntime::RenderServerBanListDump()
@@ -1852,6 +1882,8 @@ void PluginRuntime::AdvanceBanSync(ICod4xHost& host, std::int64_t nowUnixSeconds
                 LogDebug(host, "issued native unban for portal-lifted ban " + playerGuid);
             }
 
+            EnforceCachedBansForConnectedPlayers(host);
+
             pendingActiveBanMessagesByPlayerGuid.clear();
             activeBanFetchSkipEntries = 0;
             banSyncConsecutiveFailureCount = 0;
@@ -1881,6 +1913,30 @@ void PluginRuntime::AdvanceBanSync(ICod4xHost& host, std::int64_t nowUnixSeconds
     if (!StartActiveBanFetchRequest(host, nowUnixSeconds, activeBanFetchSkipEntries))
     {
         AbortBanSync(host, nowUnixSeconds, "failed to start repository active-ban request");
+    }
+}
+
+void PluginRuntime::EnforceCachedBansForConnectedPlayers(ICod4xHost& host)
+{
+    const int slotCount = host.GetSlotCount();
+    for (int slot = 0; slot < slotCount; ++slot)
+    {
+        const std::uint64_t playerId = host.GetPlayerId(slot);
+        if (playerId == 0)
+        {
+            continue;
+        }
+
+        std::string banMessage;
+        if (!TryFindPlayerBanMessage(playerId, banMessage))
+        {
+            continue;
+        }
+
+        host.DropPlayer(slot, banMessage);
+        proactiveBanDropAttemptCount.fetch_add(1, std::memory_order_relaxed);
+        LogInfo(host, "requested proactive drop for cached-banned player " + std::to_string(playerId) +
+            " from slot " + std::to_string(slot));
     }
 }
 
@@ -2549,7 +2605,7 @@ std::vector<std::string> PluginRuntime::BuildPortalPluginHealthReportLines(std::
     }
 
     std::vector<std::string> lines;
-    lines.reserve(9);
+    lines.reserve(10);
 
     lines.emplace_back("[portal-cod4x-plugin] portalpluginhealth report");
 
@@ -2571,6 +2627,17 @@ std::vector<std::string> PluginRuntime::BuildPortalPluginHealthReportLines(std::
         " activeBanCacheCount=" + std::to_string(activeBanCacheCount) +
         " pendingBanCacheCount=" + std::to_string(pendingActiveBanMessagesByPlayerGuid.size()) +
         " banSyncInFlight=" + std::string(banSyncRequest != nullptr ? "true" : "false"));
+
+    lines.push_back(
+        "banEnforcementStatusChecks=" + std::to_string(banStatusCheckCount.load(std::memory_order_relaxed)) +
+        " statusHits=" + std::to_string(banStatusHitCount.load(std::memory_order_relaxed)) +
+        " statusMisses=" + std::to_string(banStatusMissCount.load(std::memory_order_relaxed)) +
+        " statusZeroPlayerIds=" + std::to_string(banStatusZeroPlayerIdCount.load(std::memory_order_relaxed)) +
+        " authenticatedChecks=" + std::to_string(authenticatedBanCheckCount.load(std::memory_order_relaxed)) +
+        " authenticatedHits=" + std::to_string(authenticatedBanHitCount.load(std::memory_order_relaxed)) +
+        " authenticatedMisses=" + std::to_string(authenticatedBanMissCount.load(std::memory_order_relaxed)) +
+        " authenticatedZeroPlayerIds=" + std::to_string(authenticatedBanZeroPlayerIdCount.load(std::memory_order_relaxed)) +
+        " proactiveDropAttempts=" + std::to_string(proactiveBanDropAttemptCount.load(std::memory_order_relaxed)));
 
     lines.push_back(
         "ingestStage=" + ingestStageName +
@@ -2720,6 +2787,11 @@ void NotifyPlayerBanRemoved(std::uint64_t playerId)
 bool TryGetPlayerBanMessage(std::uint64_t playerId, std::string& message)
 {
     return g_runtime.TryGetPlayerBanMessage(playerId, message);
+}
+
+bool TryGetAuthenticatedPlayerBanMessage(std::uint64_t playerId, std::string& message)
+{
+    return g_runtime.TryGetAuthenticatedPlayerBanMessage(playerId, message);
 }
 
 std::string RenderServerBanListDump()

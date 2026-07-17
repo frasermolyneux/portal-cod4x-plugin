@@ -3,6 +3,7 @@
 # to assert the built plugin imports every required symbol.
 Plugin_Printf
 Plugin_ChatPrintf
+Plugin_DropClient
 Plugin_Cbuf_AddText
 Plugin_AddCommand
 Plugin_Cmd_GetInvokerSlot

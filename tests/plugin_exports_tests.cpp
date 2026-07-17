@@ -29,6 +29,7 @@ struct RegisteredCommand
 std::vector<std::string> g_logs;
 std::vector<ChatMessage> g_chats;
 std::vector<std::string> g_commands;
+std::vector<std::string> g_dropped_players;
 std::vector<RegisteredCommand> g_registered_commands;
 std::vector<std::string> g_command_arguments;
 std::string g_empty_command_argument;
@@ -72,6 +73,11 @@ extern "C" void COD4X_CALL Plugin_ChatPrintf(int slot, const char* fmt, ...)
 extern "C" void COD4X_CALL Plugin_Cbuf_AddText(const char* text)
 {
     g_commands.emplace_back(text == nullptr ? "" : text);
+}
+
+extern "C" void COD4X_CALL Plugin_DropClient(unsigned int clientnum, const char* reason)
+{
+    g_dropped_players.emplace_back(std::to_string(clientnum) + ":" + (reason == nullptr ? "" : reason));
 }
 
 extern "C" void COD4X_CALL Plugin_AddCommand(const char* name, xcommand_t command, int defaultpower)
@@ -200,6 +206,7 @@ extern "C"
 int OnInit();
 void OnFrame();
 void OnClientAuthorized();
+void OnPlayerGotAuthInfo(netadr_t* from, std::uint64_t* playerid, std::uint64_t* steamid, char* rejectmsg, qboolean* returnNow, client_t* client);
 void OnClientCommand(client_t* client, const char* command);
 void OnMessageSent(char* message, int slot, qboolean* show, int mode);
 void OnSpawnServer();
@@ -218,6 +225,7 @@ int main()
     g_logs.clear();
     g_chats.clear();
     g_commands.clear();
+    g_dropped_players.clear();
     g_registered_commands.clear();
 
     pluginInfo_t info = {};
@@ -448,6 +456,22 @@ int main()
     std::snprintf(banInfo.message, sizeof(banInfo.message), "%s", "Portal callback ban reason");
 
     OnPlayerAddBan(&banInfo);
+
+    char authenticatedRejectMessage[1024] = {};
+    std::uint64_t authenticatedPlayerId = g_player_id;
+    std::uint64_t authenticatedSteamId = g_player_id;
+    qboolean returnNow = qfalse;
+    OnPlayerGotAuthInfo(
+        &playerAddress,
+        &authenticatedPlayerId,
+        &authenticatedSteamId,
+        authenticatedRejectMessage,
+        &returnNow,
+        &fakeClient);
+    AssertTrue(
+        std::strlen(authenticatedRejectMessage) > 0,
+        "OnPlayerGotAuthInfo should reject a player already present in the ban cache.");
+    AssertTrue(returnNow == qfalse, "OnPlayerGotAuthInfo should let CoD4x perform the rejection drop.");
 
     char banMessage[256] = {};
     OnPlayerGetBanStatus(&banInfo, banMessage, static_cast<int>(sizeof(banMessage)));

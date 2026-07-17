@@ -55,6 +55,7 @@ public:
     virtual void SendChat(int slot, std::string_view message) = 0;
     virtual void Log(std::string_view message) = 0;
     virtual bool ExecuteServerCommand(std::string_view command) = 0;
+    virtual void DropPlayer(int slot, std::string_view reason) = 0;
 
     // Non-blocking HTTP: BeginHttpRequest kicks off a request and returns an opaque
     // handle (nullptr if the request could not be started). PollHttpRequest is called
@@ -115,6 +116,7 @@ public:
         std::int64_t expireUnixSeconds = -1);
     void HandlePlayerBanRemoved(std::uint64_t playerId);
     bool TryGetPlayerBanMessage(std::uint64_t playerId, std::string& message) const;
+    bool TryGetAuthenticatedPlayerBanMessage(std::uint64_t playerId, std::string& message) const;
     // Renders the pending server-originated ban list in the cod4x `dumpbanlist` output format so
     // the agent's RCON reconcile can import bans created directly on the server. Prunes expired
     // temporary bans as a side effect.
@@ -241,6 +243,15 @@ private:
     // guid appears in a subsequent active-bans response).
     std::unordered_map<std::string, ServerOriginatedBan> serverOriginatedBansByPlayerGuid;
     mutable std::mutex activeBanCacheMutex;
+    mutable std::atomic<std::uint64_t> banStatusCheckCount = 0;
+    mutable std::atomic<std::uint64_t> banStatusHitCount = 0;
+    mutable std::atomic<std::uint64_t> banStatusMissCount = 0;
+    mutable std::atomic<std::uint64_t> banStatusZeroPlayerIdCount = 0;
+    mutable std::atomic<std::uint64_t> authenticatedBanCheckCount = 0;
+    mutable std::atomic<std::uint64_t> authenticatedBanHitCount = 0;
+    mutable std::atomic<std::uint64_t> authenticatedBanMissCount = 0;
+    mutable std::atomic<std::uint64_t> authenticatedBanZeroPlayerIdCount = 0;
+    std::atomic<std::uint64_t> proactiveBanDropAttemptCount = 0;
 
     bool IsIngestConfigured() const;
     void AdvanceIngest(ICod4xHost& host, std::int64_t nowUnixSeconds);
@@ -260,6 +271,8 @@ private:
     void AdvanceBanSync(ICod4xHost& host, std::int64_t nowUnixSeconds);
     bool StartActiveBanFetchRequest(ICod4xHost& host, std::int64_t nowUnixSeconds, int skipEntries);
     void AbortBanSync(ICod4xHost& host, std::int64_t nowUnixSeconds, std::string_view reason);
+    void EnforceCachedBansForConnectedPlayers(ICod4xHost& host);
+    bool TryFindPlayerBanMessage(std::uint64_t playerId, std::string& message) const;
     std::size_t CountActiveBanItems(const std::string& responseBody) const;
     std::unordered_map<std::string, std::string> ParseActiveBanMessagesByPlayerGuid(const std::string& responseBody) const;
 
@@ -348,6 +361,7 @@ void NotifyPlayerBanAdded(
     std::int64_t expireUnixSeconds = -1);
 void NotifyPlayerBanRemoved(std::uint64_t playerId);
 bool TryGetPlayerBanMessage(std::uint64_t playerId, std::string& message);
+bool TryGetAuthenticatedPlayerBanMessage(std::uint64_t playerId, std::string& message);
 std::string RenderServerBanListDump();
 std::string RenderPortalBanListDump();
 const EffectiveServerContext& GetServerContext();
