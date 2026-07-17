@@ -487,6 +487,36 @@ int main()
     AssertTrue(foundDumpEntry, "dumpbanlist should emit the server-origin ban entry in simplebanlist format.");
     AssertTrue(foundDumpCount, "dumpbanlist should emit the active ban count line.");
 
+    const RegisteredCommand* registeredDumpPortalBanListCommand = nullptr;
+    for (const auto& command : g_registered_commands)
+    {
+        if (command.Name == "dumpportalbanlist")
+        {
+            registeredDumpPortalBanListCommand = &command;
+            break;
+        }
+    }
+
+    AssertTrue(registeredDumpPortalBanListCommand != nullptr, "dumpportalbanlist command should be registered.");
+    AssertTrue(
+        registeredDumpPortalBanListCommand->DefaultPower == 30,
+        "dumpportalbanlist command should use the ban-list default power.");
+
+    const std::size_t logCountBeforePortalDump = g_logs.size();
+    registeredDumpPortalBanListCommand->Handler();
+
+    bool foundPortalDumpCount = false;
+    for (std::size_t i = logCountBeforePortalDump; i < g_logs.size(); ++i)
+    {
+        if (g_logs[i].find("0 Active portal bans") != std::string::npos)
+        {
+            foundPortalDumpCount = true;
+            break;
+        }
+    }
+
+    AssertTrue(foundPortalDumpCount, "dumpportalbanlist should emit the portal ban count line.");
+
     OnPlayerRemoveBan(&banInfo);
 
     char clearedBanMessage[256] = {};

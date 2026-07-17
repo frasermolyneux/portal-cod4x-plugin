@@ -18,12 +18,14 @@ constexpr int kBroadcastSlot = -1;
 constexpr int kPortalPluginHealthDefaultPower = 98;
 constexpr int kPortalPluginLogLevelDefaultPower = 98;
 constexpr int kDumpBanListDefaultPower = 30;
+constexpr int kDumpPortalBanListDefaultPower = 30;
 constexpr std::string_view kPortalPluginLogLevelUsage =
     "portalpluginloglevel <debug|info|error|1|2|3>";
 
 void COD4X_CALL CmdPortalPluginHealth();
 void COD4X_CALL CmdPortalPluginLogLevel();
 void COD4X_CALL CmdDumpBanList();
+void COD4X_CALL CmdDumpPortalBanList();
 
 struct PluginCommandRegistration
 {
@@ -39,6 +41,7 @@ constexpr PluginCommandRegistration kPluginCommandRegistrations[] = {
     // server-created bans. Emits only the plugin's server-originated pending bans (portal-origin
     // bans are already in the portal, so surfacing them would risk re-import of lifted bans).
     {"dumpbanlist", &CmdDumpBanList, kDumpBanListDefaultPower},
+    {"dumpportalbanlist", &CmdDumpPortalBanList, kDumpPortalBanListDefaultPower},
 };
 
 std::unordered_map<const ftRequest_t*, std::int64_t> g_pendingIngestLogDeadlineByRequest;
@@ -324,25 +327,33 @@ public:
     }
 };
 
-void COD4X_CALL CmdDumpBanList()
+void PrintCommandOutput(std::string_view output)
 {
-    const std::string dump = portal_cod4x::RenderServerBanListDump();
-
     // Print line-by-line so the RCON response is assembled the same way the reference simplebanlist
     // plugin produced it, and to stay clear of the engine print buffer limit.
     std::size_t lineStart = 0;
-    while (lineStart < dump.size())
+    while (lineStart < output.size())
     {
-        std::size_t lineEnd = dump.find('\n', lineStart);
+        std::size_t lineEnd = output.find('\n', lineStart);
         if (lineEnd == std::string::npos)
         {
-            lineEnd = dump.size();
+            lineEnd = output.size();
         }
 
-        const std::string line = dump.substr(lineStart, lineEnd - lineStart);
+        const std::string line(output.substr(lineStart, lineEnd - lineStart));
         Plugin_Printf("%s\n", line.c_str());
         lineStart = lineEnd + 1;
     }
+}
+
+void COD4X_CALL CmdDumpBanList()
+{
+    PrintCommandOutput(portal_cod4x::RenderServerBanListDump());
+}
+
+void COD4X_CALL CmdDumpPortalBanList()
+{
+    PrintCommandOutput(portal_cod4x::RenderPortalBanListDump());
 }
 
 void COD4X_CALL CmdPortalPluginHealth()

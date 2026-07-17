@@ -119,6 +119,8 @@ public:
     // the agent's RCON reconcile can import bans created directly on the server. Prunes expired
     // temporary bans as a side effect.
     [[nodiscard]] std::string RenderServerBanListDump();
+    // Renders every portal-synchronized ban currently used by OnPlayerGetBanStatus.
+    [[nodiscard]] std::string RenderPortalBanListDump() const;
     bool TrySetLogLevel(ICod4xHost& host, int levelValue, bool announce = true);
     bool TrySetLogLevel(ICod4xHost& host, std::string_view levelToken, bool announce = true);
     [[nodiscard]] int GetLogLevelValue() const;
@@ -347,5 +349,6 @@ void NotifyPlayerBanAdded(
 void NotifyPlayerBanRemoved(std::uint64_t playerId);
 bool TryGetPlayerBanMessage(std::uint64_t playerId, std::string& message);
 std::string RenderServerBanListDump();
+std::string RenderPortalBanListDump();
 const EffectiveServerContext& GetServerContext();
 }

@@ -51,6 +51,15 @@ The plugin exports:
 
 `OnFrame` and `OnClientAuthorized` both pump runtime `TickPlugin` so periodic settings refresh can continue while the server is active.
 
+## Ban diagnostics
+
+The plugin registers two RCON ban-list commands at default power 30:
+
+- `dumpbanlist` emits only server-originated bans waiting for the portal agent to import them.
+- `dumpportalbanlist` emits every portal-synchronized ban currently held in the plugin's enforcement cache.
+
+`dumpportalbanlist` renders one line per cached ban with its CoD4x player identifier and enforcement reason, followed by an `Active portal bans` count. Portal bans remain excluded from `dumpbanlist` so the agent cannot re-import portal-owned records as new server bans.
+
 ## Version source
 
 Version is sourced from `version.json` and injected by CMake into compile definitions:

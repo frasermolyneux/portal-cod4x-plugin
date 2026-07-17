@@ -940,7 +940,9 @@ void Runtime_LoadsActiveBanCacheAndAnswersBanQuery()
 
     host.Responses["GET https://example.test/ingest/active-bans?gameType=CallOfDuty4x&skipEntries=0&takeEntries=200"] = {
         200,
-        "{\"data\":{\"items\":[{\"player\":{\"guid\":\"76561198000000001\"}}]}}"};
+        "{\"data\":{\"items\":["
+        "{\"adminActionId\":\"22222222-2222-2222-2222-222222222222\",\"player\":{\"guid\":\"76561198000000002\"}},"
+        "{\"adminActionId\":\"11111111-1111-1111-1111-111111111111\",\"player\":{\"guid\":\"76561198000000001\"}}]}}"};
 
     portal_cod4x::PluginRuntime runtime(configPath.string());
     const int initializeResult = runtime.Initialize(host, "1.2.3", "^4[^1XI-BOT^4]^7");
@@ -958,6 +960,17 @@ void Runtime_LoadsActiveBanCacheAndAnswersBanQuery()
     Assert(
         banMessage.find("banned") != std::string::npos,
         "Expected returned ban message to contain ban wording");
+
+    const std::string portalDump = runtime.RenderPortalBanListDump();
+    Assert(
+        portalDump ==
+            "0 playerid: 76561198000000001; reason: You are banned from this server.\n"
+            "1 playerid: 76561198000000002; reason: You are banned from this server.\n"
+            "2 Active portal bans\n",
+        "Expected portal ban dump to include every synchronized ban in deterministic order");
+    Assert(
+        runtime.RenderServerBanListDump().find("playerid: 76561198000000001") == std::string::npos,
+        "Portal bans must remain excluded from the server-origin pending-import dump");
 
     std::error_code ignoreError;
     std::filesystem::remove(configPath, ignoreError);

@@ -1189,6 +1189,39 @@ std::string PluginRuntime::RenderServerBanListDump()
     return output;
 }
 
+std::string PluginRuntime::RenderPortalBanListDump() const
+{
+    std::vector<std::pair<std::string, std::string>> portalBans;
+    {
+        std::lock_guard<std::mutex> guard(activeBanCacheMutex);
+        portalBans.assign(activeBanMessagesByPlayerGuid.begin(), activeBanMessagesByPlayerGuid.end());
+    }
+
+    std::sort(portalBans.begin(), portalBans.end());
+
+    std::string output;
+    int index = 0;
+    for (const auto& [playerGuid, banMessage] : portalBans)
+    {
+        const std::string safePlayerGuid = SanitiseBanField(playerGuid);
+        const std::string safeBanMessage = SanitiseBanField(
+            banMessage.empty() ? std::string(kDefaultBanMessage) : banMessage);
+
+        output += std::to_string(index);
+        output += " playerid: ";
+        output += safePlayerGuid;
+        output += "; reason: ";
+        output += safeBanMessage;
+        output += "\n";
+        ++index;
+    }
+
+    output += std::to_string(index);
+    output += " Active portal bans\n";
+
+    return output;
+}
+
 const EffectiveServerContext& PluginRuntime::GetServerContext() const
 {
     return serverContext;
@@ -2692,6 +2725,11 @@ bool TryGetPlayerBanMessage(std::uint64_t playerId, std::string& message)
 std::string RenderServerBanListDump()
 {
     return g_runtime.RenderServerBanListDump();
+}
+
+std::string RenderPortalBanListDump()
+{
+    return g_runtime.RenderPortalBanListDump();
 }
 
 const EffectiveServerContext& GetServerContext()
