@@ -167,6 +167,36 @@ void Assert(bool condition, const char* message)
     }
 }
 
+std::filesystem::path WriteVpnProtectionConfig(std::string_view testName)
+{
+    const std::filesystem::path configPath = std::filesystem::temp_directory_path() /
+        ("portal-cod4x-plugin.vpn." + std::string(testName) + ".json");
+    std::ofstream configFile(configPath);
+    configFile
+        << "{"
+        << "\"ingestBaseUrl\":\"https://example.test/ingest\","
+        << "\"ingestSubscriptionKey\":\"sub-key-test\","
+        << "\"gameServerId\":\"11111111-2222-3333-4444-555555555555\","
+        << "\"gameType\":\"CallOfDuty4x\","
+        << "\"refreshIntervalSeconds\":120"
+        << "}";
+    return configPath;
+}
+
+void ConfigureVpnProtectionPlayer(FakeHost& host)
+{
+    host.CurrentTime = 5000;
+    host.PlayerIds[2] = 76561198000000001ULL;
+    host.PlayerNames[2] = "PlayerOne";
+    host.Responses["POST https://example.test/ingest/events/player-connected"] = {202, ""};
+}
+
+void RemoveTestConfig(const std::filesystem::path& configPath)
+{
+    std::error_code ignoreError;
+    std::filesystem::remove(configPath, ignoreError);
+}
+
 void BuildMessage_UsesPrefixAndVersion()
 {
     const std::string message = portal_cod4x::BuildOnlineBroadcastMessage("^4[^1XI-BOT^4]^7", "0.1.0");
@@ -1392,6 +1422,182 @@ void Runtime_HandleChatMessage_StripsLeadingControlByteFromPayload()
     std::error_code ignoreError;
     std::filesystem::remove(configPath, ignoreError);
 }
+
+void Runtime_VpnProtectionBan_ExecutesVerifiedCommand()
+{
+    const auto configPath = WriteVpnProtectionConfig("ban");
+    FakeHost host;
+    ConfigureVpnProtectionPlayer(host);
+    host.Responses["POST https://example.test/ingest/vpn-protection/evaluate"] = {
+        200,
+        "{\"matched\":true,\"action\":\"Ban\",\"reason\":\"VPN Protection\",\"matchedRuleIds\":[\"vpn\"]}"};
+
+    portal_cod4x::PluginRuntime runtime(configPath.string());
+    runtime.Initialize(host, "0.2.0");
+    runtime.HandlePlayerConnect(host, 2, "198.51.100.10:28960");
+    runtime.HandlePlayerConnected(host, 2);
+    runtime.Tick(host);
+    runtime.Tick(host);
+
+    Assert(std::find(host.ExecutedCommands.begin(), host.ExecutedCommands.end(),
+        "banClient 2 \"VPN Protection\"") != host.ExecutedCommands.end(),
+        "Expected verified VPN Protection banClient command");
+    const auto request = std::find_if(host.Requests.begin(), host.Requests.end(), [](const FakeHost::RequestRecord& item) {
+        return item.Url == "https://example.test/ingest/vpn-protection/evaluate";
+    });
+    Assert(request != host.Requests.end(), "Expected VPN Protection evaluation request");
+    Assert(request->Body.find("\"playerGuid\":\"76561198000000001\"") != std::string::npos,
+        "Expected player guid in VPN evaluation payload");
+    Assert(request->Body.find("\"ipAddress\":\"198.51.100.10\"") != std::string::npos,
+        "Expected normalized IP in VPN evaluation payload");
+
+    RemoveTestConfig(configPath);
+}
+
+void Runtime_VpnProtectionKick_ExecutesOnlyKick()
+{
+    const auto configPath = WriteVpnProtectionConfig("kick");
+    FakeHost host;
+    ConfigureVpnProtectionPlayer(host);
+    host.Responses["POST https://example.test/ingest/vpn-protection/evaluate"] = {
+        200,
+        "{\"matched\":true,\"action\":\"Kick\",\"reason\":\"High risk VPN\"}"};
+
+    portal_cod4x::PluginRuntime runtime(configPath.string());
+    runtime.Initialize(host, "0.2.0");
+    runtime.HandlePlayerConnect(host, 2, "198.51.100.10");
+    runtime.HandlePlayerConnected(host, 2);
+    runtime.Tick(host);
+    runtime.Tick(host);
+
+    Assert(std::find(host.ExecutedCommands.begin(), host.ExecutedCommands.end(),
+        "onlykick 2 \"High risk VPN\"") != host.ExecutedCommands.end(),
+        "Expected verified VPN Protection onlykick command");
+    RemoveTestConfig(configPath);
+}
+
+void Runtime_VpnProtectionNoMatch_DoesNotExecuteCommand()
+{
+    const auto configPath = WriteVpnProtectionConfig("no-match");
+    FakeHost host;
+    ConfigureVpnProtectionPlayer(host);
+    host.Responses["POST https://example.test/ingest/vpn-protection/evaluate"] = {
+        200,
+        "{\"matched\":false,\"action\":\"Unknown\",\"reason\":\"\"}"};
+
+    portal_cod4x::PluginRuntime runtime(configPath.string());
+    runtime.Initialize(host, "0.2.0");
+    runtime.HandlePlayerConnect(host, 2, "198.51.100.10");
+    runtime.HandlePlayerConnected(host, 2);
+    runtime.Tick(host);
+    runtime.Tick(host);
+
+    Assert(host.ExecutedCommands.empty(), "No-match VPN evaluation must not execute a command");
+    RemoveTestConfig(configPath);
+}
+
+void Runtime_VpnProtectionTransportFailure_FailsOpen()
+{
+    const auto configPath = WriteVpnProtectionConfig("transport-failure");
+    FakeHost host;
+    ConfigureVpnProtectionPlayer(host);
+
+    portal_cod4x::PluginRuntime runtime(configPath.string());
+    runtime.Initialize(host, "0.2.0");
+    runtime.HandlePlayerConnect(host, 2, "198.51.100.10");
+    runtime.HandlePlayerConnected(host, 2);
+    runtime.Tick(host);
+    runtime.Tick(host);
+
+    Assert(host.ExecutedCommands.empty(), "Failed VPN evaluation must leave the player connected");
+    RemoveTestConfig(configPath);
+}
+
+void Runtime_VpnProtectionSlotReuse_IgnoresDecision()
+{
+    const auto configPath = WriteVpnProtectionConfig("slot-reuse");
+    FakeHost host;
+    ConfigureVpnProtectionPlayer(host);
+    host.Responses["POST https://example.test/ingest/vpn-protection/evaluate"] = {
+        200,
+        "{\"matched\":true,\"action\":\"Ban\",\"reason\":\"VPN Protection\"}"};
+
+    portal_cod4x::PluginRuntime runtime(configPath.string());
+    runtime.Initialize(host, "0.2.0");
+    runtime.HandlePlayerConnect(host, 2, "198.51.100.10");
+    runtime.HandlePlayerConnected(host, 2);
+    runtime.Tick(host);
+    host.PlayerIds[2] = 76561198000000002ULL;
+    host.PlayerNames[2] = "OtherPlayer";
+    runtime.Tick(host);
+
+    Assert(host.ExecutedCommands.empty(), "VPN decision for a reused slot must be ignored");
+    RemoveTestConfig(configPath);
+}
+
+void Runtime_VpnProtectionLateIpAndDuplicateCallbacks_QueueOneRequest()
+{
+    const auto configPath = WriteVpnProtectionConfig("request-count");
+    FakeHost host;
+    ConfigureVpnProtectionPlayer(host);
+    host.Responses["POST https://example.test/ingest/vpn-protection/evaluate"] = {
+        200,
+        "{\"matched\":false}"};
+
+    portal_cod4x::PluginRuntime runtime(configPath.string());
+    runtime.Initialize(host, "0.2.0");
+    runtime.HandlePlayerConnected(host, 2);
+    runtime.Tick(host);
+    runtime.Tick(host);
+    const auto requestsWithoutIp = std::count_if(host.Requests.begin(), host.Requests.end(), [](const FakeHost::RequestRecord& item) {
+        return item.Url == "https://example.test/ingest/vpn-protection/evaluate";
+    });
+    Assert(requestsWithoutIp == 0, "Missing IP must skip VPN evaluation");
+
+    runtime.HandlePlayerConnect(host, 2, "198.51.100.10");
+    runtime.HandlePlayerConnected(host, 2);
+    runtime.HandlePlayerConnected(host, 2);
+    runtime.Tick(host);
+    runtime.Tick(host);
+    const auto requestsAfterLateIp = std::count_if(host.Requests.begin(), host.Requests.end(), [](const FakeHost::RequestRecord& item) {
+        return item.Url == "https://example.test/ingest/vpn-protection/evaluate";
+    });
+    Assert(requestsAfterLateIp == 1, "Expected one VPN evaluation when the IP callback arrives late");
+
+    RemoveTestConfig(configPath);
+}
+
+void Runtime_VpnProtectionSamePlayerReconnect_CancelsStaleRequest()
+{
+    const auto configPath = WriteVpnProtectionConfig("same-player-reconnect");
+    FakeHost host;
+    ConfigureVpnProtectionPlayer(host);
+    host.Responses["POST https://example.test/ingest/vpn-protection/evaluate"] = {
+        200,
+        "{\"matched\":true,\"action\":\"Kick\",\"reason\":\"VPN Protection\"}"};
+
+    portal_cod4x::PluginRuntime runtime(configPath.string());
+    runtime.Initialize(host, "0.2.0");
+    runtime.HandlePlayerConnect(host, 2, "198.51.100.10");
+    runtime.HandlePlayerConnected(host, 2);
+    runtime.Tick(host);
+
+    runtime.HandlePlayerDisconnected(host, 2);
+    runtime.HandlePlayerConnect(host, 2, "198.51.100.10");
+    runtime.HandlePlayerConnected(host, 2);
+    runtime.Tick(host);
+    runtime.Tick(host);
+
+    const auto requestCount = std::count_if(host.Requests.begin(), host.Requests.end(), [](const FakeHost::RequestRecord& item) {
+        return item.Url == "https://example.test/ingest/vpn-protection/evaluate";
+    });
+    Assert(requestCount == 2, "Expected a fresh VPN evaluation after reconnect");
+    Assert(std::count(host.ExecutedCommands.begin(), host.ExecutedCommands.end(),
+        "onlykick 2 \"VPN Protection\"") == 1,
+        "Expected only the reconnect evaluation to execute a command");
+
+    RemoveTestConfig(configPath);
+}
 }
 
 int main()
@@ -1408,6 +1614,13 @@ int main()
     Runtime_HandleClientCommand_IgnoresPortalOwnedCommands();
     Runtime_HandleChatMessage_DoesNotInterceptPortalOwnedCommands();
     Runtime_HandleChatMessage_StripsLeadingControlByteFromPayload();
+    Runtime_VpnProtectionBan_ExecutesVerifiedCommand();
+    Runtime_VpnProtectionKick_ExecutesOnlyKick();
+    Runtime_VpnProtectionNoMatch_DoesNotExecuteCommand();
+    Runtime_VpnProtectionTransportFailure_FailsOpen();
+    Runtime_VpnProtectionSlotReuse_IgnoresDecision();
+    Runtime_VpnProtectionLateIpAndDuplicateCallbacks_QueueOneRequest();
+    Runtime_VpnProtectionSamePlayerReconnect_CancelsStaleRequest();
     Runtime_HandleClientCommand_DoesNotPrefixMatchLongerToken();
     Runtime_HandleClientCommand_DedupesCrossCallbackPath();
     Runtime_HandleClientCommand_PortalPluginHealth_UsesConsoleAndTellFlow();

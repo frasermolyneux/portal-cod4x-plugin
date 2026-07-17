@@ -139,6 +139,12 @@ private:
         FetchingActiveBans
     };
 
+    enum class VpnEvaluationStage
+    {
+        Idle,
+        Evaluating
+    };
+
     struct BufferedEvent
     {
         std::string QueueName;
@@ -156,7 +162,9 @@ private:
         int SlotId = -1;
         int Score = 0;
         std::uint64_t SteamId = 0;
+        std::uint64_t ConnectionGeneration = 0;
         std::int64_t ConnectedAtUnixSeconds = 0;
+        bool VpnEvaluationQueued = false;
     };
 
     struct ServerOriginatedBan
@@ -166,6 +174,15 @@ private:
         std::string AdminSteamId;
         std::string Reason;
         std::int64_t ExpireUnixSeconds = -1; // -1 => permanent (Never)
+    };
+
+    struct PendingVpnEvaluation
+    {
+        std::string PlayerGuid;
+        std::string Username;
+        std::string IpAddress;
+        int SlotId = -1;
+        std::uint64_t ConnectionGeneration = 0;
     };
 
     std::string configPath;
@@ -193,11 +210,18 @@ private:
     std::vector<std::size_t> ingestBatchIndices;
     std::deque<BufferedEvent> bufferedEvents;
     std::unordered_map<int, ConnectedPlayerState> connectedPlayers;
+    std::uint64_t nextConnectionGeneration = 0;
 
     // Player GUIDs for which a player-connected event has already been emitted this session.
     // Keyed by GUID (not slot) so it survives the map-rotation boundary (OnExitLevel clears the
     // per-slot map); reset only on genuine disconnect and pruned on level exit.
     std::unordered_set<std::string> connectEmittedGuids;
+
+    VpnEvaluationStage vpnEvaluationStage = VpnEvaluationStage::Idle;
+    HttpRequestHandle vpnEvaluationRequest = nullptr;
+    std::int64_t vpnEvaluationRequestStartedUnixSeconds = 0;
+    std::deque<PendingVpnEvaluation> pendingVpnEvaluations;
+    std::optional<PendingVpnEvaluation> activeVpnEvaluation;
 
     BanSyncStage banSyncStage = BanSyncStage::Idle;
     HttpRequestHandle banSyncRequest = nullptr;
@@ -222,6 +246,13 @@ private:
     std::string BuildIngestRequestContext(std::int64_t nowUnixSeconds) const;
     void AbortIngest(ICod4xHost& host, std::int64_t nowUnixSeconds, std::string_view reason);
     void FlushServerStatusSnapshot(ICod4xHost& host, std::int64_t nowUnixSeconds);
+
+    void QueueVpnEvaluation(ConnectedPlayerState& playerState);
+    void AdvanceVpnEvaluation(ICod4xHost& host, std::int64_t nowUnixSeconds);
+    bool StartVpnEvaluationRequest(ICod4xHost& host, std::int64_t nowUnixSeconds);
+    void CompleteVpnEvaluation(ICod4xHost& host, const HttpResponse& response);
+    void ResetVpnEvaluation(ICod4xHost& host);
+    std::string BuildVpnEvaluationPayload(const PendingVpnEvaluation& evaluation) const;
 
     bool IsRepositoryConfigured() const;
     void AdvanceBanSync(ICod4xHost& host, std::int64_t nowUnixSeconds);
