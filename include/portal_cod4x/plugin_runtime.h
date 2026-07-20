@@ -273,6 +273,10 @@ private:
     void AbortBanSync(ICod4xHost& host, std::int64_t nowUnixSeconds, std::string_view reason);
     void EnforceCachedBansForConnectedPlayers(ICod4xHost& host);
     bool TryFindPlayerBanMessage(std::uint64_t playerId, std::string& message) const;
+    // Normalises a ban player id to the canonical PUID the portal keys bans on. cod4x's ban hooks
+    // (OnPlayerAddBan/RemoveBan) can deliver the legacy short id, whereas the portal and the agent
+    // reconcile use the canonical PUID; resolve via the connected roster so the two agree.
+    [[nodiscard]] std::string ResolveBanPlayerGuid(std::uint64_t playerId) const;
     std::size_t CountActiveBanItems(const std::string& responseBody) const;
     std::unordered_map<std::string, std::string> ParseActiveBanMessagesByPlayerGuid(const std::string& responseBody) const;
 

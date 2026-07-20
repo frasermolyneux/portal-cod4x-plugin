@@ -1296,6 +1296,116 @@ void Runtime_ServerOriginBanNickCannotForgePortalManagedMarker()
         "Crafted nick must not produce a '; reason:' delimiter carrying the portal-managed marker");
 }
 
+void Runtime_JsonUnescapeDecodesUnicodeEscapesInConfigStrings()
+{
+    const std::filesystem::path configPath =
+        std::filesystem::temp_directory_path() / "portal-cod4x-plugin.jsonunescape.test.json";
+
+    {
+        std::ofstream configFile(configPath);
+        // The subscription key carries a \u0027 escape (an apostrophe). Prior to the fix the decoder
+        // dropped the backslash and left a literal "u0027" in the emitted request header.
+        configFile
+            << "{"
+            << "\"ingestBaseUrl\":\"https://example.test/ingest\","
+            << "\"ingestSubscriptionKey\":\"sub\\u0027key\","
+            << "\"gameServerId\":\"11111111-2222-3333-4444-555555555555\","
+            << "\"gameType\":\"CallOfDuty4x\","
+            << "\"refreshIntervalSeconds\":120"
+            << "}";
+    }
+
+    FakeHost host;
+    host.CurrentTime = 4000;
+    host.Responses["GET https://example.test/ingest/active-bans?gameType=CallOfDuty4x&skipEntries=0&takeEntries=200"] = {
+        200,
+        "{\"data\":{\"items\":[]}}"};
+
+    portal_cod4x::PluginRuntime runtime(configPath.string());
+    Assert(runtime.Initialize(host, "1.2.3", "^4[^1XI-BOT^4]^7") == 0, "PluginRuntime initialize should succeed");
+
+    for (int i = 0; i < 6; ++i)
+    {
+        runtime.Tick(host);
+    }
+
+    bool sawDecodedKey = false;
+    for (const auto& request : host.Requests)
+    {
+        if (request.Headers.find("Ocp-Apim-Subscription-Key: sub'key") != std::string::npos)
+        {
+            sawDecodedKey = true;
+        }
+        Assert(
+            request.Headers.find("subu0027key") == std::string::npos,
+            "The \\u0027 escape must be decoded to an apostrophe, not left as a literal 'u0027'");
+    }
+
+    Assert(sawDecodedKey, "Expected at least one request header to carry the \\u0027-decoded subscription key");
+
+    std::error_code ignoreError;
+    std::filesystem::remove(configPath, ignoreError);
+}
+
+void Runtime_ServerOriginBanResolvesLegacyIdToCanonicalPuidFromRoster()
+{
+    const auto configPath = WriteVpnProtectionConfig("legacy-ban-resolve");
+    FakeHost host;
+    host.CurrentTime = 4000;
+
+    portal_cod4x::PluginRuntime runtime(configPath.string());
+    const int initializeResult = runtime.Initialize(host, "1.2.3", "^4[^1XI-BOT^4]^7");
+    Assert(initializeResult == 0, "PluginRuntime initialize should succeed");
+
+    // A connected player whose canonical PUID carries non-zero low 24 bits, so recovering the full
+    // id requires the live roster rather than just the legacy lower bound.
+    const std::uint64_t canonicalPuid = 2310346614574440782ULL;
+    const std::uint64_t legacyId = (static_cast<std::uint64_t>(4) << 40) | (canonicalPuid >> 24);
+
+    host.PlayerIds[3] = canonicalPuid;
+    host.PlayerNames[3] = "Squish";
+    runtime.HandlePlayerConnect(host, 3, "203.0.113.7");
+    runtime.HandlePlayerConnected(host, 3);
+
+    // cod4x's OnPlayerAddBan delivers the legacy short id; the plugin must normalise it back to the
+    // canonical PUID the portal keys bans on so dumpbanlist agrees with the agent reconcile.
+    runtime.HandlePlayerBanAdded(legacyId, "Aimbot", 0, "Squish", -1);
+
+    const std::string dump = runtime.RenderServerBanListDump();
+    Assert(
+        dump.find("playerid: 2310346614574440782") != std::string::npos,
+        "Legacy ban id must be rendered as the canonical PUID recovered from the roster");
+    Assert(
+        dump.find("playerid: " + std::to_string(legacyId)) == std::string::npos,
+        "Legacy short id must not leak into dumpbanlist once resolved");
+
+    // The ban must also be enforceable under the canonical id used by OnPlayerGetBanStatus.
+    std::string banMessage;
+    Assert(
+        runtime.TryGetPlayerBanMessage(canonicalPuid, banMessage),
+        "Resolved ban must be enforced under the canonical PUID");
+
+    std::error_code ignoreError;
+    std::filesystem::remove(configPath, ignoreError);
+}
+
+void Runtime_ServerOriginBanKeepsRawIdWhenPlayerNotConnected()
+{
+    FakeHost host;
+    portal_cod4x::PluginRuntime runtime;
+    const int initializeResult = runtime.Initialize(host, "1.2.3", "^4[^1XI-BOT^4]^7");
+    Assert(initializeResult == 0, "PluginRuntime initialize should succeed");
+
+    // With no matching connected player the plugin cannot recover the low 24 bits, so it falls back
+    // to the id as delivered (no regression versus prior behaviour; the agent reconcile still maps).
+    const std::uint64_t legacyId = 4535753900373ULL;
+    runtime.HandlePlayerBanAdded(legacyId, "Aimbot", 0, "Squish", -1);
+
+    Assert(
+        runtime.RenderServerBanListDump().find("playerid: 4535753900373") != std::string::npos,
+        "Unresolvable ban id must fall back to the raw id rather than being dropped");
+}
+
 void Runtime_ExpiredServerOriginTempBanIsNotEnforced()
 {
     FakeHost host;
@@ -1775,6 +1885,9 @@ int main()
     Runtime_AuthenticatedBanChecksExposeHitMissAndZeroIdCounters();
     Runtime_PlayerBanMutationHintsUpdateCacheImmediately();
     Runtime_ServerOriginBanRendersDumpBanListAndEvictsOnImport();
+    Runtime_ServerOriginBanResolvesLegacyIdToCanonicalPuidFromRoster();
+    Runtime_ServerOriginBanKeepsRawIdWhenPlayerNotConnected();
+    Runtime_JsonUnescapeDecodesUnicodeEscapesInConfigStrings();
     Runtime_PortalLiftedBanIssuesNativeUnban();
     Runtime_ServerOriginBanNickCannotForgePortalManagedMarker();
     Runtime_ExpiredServerOriginTempBanIsNotEnforced();

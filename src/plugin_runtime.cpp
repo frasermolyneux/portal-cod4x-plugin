@@ -6,6 +6,7 @@
 #include <ctime>
 #include <fstream>
 #include <iomanip>
+#include <limits>
 #include <random>
 #include <regex>
 #include <sstream>
@@ -106,6 +107,103 @@ bool TryReadFile(const std::string& path, std::string& content)
     return true;
 }
 
+// Appends a Unicode code point to the buffer encoded as UTF-8.
+void AppendUtf8CodePoint(std::string& out, std::uint32_t codePoint)
+{
+    if (codePoint <= 0x7F)
+    {
+        out.push_back(static_cast<char>(codePoint));
+    }
+    else if (codePoint <= 0x7FF)
+    {
+        out.push_back(static_cast<char>(0xC0 | (codePoint >> 6)));
+        out.push_back(static_cast<char>(0x80 | (codePoint & 0x3F)));
+    }
+    else if (codePoint <= 0xFFFF)
+    {
+        out.push_back(static_cast<char>(0xE0 | (codePoint >> 12)));
+        out.push_back(static_cast<char>(0x80 | ((codePoint >> 6) & 0x3F)));
+        out.push_back(static_cast<char>(0x80 | (codePoint & 0x3F)));
+    }
+    else
+    {
+        out.push_back(static_cast<char>(0xF0 | (codePoint >> 18)));
+        out.push_back(static_cast<char>(0x80 | ((codePoint >> 12) & 0x3F)));
+        out.push_back(static_cast<char>(0x80 | ((codePoint >> 6) & 0x3F)));
+        out.push_back(static_cast<char>(0x80 | (codePoint & 0x3F)));
+    }
+}
+
+// Parses exactly four hex digits at escaped[pos..pos+4). Returns false (leaving value untouched)
+// when four hex digits are not available so the caller can fall back to literal output.
+bool TryParseUnicodeEscape(std::string_view escaped, std::size_t pos, std::uint16_t& value)
+{
+    if (pos + 4 > escaped.size())
+    {
+        return false;
+    }
+
+    std::uint16_t parsed = 0;
+    for (std::size_t i = 0; i < 4; ++i)
+    {
+        const char c = escaped[pos + i];
+        std::uint16_t digit;
+        if (c >= '0' && c <= '9')
+        {
+            digit = static_cast<std::uint16_t>(c - '0');
+        }
+        else if (c >= 'a' && c <= 'f')
+        {
+            digit = static_cast<std::uint16_t>(c - 'a' + 10);
+        }
+        else if (c >= 'A' && c <= 'F')
+        {
+            digit = static_cast<std::uint16_t>(c - 'A' + 10);
+        }
+        else
+        {
+            return false;
+        }
+
+        parsed = static_cast<std::uint16_t>((parsed << 4) | digit);
+    }
+
+    value = parsed;
+    return true;
+}
+
+// Parses a non-negative decimal player id string into a uint64. Returns false on empty/non-digit
+// input or on overflow; player GUIDs in this plugin are always numeric and within uint64 range.
+bool TryParseUint64(const std::string& value, std::uint64_t& parsed)
+{
+    if (value.empty())
+    {
+        return false;
+    }
+
+    std::uint64_t result = 0;
+    for (const char c : value)
+    {
+        if (c < '0' || c > '9')
+        {
+            return false;
+        }
+
+        const std::uint64_t digit = static_cast<std::uint64_t>(c - '0');
+        // Reject overflow so a malformed/over-long id can never wrap into a plausible-looking
+        // value that produces a false roster match.
+        if (result > (std::numeric_limits<std::uint64_t>::max() - digit) / 10)
+        {
+            return false;
+        }
+
+        result = (result * 10) + digit;
+    }
+
+    parsed = result;
+    return true;
+}
+
 std::string JsonUnescape(std::string_view escaped)
 {
     std::string unescaped;
@@ -138,6 +236,39 @@ std::string JsonUnescape(std::string_view escaped)
             case 't':
                 unescaped.push_back('\t');
                 break;
+            case 'u':
+            {
+                // Decode a \uXXXX escape (e.g. \u0027 -> '). Without this the previous default
+                // branch dropped the backslash and left a literal "u0027" in ban reasons and other
+                // portal-sourced strings.
+                std::uint16_t code = 0;
+                if (!TryParseUnicodeEscape(escaped, i + 1, code))
+                {
+                    // Malformed escape; preserve prior behaviour and emit the 'u' literally.
+                    unescaped.push_back(next);
+                    break;
+                }
+
+                i += 4; // consume the four hex digits
+
+                std::uint32_t codePoint = code;
+                // Combine a UTF-16 surrogate pair: \uD800-\uDBFF followed by \uDC00-\uDFFF.
+                if (code >= 0xD800 && code <= 0xDBFF && i + 2 < escaped.size() &&
+                    escaped[i + 1] == '\\' && escaped[i + 2] == 'u')
+                {
+                    std::uint16_t low = 0;
+                    if (TryParseUnicodeEscape(escaped, i + 3, low) && low >= 0xDC00 && low <= 0xDFFF)
+                    {
+                        codePoint = 0x10000u +
+                            ((static_cast<std::uint32_t>(code - 0xD800) << 10) |
+                             static_cast<std::uint32_t>(low - 0xDC00));
+                        i += 6; // consume "\uXXXX" of the low surrogate
+                    }
+                }
+
+                AppendUtf8CodePoint(unescaped, codePoint);
+                break;
+            }
             default:
                 unescaped.push_back(next);
                 break;
@@ -443,6 +574,12 @@ std::string BuildPlayerGuidKey(std::uint64_t playerId)
 
     return std::to_string(playerId);
 }
+
+// A legacy CoD4x player id encodes the canonical PUID as (4 << 40) | (canonicalPuid >> 24); the
+// low 24 bits of the canonical id are not recoverable from the legacy id alone, which is why the
+// resolver relies on the live roster to recover the full canonical id.
+constexpr std::uint64_t kLegacyCoD4xIdentifierPrefix = 4;
+constexpr std::uint64_t kLegacyCoD4xPayloadMask = (static_cast<std::uint64_t>(1) << 40) - 1;
 }
 
 std::string BuildOnlineBroadcastMessage(std::string_view prefix, std::string_view version)
@@ -1039,6 +1176,61 @@ void PluginRuntime::HandleServerExited(ICod4xHost&)
     connectedPlayers.clear();
 }
 
+std::string PluginRuntime::ResolveBanPlayerGuid(std::uint64_t playerId) const
+{
+    if (playerId == 0)
+    {
+        return {};
+    }
+
+    const std::string rawKey = std::to_string(playerId);
+
+    // cod4x delivers the canonical 64-bit player id to OnPlayerGetBanStatus / GetPlayerId, but the
+    // OnPlayerAddBan/RemoveBan hooks can deliver the shorter legacy id. The portal (and the agent's
+    // ban reconcile) key every ban on the canonical PUID, so normalise a legacy id back to the
+    // canonical form using the connected roster. This lets the agent import a server-side ban
+    // without a fragile prefix search, and lets the plugin evict it once the portal reports it.
+    //
+    // Thread-safety: this reads connectedPlayers without a lock. That is safe because the only
+    // callers (HandlePlayerBanAdded / HandlePlayerBanRemoved, from the OnPlayerAddBan /
+    // OnPlayerRemoveBan engine hooks) run on the main server thread, the same thread that mutates
+    // connectedPlayers via the connect / disconnect / frame handlers. This is deliberately NOT used
+    // by TryFindPlayerBanMessage, whose OnPlayerGetBanStatus caller can run on the authentication
+    // thread where a lock-free roster read would be a data race.
+    //
+    // Because the low 24 bits of the canonical id are discarded when forming the legacy id, two
+    // connected PUIDs that differ only in those bits would derive the same legacy id; the first
+    // roster match wins. Such a collision is vanishingly unlikely and the fallback stays correct.
+    for (const auto& [slot, state] : connectedPlayers)
+    {
+        static_cast<void>(slot);
+        if (state.PlayerGuid.empty())
+        {
+            continue;
+        }
+
+        if (state.PlayerGuid == rawKey)
+        {
+            return state.PlayerGuid; // already the canonical id
+        }
+
+        std::uint64_t canonical = 0;
+        if (!TryParseUint64(state.PlayerGuid, canonical))
+        {
+            continue;
+        }
+
+        const std::uint64_t derivedLegacy =
+            (kLegacyCoD4xIdentifierPrefix << 40) | ((canonical >> 24) & kLegacyCoD4xPayloadMask);
+        if (derivedLegacy == playerId)
+        {
+            return state.PlayerGuid;
+        }
+    }
+
+    return rawKey;
+}
+
 void PluginRuntime::HandlePlayerBanAdded(
     std::uint64_t playerId,
     std::string_view reason,
@@ -1046,7 +1238,7 @@ void PluginRuntime::HandlePlayerBanAdded(
     std::string_view playerName,
     std::int64_t expireUnixSeconds)
 {
-    const std::string playerGuid = BuildPlayerGuidKey(playerId);
+    const std::string playerGuid = ResolveBanPlayerGuid(playerId);
     if (playerGuid.empty())
     {
         return;
@@ -1075,7 +1267,7 @@ void PluginRuntime::HandlePlayerBanAdded(
 
 void PluginRuntime::HandlePlayerBanRemoved(std::uint64_t playerId)
 {
-    const std::string playerGuid = BuildPlayerGuidKey(playerId);
+    const std::string playerGuid = ResolveBanPlayerGuid(playerId);
     if (playerGuid.empty())
     {
         return;
