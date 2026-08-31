@@ -1,14 +1,6 @@
 # Copilot Instructions
 
-> Shared conventions: see [`.github-copilot/.github/instructions/metadata.instructions.md`](../.github-copilot/.github/instructions/metadata.instructions.md) and [`.github-copilot/.github/instructions/workflows.instructions.md`](../.github-copilot/.github/instructions/workflows.instructions.md) for organization baselines.
->
 > **Cloud agents (GitHub Copilot coding agent etc.):** read [`AGENTS.md`](../AGENTS.md) at the repo root first — it is the canonical brief that survives outside the local VS Code multi-root workspace.
-
-## Org conventions via MCP (when available)
-
-If a `frasermolyneux-copilot` MCP server is configured in your client (`~/.copilot/mcp-config.json`, VS Code user `mcp.json`, or an equivalent stdio MCP wire-up), **prefer its catalog tools** over your own assumptions when answering questions about org standards, branching, workflows, Terraform, .NET projects, Azure patterns, or shared library / platform consumption contracts. The catalog source-of-truth lives in `frasermolyneux/.github-copilot` — see `mcp-server/README.md` there for the tool contract.
-
-This is **complementary** to the file-load model: if `./.github-copilot/` is checked out in the runner (per `copilot-setup-steps.yml`), continue to read those files directly. If both are available, prefer MCP for freshness. If no MCP server is configured in your client, treat this section as a no-op and fall back to the file paths above.
 
 ## Project Overview
 
@@ -39,8 +31,7 @@ ctest --test-dir build --output-on-failure --build-config Release
 
 ## Documentation
 
-CoD4x reference docs that shape this repo live in `.github-copilot/docs/cod4x/`, especially:
-
-- `plugin-system.md`
-- `plugin-developer-guide.md`
-- `server-build-and-abi.md`
+- `docs/plugin-development.md` — build modes, versioning, CI artifact naming
+- `docs/plugin-runtime.md` — ABI wiring, startup broadcast, ban diagnostics
+- `docs/plugin-settings-rollout.md` — runtime config contract and Azure source of truth
+- `docs/development-workflows.md` — local prerequisites, CI workflow list

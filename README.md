@@ -1,7 +1,6 @@
 # portal-cod4x-plugin
 [![Build and Test](https://github.com/frasermolyneux/portal-cod4x-plugin/actions/workflows/build-and-test.yml/badge.svg)](https://github.com/frasermolyneux/portal-cod4x-plugin/actions/workflows/build-and-test.yml)
 [![Code Quality](https://github.com/frasermolyneux/portal-cod4x-plugin/actions/workflows/codequality.yml/badge.svg)](https://github.com/frasermolyneux/portal-cod4x-plugin/actions/workflows/codequality.yml)
-[![Copilot Setup Steps](https://github.com/frasermolyneux/portal-cod4x-plugin/actions/workflows/copilot-setup-steps.yml/badge.svg)](https://github.com/frasermolyneux/portal-cod4x-plugin/actions/workflows/copilot-setup-steps.yml)
 [![Dependabot Auto-Merge](https://github.com/frasermolyneux/portal-cod4x-plugin/actions/workflows/dependabot-automerge.yml/badge.svg)](https://github.com/frasermolyneux/portal-cod4x-plugin/actions/workflows/dependabot-automerge.yml)
 [![Deploy Dev](https://github.com/frasermolyneux/portal-cod4x-plugin/actions/workflows/deploy-dev.yml/badge.svg)](https://github.com/frasermolyneux/portal-cod4x-plugin/actions/workflows/deploy-dev.yml)
 [![Deploy Prd](https://github.com/frasermolyneux/portal-cod4x-plugin/actions/workflows/deploy-prd.yml/badge.svg)](https://github.com/frasermolyneux/portal-cod4x-plugin/actions/workflows/deploy-prd.yml)

@@ -36,4 +36,3 @@ ctest --test-dir build --output-on-failure --build-config Release
 - `pr-verify.yml` runs for pull requests and enforces draft-aware validation.
 - `codequality.yml` runs scheduled Monday scans, push-to-main scans, and PR dependency review.
 - `dependabot-automerge.yml` applies org policy and auto-merges safe Dependabot updates.
-- `copilot-setup-steps.yml` prepares cloud coding-agent sessions.
