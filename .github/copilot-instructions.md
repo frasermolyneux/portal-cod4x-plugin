@@ -35,3 +35,7 @@ ctest --test-dir build --output-on-failure --build-config Release
 - `docs/plugin-runtime.md` — ABI wiring, startup broadcast, ban diagnostics
 - `docs/plugin-settings-rollout.md` — runtime config contract and Azure source of truth
 - `docs/development-workflows.md` — local prerequisites, CI workflow list
+
+## Terraform toolchain
+
+Commit each root's `.terraform-version` and `.terraform.lock.hcl`. Select the exact root CLI pin before invoking Terraform; normal initialization uses `-lockfile=readonly`. Regenerate provider selections only in a reviewed dependency-update PR; never commit state, plans, or `.terraform/`.
