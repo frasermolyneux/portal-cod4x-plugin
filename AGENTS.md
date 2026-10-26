@@ -24,7 +24,7 @@ Optional: `clang-format --dry-run --Werror src/*.cpp include/portal_cod4x/*.h te
 terraform -chdir=terraform fmt -check -recursive
 ```
 
-Never run `terraform init -lockfile=readonly/plan/apply/destroy`; that happens only via `deploy-dev.yml`, `deploy-prd.yml`, `destroy-environment.yml` under OIDC.
+Never run backend initialization, planning, apply, or destroy locally; those operations happen only via `deploy-dev.yml`, `deploy-prd.yml`, `destroy-environment.yml` under OIDC. Shared main-only CI validation may use `init -backend=false -lockfile=readonly` and `validate` without Azure credentials, state access, or planning.
 
 ## Artifact ownership
 
@@ -34,5 +34,5 @@ CI builds Linux (`.so`) / Windows (`.dll`) binaries and uploads them as GitHub A
 
 - ❌ Hard-code runtime secrets; config is cvar/env/local-JSON only (`docs/plugin-settings-rollout.md`).
 - ❌ Create or modify `portal-environments` resources/config from this repo — read-only remote state consumption only.
-- ❌ Run `terraform init -lockfile=readonly/plan/apply/destroy`, or trigger deploy/release/destroy workflow runs.
+- ❌ Run backend initialization, planning, apply, or destroy locally, or trigger deploy/release/destroy workflow runs.
 - ❌ Change workflow schedules, Terraform resource naming, or role-assignment scopes without the task explicitly calling for it.
