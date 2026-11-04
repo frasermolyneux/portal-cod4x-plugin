@@ -85,7 +85,7 @@ jobs:
 
       - name: Initialize Terraform output context (Production)
         if: env.HAS_RELEASE_TAG == 'true'
-        uses: frasermolyneux/actions/terraform-output@terraform-output/v2.0.0
+        uses: frasermolyneux/actions/terraform-output@terraform-output/v2.0.1
         with:
           perform-checkout: "false"
           terraform-folder: "terraform"
