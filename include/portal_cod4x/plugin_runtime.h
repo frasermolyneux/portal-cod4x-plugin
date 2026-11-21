@@ -211,10 +211,11 @@ private:
     bool ingestConfigWarningLogged = false;
     std::string ingestBatchQueueName;
     std::string ingestBatchPayload;
-    std::vector<std::size_t> ingestBatchIndices;
+    std::vector<std::string> ingestBatchMessageIds;
     std::deque<BufferedEvent> bufferedEvents;
     std::unordered_map<int, ConnectedPlayerState> connectedPlayers;
     std::uint64_t nextConnectionGeneration = 0;
+    std::string producerEpoch;
 
     // Player GUIDs for which a player-connected event has already been emitted this session.
     // Keyed by GUID (not slot) so it survives the map-rotation boundary (OnExitLevel clears the
@@ -318,8 +319,9 @@ private:
     void BufferEvent(std::string queueName, std::string payloadJson, std::string messageId, std::int64_t nowUnixSeconds);
     void PruneBufferedEvents(ICod4xHost& host, std::int64_t nowUnixSeconds);
     std::vector<std::size_t> BuildBatchIndicesForQueue(const std::string& queueName, std::size_t maxEvents, std::size_t maxBytes) const;
-    void DropBufferedEventsByIndex(const std::vector<std::size_t>& indices);
+    void DropBufferedEventsById(const std::vector<std::string>& messageIds);
     std::string BuildBaseEventPrefix(std::int64_t nowUnixSeconds, const std::string& messageId, long long sequenceId) const;
+    std::string BuildPlaytimeMetadata(std::int64_t nowUnixSeconds, const std::string& messageId, long long sequenceId, int timestampQuality, int rosterCompleteness) const;
     long long NextSequenceId();
     static std::string GenerateMessageId();
     static std::string JsonEscape(std::string_view value);

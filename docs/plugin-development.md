@@ -18,6 +18,24 @@ Startup broadcast details:
 
 Runtime logic is isolated in `plugin_runtime` and `plugin_exports` modules with unit-test coverage for runtime behavior and callback bridging.
 
+Player connect, disconnect, map change and status events include additive playtime metadata. Observation IDs
+are the existing message IDs and remain stable during in-memory retries; producer timestamps use the host's
+UTC wall clock. The queue is memory-only: a plugin or server restart loses unsent events, and no spool
+replays them. It holds at most 1,000 events; at capacity, new chat is discarded and other events evict a
+buffered chat if available, otherwise the oldest event. An in-flight event can be evicted before its result
+is known. Events are also discarded after eight failed attempts or 15 minutes. A retry retains its observation
+ID while buffered, but sequence numbers are scoped to a producer epoch and do not provide durable replay.
+Consequently, a missing join, disconnect or map change can leave playtime or map attribution incomplete;
+later partial snapshots cannot prove absence or recover unobserved history. Report this gap in coverage
+rather than treating measured time as complete.
+Status snapshots are always marked partial: the current host interface cannot reliably distinguish empty
+slots, bots and unresolved players, so they must not be used to infer absence or treated as proof that
+individual entries are human. Bot creation can bypass `OnPlayerConnect`; the current adapter does not read
+the host's per-client state or bot flag, so player bot classification is unknown. The upstream SDK exposes
+client state, but this repository does not pin a matching deployed host or verify its client layout; handler
+version 4.000 alone does not establish that compatibility. Callback timestamps reflect when the plugin
+observes the event; hot-loaded players are not credited for earlier time.
+
 Phase 2 settings rollout guidance is documented in `docs/plugin-settings-rollout.md`, including config generation and smoke validation.
 
 Local config generation helper:
