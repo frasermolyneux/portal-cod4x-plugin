@@ -18,6 +18,44 @@ Startup broadcast details:
 
 Runtime logic is isolated in `plugin_runtime` and `plugin_exports` modules with unit-test coverage for runtime behavior and callback bridging.
 
+Player connect, disconnect, map change and status callbacks publish separate playtime observations to
+`/ingest/events/playtime-observation` as well as the existing legacy events. The playtime payload contains
+only the player identity fields required by the consumer, not IP addresses or chat. Observation IDs
+are the message IDs and remain stable during in-memory retries; producer timestamps use the host's
+UTC wall clock. The queue is memory-only: a plugin or server restart loses unsent events, and no spool
+replays them. It holds at most 1,000 events; at capacity, new chat is discarded and other events evict a
+buffered chat if available, otherwise the oldest event. An in-flight event can be evicted before its result
+is known. Events are also discarded after eight failed attempts or 15 minutes. A retry retains its observation
+ID while buffered, but sequence numbers are scoped to a producer epoch and do not provide durable replay.
+Consequently, a missing join, disconnect or map change can leave playtime or map attribution incomplete;
+later partial snapshots cannot prove absence or recover unobserved history. Report this gap in coverage
+rather than treating measured time as complete.
+Playtime roster observations include `playtimeCoverage` with the producer's UTC start time and cumulative
+counts of dedicated playtime observations discarded for capacity, attempts or age during the accompanying producer epoch.
+Each discard is counted once; attempt exhaustion takes precedence if both thresholds are exceeded.
+The observation's producer epoch scopes these counters. Its `eventPublishedUtc` is stamped on the
+first publish attempt and retained on retries; the consumer uses it as the coverage report time.
+These counts report loss of local retention, not confirmed downstream loss: an in-flight request may
+already have been accepted. Counters reset on restart, and losses can occur before a status is delivered,
+so zero counts and a new epoch do not establish complete coverage.
+Status snapshots are always marked partial: the current host interface cannot reliably distinguish empty
+slots, bots and unresolved players, so they must not be used to infer absence or treated as proof that
+individual entries are human. Bot creation can bypass `OnPlayerConnect`; the current adapter does not read
+the host's per-client state or bot flag, so player bot classification is unknown. The upstream SDK exposes
+client state, but this repository does not pin a matching deployed host or verify its client layout; handler
+version 4.000 alone does not establish that compatibility. Callback timestamps reflect when the plugin
+observes the event; hot-loaded players are not credited for earlier time.
+If a disconnect is missed, a same-player reconnect in the same slot cannot be distinguished safely
+from a late connect callback; its join can be suppressed and the resulting coverage remains uncertain.
+A zero-ID slot in a partial roster does not prove a disconnect, and the local discard counters do not
+count callbacks the plugin never observed or joins suppressed by this ambiguity.
+Resolved roster identities prevent duplicate joins on map re-entry and are retained across level exit
+for disconnect callbacks. If a later snapshot cannot resolve the slot or identifies a different player,
+the previous identity is not used to invent a leave; missed callbacks can still leave coverage uncertain.
+The plugin is the intended CoD4x playtime source; servers without an active plugin have a coverage gap.
+Deploy the ingest route and consumer before releasing the plugin. No production host coverage or
+callback freshness has been verified here.
+
 Phase 2 settings rollout guidance is documented in `docs/plugin-settings-rollout.md`, including config generation and smoke validation.
 
 Local config generation helper:

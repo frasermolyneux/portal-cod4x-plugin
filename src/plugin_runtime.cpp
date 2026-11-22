@@ -39,8 +39,14 @@ constexpr std::string_view kQueueChatMessage = "chat-message";
 constexpr std::string_view kQueueServerConnected = "server-connected";
 constexpr std::string_view kQueueMapChange = "map-change";
 constexpr std::string_view kQueueServerStatus = "server-status";
+constexpr std::string_view kQueuePlaytimeObservation = "playtime-observation";
 constexpr std::int64_t kCrossCallbackDedupWindowSeconds = 1;
 constexpr std::string_view kPortalPluginHealthCommandPrefix = "!portalpluginhealth";
+
+bool IsPlaytimeQueue(std::string_view queueName)
+{
+    return queueName == kQueuePlaytimeObservation;
+}
 
 std::string Trim(std::string value)
 {
@@ -715,11 +721,16 @@ int PluginRuntime::Initialize(ICod4xHost& host, std::string_view version, std::s
     const std::string normalizedVersion = version.empty() ? "0.0.0-unknown" : std::string(version);
     chatPrefix = prefix.empty() ? std::string(kDefaultBotPrefix) : std::string(prefix);
     pluginVersion = normalizedVersion;
+    producerEpoch = GenerateMessageId();
 
     LogInfo(host, "Portal Plugin is online (version " + normalizedVersion + ")");
     host.BroadcastChat(onlineMessage);
 
     const std::int64_t nowUnixSeconds = host.GetUnixTimeSeconds();
+    producerStartedUnixSeconds = nowUnixSeconds;
+    droppedPlaytimeCapacity = 0;
+    droppedPlaytimeAttempts = 0;
+    droppedPlaytimeAge = 0;
     TryLoadConfig(host, nowUnixSeconds);
     nextServerStatusUnixSeconds = nowUnixSeconds + kServerStatusIntervalSeconds;
 
@@ -801,13 +812,20 @@ void PluginRuntime::HandlePlayerConnected(ICod4xHost& host, int slot)
     }
 
     const std::uint64_t playerId = host.GetPlayerId(slot);
+    auto previousPlaytimePlayer = playtimePlayersBySlot.find(slot);
     if (playerId == 0)
     {
+        playtimePlayersBySlot[slot].IdentityResolved = false;
         return;
     }
 
     const std::int64_t nowUnixSeconds = host.GetUnixTimeSeconds();
     const std::string currentGuid = std::to_string(playerId);
+    if (previousPlaytimePlayer != playtimePlayersBySlot.end() &&
+        previousPlaytimePlayer->second.PlayerGuid != currentGuid)
+    {
+        previousPlaytimePlayer->second = {currentGuid, {}, false};
+    }
 
     // Always keep the roster state in sync with the live slot, even for a player who carried across
     // a map rotation. OnClientEnterWorld re-fires for every player on each map rotation (OnExitLevel
@@ -829,9 +847,31 @@ void PluginRuntime::HandlePlayerConnected(ICod4xHost& host, int slot)
     playerState.SteamId = host.GetPlayerSteamId(slot);
     playerState.Username = Trim(host.GetPlayerName(slot));
     playerState.Score = host.GetPlayerScore(slot);
+    if (playerState.Username.empty() && playtimePlayersBySlot.find(slot) == playtimePlayersBySlot.end())
+    {
+        playtimePlayersBySlot[slot] = {currentGuid, {}, false};
+    }
     if (playerState.ConnectedAtUnixSeconds == 0)
     {
         playerState.ConnectedAtUnixSeconds = nowUnixSeconds;
+    }
+
+    std::string playtimeFields;
+    if (!playerState.Username.empty())
+    {
+        const auto previous = playtimePlayersBySlot.find(slot);
+        if (previous == playtimePlayersBySlot.end() || previous->second.PlayerGuid != currentGuid ||
+            previous->second.Username.empty())
+        {
+            playtimeFields = ",\"playerGuid\":\"" + JsonEscape(currentGuid) +
+                "\",\"username\":\"" + JsonEscape(playerState.Username) +
+                "\",\"slotId\":" + std::to_string(slot) + ",\"isBot\":null";
+            if (playerState.SteamId != 0)
+            {
+                playtimeFields += ",\"steamId\":\"" + std::to_string(playerState.SteamId) + "\"";
+            }
+        }
+        playtimePlayersBySlot[slot] = {currentGuid, playerState.Username, true};
     }
 
     // playerState.IpAddress may be empty when this slot never fired OnPlayerConnect under the
@@ -845,6 +885,10 @@ void PluginRuntime::HandlePlayerConnected(ICod4xHost& host, int slot)
     // re-emits.
     if (connectEmittedGuids.count(currentGuid) != 0)
     {
+        if (!playtimeFields.empty())
+        {
+            BufferPlaytimeObservation(nowUnixSeconds, 1, playtimeFields);
+        }
         return;
     }
 
@@ -868,6 +912,10 @@ void PluginRuntime::HandlePlayerConnected(ICod4xHost& host, int slot)
         nowUnixSeconds);
 
     connectEmittedGuids.insert(currentGuid);
+    if (!playtimeFields.empty())
+    {
+        BufferPlaytimeObservation(nowUnixSeconds, 1, playtimeFields);
+    }
     QueueVpnEvaluation(playerState);
 }
 
@@ -881,18 +929,37 @@ void PluginRuntime::HandleClientAuthorized(ICod4xHost& host)
     const std::int64_t nowUnixSeconds = host.GetUnixTimeSeconds();
     for (auto& [slot, state] : connectedPlayers)
     {
+        const std::uint64_t livePlayerId = host.GetPlayerId(slot);
+        const std::string liveGuid = livePlayerId == 0 ? std::string() : std::to_string(livePlayerId);
+        if (!liveGuid.empty())
+        {
+            const auto playtimePlayer = playtimePlayersBySlot.find(slot);
+            if (playtimePlayer != playtimePlayersBySlot.end() &&
+                playtimePlayer->second.PlayerGuid != liveGuid)
+            {
+                playtimePlayer->second = {liveGuid, {}, false};
+            }
+        }
         if (state.PlayerGuid.empty())
         {
-            const std::uint64_t playerId = host.GetPlayerId(slot);
-            if (playerId != 0)
+            if (!liveGuid.empty())
             {
-                state.PlayerGuid = std::to_string(playerId);
+                state.PlayerGuid = liveGuid;
             }
         }
 
         if (state.Username.empty())
         {
             state.Username = Trim(host.GetPlayerName(slot));
+        }
+
+        auto playtimePlayer = playtimePlayersBySlot.find(slot);
+        if (!liveGuid.empty() && state.PlayerGuid == liveGuid && !state.Username.empty() &&
+            playtimePlayer != playtimePlayersBySlot.end() &&
+            (playtimePlayer->second.PlayerGuid.empty() || playtimePlayer->second.PlayerGuid == liveGuid))
+        {
+            playtimePlayer->second.PlayerGuid = liveGuid;
+            playtimePlayer->second.IdentityResolved = true;
         }
 
         if (state.SteamId == 0)
@@ -958,6 +1025,38 @@ void PluginRuntime::HandlePlayerDisconnected(ICod4xHost& host, int slot)
         state.Username = Trim(host.GetPlayerName(slot));
     }
 
+    const auto playtimePlayer = playtimePlayersBySlot.find(slot);
+    if (playtimePlayer != playtimePlayersBySlot.end())
+    {
+        const auto livePlayerId = host.GetPlayerId(slot);
+        const auto& cached = playtimePlayer->second;
+        const bool sameState = state.PlayerGuid.empty() || state.PlayerGuid == cached.PlayerGuid;
+        const std::string& username = cached.Username.empty() && state.PlayerGuid == cached.PlayerGuid
+            ? state.Username : cached.Username;
+        if ((cached.IdentityResolved || livePlayerId != 0) && sameState &&
+            !cached.PlayerGuid.empty() && !username.empty() &&
+            (livePlayerId == 0 || std::to_string(livePlayerId) == cached.PlayerGuid))
+        {
+            const auto nowUnixSeconds = host.GetUnixTimeSeconds();
+            BufferPlaytimeObservation(nowUnixSeconds, 2,
+                ",\"playerGuid\":\"" + JsonEscape(cached.PlayerGuid) +
+                    "\",\"username\":\"" + JsonEscape(username) +
+                    "\",\"slotId\":" + std::to_string(slot) + ",\"isBot\":null");
+        }
+        playtimePlayersBySlot.erase(playtimePlayer);
+    }
+    else if (!state.PlayerGuid.empty() && !state.Username.empty())
+    {
+        const auto livePlayerId = host.GetPlayerId(slot);
+        if (livePlayerId == 0 || std::to_string(livePlayerId) == state.PlayerGuid)
+        {
+            const auto nowUnixSeconds = host.GetUnixTimeSeconds();
+            BufferPlaytimeObservation(nowUnixSeconds, 2,
+                ",\"playerGuid\":\"" + JsonEscape(state.PlayerGuid) +
+                    "\",\"username\":\"" + JsonEscape(state.Username) +
+                    "\",\"slotId\":" + std::to_string(slot) + ",\"isBot\":null");
+        }
+    }
     if (state.PlayerGuid.empty() || state.Username.empty())
     {
         return;
@@ -1142,6 +1241,14 @@ void PluginRuntime::HandleServerSpawned(ICod4xHost& host)
         BuildMapChangePayload(nowUnixSeconds, mapChangeMessageId, GetMapName(host), GetGameName(host)),
         mapChangeMessageId,
         nowUnixSeconds);
+
+    {
+        const auto mapName = GetMapName(host);
+        if (mapName != "unknown")
+        {
+            BufferPlaytimeObservation(nowUnixSeconds, 3, ",\"mapName\":\"" + JsonEscape(mapName) + "\"");
+        }
+    }
 
     nextServerStatusUnixSeconds = nowUnixSeconds;
 }
@@ -1553,11 +1660,11 @@ void PluginRuntime::AdvanceIngest(ICod4xHost& host, std::int64_t nowUnixSeconds)
         {
             if (response.StatusCode >= 200 && response.StatusCode < 300)
             {
-                DropBufferedEventsByIndex(ingestBatchIndices);
+                DropBufferedEventsById(ingestBatchMessageIds);
                 LogDebug(
                     host,
                     "ingest batch POST succeeded" + BuildIngestRequestContext(nowUnixSeconds));
-                ingestBatchIndices.clear();
+                ingestBatchMessageIds.clear();
                 ingestBatchQueueName.clear();
                 ingestBatchPayload.clear();
                 ingestConsecutiveFailureCount = 0;
@@ -1566,11 +1673,11 @@ void PluginRuntime::AdvanceIngest(ICod4xHost& host, std::int64_t nowUnixSeconds)
                 return;
             }
 
-            for (const std::size_t index : ingestBatchIndices)
+            for (auto& event : bufferedEvents)
             {
-                if (index < bufferedEvents.size())
+                if (std::find(ingestBatchMessageIds.begin(), ingestBatchMessageIds.end(), event.MessageId) != ingestBatchMessageIds.end())
                 {
-                    bufferedEvents[index].AttemptCount++;
+                    event.AttemptCount++;
                 }
             }
 
@@ -1583,7 +1690,7 @@ void PluginRuntime::AdvanceIngest(ICod4xHost& host, std::int64_t nowUnixSeconds)
             nextIngestAttemptUnixSeconds = nowUnixSeconds + backoffSeconds;
             LogError(host, "ingest batch POST returned HTTP " + std::to_string(response.StatusCode) + BuildIngestRequestContext(nowUnixSeconds));
 
-            ingestBatchIndices.clear();
+            ingestBatchMessageIds.clear();
             ingestBatchQueueName.clear();
             ingestBatchPayload.clear();
             ingestStage = IngestStage::Idle;
@@ -1611,22 +1718,37 @@ bool PluginRuntime::StartIngestBatchRequest(ICod4xHost& host, std::int64_t nowUn
     }
 
     ingestBatchQueueName = bufferedEvents.front().QueueName;
-    ingestBatchIndices = BuildBatchIndicesForQueue(ingestBatchQueueName, kIngestMaxBatchEvents, kIngestMaxBatchBytes);
-    if (ingestBatchIndices.empty())
+    const auto indices = BuildBatchIndicesForQueue(ingestBatchQueueName, kIngestMaxBatchEvents, kIngestMaxBatchBytes);
+    if (indices.empty())
     {
         return false;
     }
 
     ingestBatchPayload.clear();
     ingestBatchPayload.push_back('[');
-    for (std::size_t i = 0; i < ingestBatchIndices.size(); ++i)
+    ingestBatchMessageIds.clear();
+    for (std::size_t i = 0; i < indices.size(); ++i)
     {
         if (i > 0)
         {
             ingestBatchPayload.push_back(',');
         }
 
-        ingestBatchPayload += StampPublishedUtc(bufferedEvents[ingestBatchIndices[i]].PayloadJson, nowUnixSeconds);
+        auto& event = bufferedEvents[indices[i]];
+        ingestBatchMessageIds.push_back(event.MessageId);
+        if (event.QueueName == kQueuePlaytimeObservation)
+        {
+            if (!event.Published)
+            {
+                event.PayloadJson = StampPublishedUtc(std::move(event.PayloadJson), nowUnixSeconds);
+                event.Published = true;
+            }
+            ingestBatchPayload += event.PayloadJson;
+        }
+        else
+        {
+            ingestBatchPayload += StampPublishedUtc(event.PayloadJson, nowUnixSeconds);
+        }
     }
 
     ingestBatchPayload.push_back(']');
@@ -1639,7 +1761,7 @@ bool PluginRuntime::StartIngestBatchRequest(ICod4xHost& host, std::int64_t nowUn
         host,
         "starting ingest batch POST to " + requestUrl +
             " queue=" + ingestBatchQueueName +
-            " eventCount=" + std::to_string(ingestBatchIndices.size()) +
+            " eventCount=" + std::to_string(ingestBatchMessageIds.size()) +
             " payloadBytes=" + std::to_string(ingestBatchPayload.size()));
 
     ingestRequest = host.BeginHttpRequest(requestUrl, "POST", ingestBatchPayload, headers);
@@ -1678,7 +1800,7 @@ std::string PluginRuntime::BuildIngestRequestContext(std::int64_t nowUnixSeconds
             context += " queue=" + ingestBatchQueueName;
         }
 
-        context += " eventCount=" + std::to_string(ingestBatchIndices.size());
+        context += " eventCount=" + std::to_string(ingestBatchMessageIds.size());
         context += " payloadBytes=" + std::to_string(ingestBatchPayload.size());
 
         if (loadedConfig.has_value() && !loadedConfig->IngestBaseUrl.empty() && !ingestBatchQueueName.empty())
@@ -1705,11 +1827,11 @@ void PluginRuntime::AbortIngest(ICod4xHost& host, std::int64_t nowUnixSeconds, s
 
     if (ingestStage == IngestStage::PostingBatch)
     {
-        for (const std::size_t index : ingestBatchIndices)
+        for (auto& event : bufferedEvents)
         {
-            if (index < bufferedEvents.size())
+            if (std::find(ingestBatchMessageIds.begin(), ingestBatchMessageIds.end(), event.MessageId) != ingestBatchMessageIds.end())
             {
-                bufferedEvents[index].AttemptCount++;
+                event.AttemptCount++;
             }
         }
     }
@@ -1719,7 +1841,7 @@ void PluginRuntime::AbortIngest(ICod4xHost& host, std::int64_t nowUnixSeconds, s
     const std::int64_t backoffSeconds = static_cast<std::int64_t>(
         std::min<std::size_t>(60, static_cast<std::size_t>(1) << std::min<std::size_t>(6, ingestConsecutiveFailureCount)));
     nextIngestAttemptUnixSeconds = nowUnixSeconds + backoffSeconds;
-    ingestBatchIndices.clear();
+    ingestBatchMessageIds.clear();
     ingestBatchQueueName.clear();
     ingestBatchPayload.clear();
 
@@ -2232,6 +2354,11 @@ void PluginRuntime::FlushServerStatusSnapshot(ICod4xHost& host, std::int64_t now
         {
             // Empty slot or bot (bots report id 0) — drop any stale entry for this slot.
             connectedPlayers.erase(slot);
+            const auto playtimePlayer = playtimePlayersBySlot.find(slot);
+            if (playtimePlayer != playtimePlayersBySlot.end())
+            {
+                playtimePlayer->second.IdentityResolved = false;
+            }
             continue;
         }
 
@@ -2252,6 +2379,15 @@ void PluginRuntime::FlushServerStatusSnapshot(ICod4xHost& host, std::int64_t now
         if (state.Username.empty())
         {
             state.Username = Trim(host.GetPlayerName(slot));
+        }
+        auto playtimePlayer = playtimePlayersBySlot.find(slot);
+        if (playtimePlayer != playtimePlayersBySlot.end() && playtimePlayer->second.PlayerGuid != currentGuid)
+        {
+            playtimePlayer->second = {currentGuid, {}, false};
+        }
+        if (!state.Username.empty())
+        {
+            playtimePlayersBySlot[slot] = {currentGuid, state.Username, true};
         }
         if (state.SteamId == 0)
         {
@@ -2283,6 +2419,42 @@ void PluginRuntime::FlushServerStatusSnapshot(ICod4xHost& host, std::int64_t now
         BuildServerStatusPayload(nowUnixSeconds, messageId, host),
         messageId,
         nowUnixSeconds);
+    {
+        std::string fields = ",\"players\":[";
+        bool first = true;
+        std::vector<int> slots;
+        for (const auto& [slot, state] : connectedPlayers)
+        {
+            if (!state.PlayerGuid.empty() && !state.Username.empty())
+            {
+                slots.push_back(slot);
+            }
+        }
+        std::sort(slots.begin(), slots.end());
+        for (int slot : slots)
+        {
+            const auto& player = connectedPlayers.at(slot);
+            if (!first)
+            {
+                fields += ",";
+            }
+            first = false;
+            fields += "{\"playerGuid\":\"" + JsonEscape(player.PlayerGuid) +
+                "\",\"username\":\"" + JsonEscape(player.Username) +
+                "\",\"slotId\":" + std::to_string(slot) + ",\"isBot\":null}";
+        }
+        fields += "]";
+        const auto mapName = GetMapName(host);
+        if (mapName != "unknown")
+        {
+            fields += ",\"mapName\":\"" + JsonEscape(mapName) + "\"";
+        }
+        fields += ",\"playtimeCoverage\":{\"producerStartedUtc\":\"" + ToIso8601Utc(producerStartedUnixSeconds) +
+            "\",\"droppedCapacity\":" + std::to_string(droppedPlaytimeCapacity) +
+            ",\"droppedAttempts\":" + std::to_string(droppedPlaytimeAttempts) +
+            ",\"droppedAge\":" + std::to_string(droppedPlaytimeAge) + "}";
+        BufferPlaytimeObservation(nowUnixSeconds, 4, fields);
+    }
 }
 
 std::string PluginRuntime::BuildPlayerConnectedPayload(
@@ -2294,12 +2466,15 @@ std::string PluginRuntime::BuildPlayerConnectedPayload(
     const std::string& ipAddress,
     int slotId)
 {
-    std::string payload = BuildBaseEventPrefix(nowUnixSeconds, messageId, NextSequenceId());
+    const auto sequenceId = NextSequenceId();
+    std::string payload = BuildBaseEventPrefix(nowUnixSeconds, messageId, sequenceId);
+    payload += BuildPlaytimeMetadata(nowUnixSeconds, messageId, sequenceId, 2, 0);
     payload += ",\"playerGuid\":\"" + JsonEscape(playerGuid) + "\"";
     payload += ",\"steamId\":\"" + std::to_string(steamId) + "\"";
     payload += ",\"username\":\"" + JsonEscape(username) + "\"";
     payload += ",\"ipAddress\":\"" + JsonEscape(ipAddress) + "\"";
     payload += ",\"slotId\":" + std::to_string(slotId);
+    payload += ",\"isBot\":null";
     payload += "}";
     return payload;
 }
@@ -2311,10 +2486,13 @@ std::string PluginRuntime::BuildPlayerDisconnectedPayload(
     const std::string& username,
     int slotId)
 {
-    std::string payload = BuildBaseEventPrefix(nowUnixSeconds, messageId, NextSequenceId());
+    const auto sequenceId = NextSequenceId();
+    std::string payload = BuildBaseEventPrefix(nowUnixSeconds, messageId, sequenceId);
+    payload += BuildPlaytimeMetadata(nowUnixSeconds, messageId, sequenceId, 2, 0);
     payload += ",\"playerGuid\":\"" + JsonEscape(playerGuid) + "\"";
     payload += ",\"username\":\"" + JsonEscape(username) + "\"";
     payload += ",\"slotId\":" + std::to_string(slotId);
+    payload += ",\"isBot\":null";
     payload += "}";
     return payload;
 }
@@ -2350,7 +2528,9 @@ std::string PluginRuntime::BuildMapChangePayload(
     const std::string& mapName,
     const std::string& gameName)
 {
-    std::string payload = BuildBaseEventPrefix(nowUnixSeconds, messageId, NextSequenceId());
+    const auto sequenceId = NextSequenceId();
+    std::string payload = BuildBaseEventPrefix(nowUnixSeconds, messageId, sequenceId);
+    payload += BuildPlaytimeMetadata(nowUnixSeconds, messageId, sequenceId, 2, 0);
     payload += ",\"mapName\":\"" + JsonEscape(mapName) + "\"";
     payload += ",\"gameName\":\"" + JsonEscape(gameName) + "\"";
     payload += "}";
@@ -2371,7 +2551,9 @@ std::string PluginRuntime::BuildServerStatusPayload(std::int64_t nowUnixSeconds,
 
     std::sort(sortedSlots.begin(), sortedSlots.end());
 
-    std::string payload = BuildBaseEventPrefix(nowUnixSeconds, messageId, NextSequenceId());
+    const auto sequenceId = NextSequenceId();
+    std::string payload = BuildBaseEventPrefix(nowUnixSeconds, messageId, sequenceId);
+    payload += BuildPlaytimeMetadata(nowUnixSeconds, messageId, sequenceId, 3, 2);
     payload += ",\"mapName\":\"" + JsonEscape(GetMapName(host)) + "\"";
     payload += ",\"gameName\":\"" + JsonEscape(GetGameName(host)) + "\"";
     payload += ",\"playerCount\":" + std::to_string(sortedSlots.size());
@@ -2389,6 +2571,7 @@ std::string PluginRuntime::BuildServerStatusPayload(std::int64_t nowUnixSeconds,
         payload += ",\"username\":\"" + JsonEscape(state.Username) + "\"";
         payload += ",\"ipAddress\":\"" + JsonEscape(state.IpAddress) + "\"";
         payload += ",\"slotId\":" + std::to_string(state.SlotId);
+        payload += ",\"isBot\":null";
         payload += ",\"connectedAtUtc\":\"" + ToIso8601Utc(state.ConnectedAtUnixSeconds) + "\"";
         payload += ",\"score\":" + std::to_string(state.Score);
         payload += ",\"ping\":0,\"rate\":0}";
@@ -2469,6 +2652,10 @@ void PluginRuntime::BufferEvent(std::string queueName, std::string payloadJson, 
         }
         else if (!bufferedEvents.empty())
         {
+            if (IsPlaytimeQueue(bufferedEvents.front().QueueName))
+            {
+                ++droppedPlaytimeCapacity;
+            }
             bufferedEvents.pop_front();
         }
     }
@@ -2510,11 +2697,18 @@ void PluginRuntime::PruneBufferedEvents(ICod4xHost& host, std::int64_t nowUnixSe
         if (exceededAttempts)
         {
             droppedByAttempts++;
+            if (IsPlaytimeQueue(it->QueueName))
+            {
+                ++droppedPlaytimeAttempts;
+            }
         }
-
-        if (exceededAge)
+        else
         {
             droppedByAge++;
+            if (IsPlaytimeQueue(it->QueueName))
+            {
+                ++droppedPlaytimeAge;
+            }
         }
 
         it = bufferedEvents.erase(it);
@@ -2564,23 +2758,11 @@ std::vector<std::size_t> PluginRuntime::BuildBatchIndicesForQueue(
     return indices;
 }
 
-void PluginRuntime::DropBufferedEventsByIndex(const std::vector<std::size_t>& indices)
+void PluginRuntime::DropBufferedEventsById(const std::vector<std::string>& messageIds)
 {
-    if (indices.empty())
-    {
-        return;
-    }
-
-    std::vector<std::size_t> sortedIndices = indices;
-    std::sort(sortedIndices.begin(), sortedIndices.end(), std::greater<>());
-
-    for (const std::size_t index : sortedIndices)
-    {
-        if (index < bufferedEvents.size())
-        {
-            bufferedEvents.erase(bufferedEvents.begin() + static_cast<std::ptrdiff_t>(index));
-        }
-    }
+    std::erase_if(bufferedEvents, [&](const BufferedEvent& event) {
+        return std::find(messageIds.begin(), messageIds.end(), event.MessageId) != messageIds.end();
+    });
 }
 
 std::string PluginRuntime::BuildBaseEventPrefix(std::int64_t nowUnixSeconds, const std::string& messageId, long long sequenceId) const
@@ -2596,6 +2778,30 @@ std::string PluginRuntime::BuildBaseEventPrefix(std::int64_t nowUnixSeconds, con
     return payload;
 }
 
+std::string PluginRuntime::BuildPlaytimeMetadata(
+    std::int64_t nowUnixSeconds, const std::string& messageId, long long sequenceId,
+    int timestampQuality, int rosterCompleteness) const
+{
+    return ",\"playtime\":{\"observationId\":\"" + JsonEscape(messageId) +
+        "\",\"eventUtc\":\"" + ToIso8601Utc(nowUnixSeconds) +
+        "\",\"timestampQuality\":" + std::to_string(timestampQuality) +
+        ",\"freshness\":1" +
+        ",\"producerEpoch\":\"" + JsonEscape(producerEpoch) +
+        "\",\"producerSequence\":" + std::to_string(sequenceId) +
+        ",\"connectionCorrelationId\":null,\"rosterCompleteness\":" + std::to_string(rosterCompleteness) + "}";
+}
+
+void PluginRuntime::BufferPlaytimeObservation(std::int64_t nowUnixSeconds, int kind, const std::string& fields)
+{
+    const auto messageId = GenerateMessageId();
+    const auto sequenceId = NextSequenceId();
+    auto payload = BuildBaseEventPrefix(nowUnixSeconds, messageId, sequenceId);
+    payload += ",\"kind\":" + std::to_string(kind);
+    payload += BuildPlaytimeMetadata(nowUnixSeconds, messageId, sequenceId, kind == 4 ? 3 : 2, kind == 4 ? 2 : 0);
+    payload += fields + "}";
+    BufferEvent(std::string(kQueuePlaytimeObservation), std::move(payload), messageId, nowUnixSeconds);
+}
+
 long long PluginRuntime::NextSequenceId()
 {
     return nextSequenceId++;
@@ -2603,7 +2809,7 @@ long long PluginRuntime::NextSequenceId()
 
 std::string PluginRuntime::GenerateMessageId()
 {
-    static std::mt19937_64 generator(std::random_device{}());
+    std::random_device source;
     static constexpr char kHexChars[] = "0123456789abcdef";
 
     std::uniform_int_distribution<unsigned int> distribution(0, 15);
@@ -2621,7 +2827,7 @@ std::string PluginRuntime::GenerateMessageId()
 
         for (int i = 0; i < groups[groupIndex]; ++i)
         {
-            output.push_back(kHexChars[distribution(generator)]);
+            output.push_back(kHexChars[distribution(source)]);
         }
     }
 
@@ -2845,7 +3051,7 @@ std::vector<std::string> PluginRuntime::BuildPortalPluginHealthReportLines(std::
             "ingestRequestUrl=" + loadedConfig->IngestBaseUrl + QueueEndpointPath(loadedConfig->IngestBaseUrl, ingestBatchQueueName) +
             " ingestElapsedSeconds=" + std::to_string(elapsedSeconds) +
             " ingestBatchQueue=" + ingestBatchQueueName +
-            " ingestBatchEventCount=" + std::to_string(ingestBatchIndices.size()));
+            " ingestBatchEventCount=" + std::to_string(ingestBatchMessageIds.size()));
     }
 
     lines.push_back(

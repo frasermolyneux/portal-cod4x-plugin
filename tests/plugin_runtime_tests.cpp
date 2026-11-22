@@ -94,6 +94,11 @@ public:
             pending->HasResponse = true;
             pending->Response = it->second;
         }
+        else if (url == "https://example.test/ingest/events/playtime-observation")
+        {
+            pending->HasResponse = true;
+            pending->Response = {202, ""};
+        }
 
         return static_cast<portal_cod4x::HttpRequestHandle>(pending);
     }
@@ -500,6 +505,862 @@ void Runtime_ServerStatusSnapshot_ReconcilesLiveSlotsAcrossMapRotation()
 
     std::error_code ignoreError;
     std::filesystem::remove(configPath, ignoreError);
+}
+
+std::string JsonStringField(const std::string& payload, const std::string& field)
+{
+    const std::string token = "\"" + field + "\":\"";
+    const auto start = payload.find(token);
+    if (start == std::string::npos)
+    {
+        return {};
+    }
+    const auto valueStart = start + token.size();
+    const auto end = payload.find('"', valueStart);
+    return end == std::string::npos ? std::string() : payload.substr(valueStart, end - valueStart);
+}
+
+void Runtime_PlaytimeMetadataSurvivesRetryAndReconnect()
+{
+    const auto configPath = WriteVpnProtectionConfig("playtime");
+    FakeHost host;
+    ConfigureVpnProtectionPlayer(host);
+    const std::string connectUrl = "https://example.test/ingest/events/player-connected";
+    host.Responses["POST " + connectUrl] = {500, ""};
+    host.Responses["POST https://example.test/ingest/events/player-disconnected"] = {202, ""};
+    host.Responses["POST https://example.test/ingest/events/map-change"] = {202, ""};
+    host.Responses["POST https://example.test/ingest/events/server-connected"] = {202, ""};
+    host.Responses["POST https://example.test/ingest/events/server-status"] = {202, ""};
+
+    portal_cod4x::PluginRuntime runtime(configPath.string());
+    runtime.Initialize(host, "0.2.0");
+    runtime.HandlePlayerConnected(host, 2);
+    runtime.Tick(host);
+    runtime.Tick(host);
+    host.Responses["POST " + connectUrl] = {202, ""};
+    host.CurrentTime += 3;
+    runtime.Tick(host);
+    runtime.Tick(host);
+
+    std::vector<std::string> connectBodies;
+    for (const auto& request : host.Requests)
+    {
+        if (request.Url == connectUrl)
+        {
+            connectBodies.push_back(request.Body);
+        }
+    }
+    Assert(connectBodies.size() == 2, "Expected retry of player-connected event");
+    const auto messageId = JsonStringField(connectBodies[0], "messageId");
+    const auto epoch = JsonStringField(connectBodies[0], "producerEpoch");
+    Assert(!messageId.empty() && JsonStringField(connectBodies[0], "observationId") == messageId,
+        "Playtime observation ID must equal the broker message ID");
+    Assert(JsonStringField(connectBodies[1], "observationId") == messageId, "Retry must retain observation ID");
+    Assert(!epoch.empty() && JsonStringField(connectBodies[1], "producerEpoch") == epoch, "Retry must retain producer epoch");
+    Assert(JsonStringField(connectBodies[0], "eventUtc") == JsonStringField(connectBodies[1], "eventUtc"),
+        "Retry must retain observation time");
+    Assert(JsonStringField(connectBodies[0], "eventUtc") == "1970-01-01T01:23:20Z",
+        "Playtime observation must use the callback's UTC time");
+    Assert(connectBodies[0].find("\"timestampQuality\":2") != std::string::npos &&
+        connectBodies[0].find("\"producerSequence\":1") != std::string::npos &&
+        connectBodies[0].find("\"rosterCompleteness\":0") != std::string::npos &&
+        connectBodies[0].find("\"isBot\":null") != std::string::npos &&
+        connectBodies[0].find("\"connectionCorrelationId\":null") != std::string::npos,
+        "Player event must carry producer timestamp and non-roster metadata");
+
+    runtime.HandlePlayerDisconnected(host, 2);
+    runtime.HandlePlayerConnected(host, 2);
+    runtime.HandleServerSpawned(host);
+    for (int i = 0; i < 16; ++i)
+    {
+        runtime.Tick(host);
+    }
+
+    bool sawReconnect = false;
+    bool sawDisconnect = false;
+    bool sawMap = false;
+    bool sawStatus = false;
+    for (const auto& request : host.Requests)
+    {
+        if (request.Url == connectUrl && JsonStringField(request.Body, "observationId") != messageId)
+        {
+            sawReconnect = JsonStringField(request.Body, "producerEpoch") == epoch;
+        }
+        if (request.Url.find("/events/player-disconnected") != std::string::npos)
+        {
+            sawDisconnect = request.Body.find("\"timestampQuality\":2") != std::string::npos &&
+                request.Body.find("\"isBot\":null") != std::string::npos;
+        }
+        if (request.Url.find("/events/map-change") != std::string::npos)
+        {
+            sawMap = request.Body.find("\"timestampQuality\":2") != std::string::npos;
+        }
+        if (request.Url.find("/events/server-status") != std::string::npos)
+        {
+            sawStatus = request.Body.find("\"timestampQuality\":3") != std::string::npos &&
+                request.Body.find("\"rosterCompleteness\":2") != std::string::npos &&
+                request.Body.find("\"isBot\":null") != std::string::npos;
+        }
+    }
+    Assert(sawReconnect && sawDisconnect && sawMap && sawStatus, "Expected metadata on reconnect, disconnect, map and partial status");
+
+    host.PlayerIds.clear();
+    host.PlayerNames.clear();
+    host.CurrentTime += 61;
+    const auto requestCountBeforeEmptySnapshot = host.Requests.size();
+    for (int i = 0; i < 6; ++i)
+    {
+        runtime.Tick(host);
+    }
+    const bool sawEmptyPartialStatus = std::any_of(host.Requests.begin() + requestCountBeforeEmptySnapshot, host.Requests.end(), [](const FakeHost::RequestRecord& request) {
+        return request.Url.find("/events/server-status") != std::string::npos &&
+            request.Body.find("\"playerCount\":0") != std::string::npos &&
+            request.Body.find("\"rosterCompleteness\":2") != std::string::npos;
+    });
+    Assert(sawEmptyPartialStatus,
+        "An apparently empty roster must remain partial");
+    RemoveTestConfig(configPath);
+}
+
+void Runtime_InFlightBatchDoesNotAcknowledgeEvictedIndices()
+{
+    const auto configPath = WriteVpnProtectionConfig("batch-eviction");
+    FakeHost host;
+    ConfigureVpnProtectionPlayer(host);
+    host.Responses["POST https://example.test/ingest/events/chat-message"] = {202, ""};
+    host.Responses["POST https://example.test/ingest/events/server-connected"] = {202, ""};
+    host.Responses["POST https://example.test/ingest/events/map-change"] = {202, ""};
+    portal_cod4x::PluginRuntime runtime(configPath.string());
+    runtime.Initialize(host, "0.2.0");
+    runtime.HandleChatMessage(host, 2, "hello", false);
+    runtime.Tick(host);
+    for (int i = 0; i < 499; ++i)
+    {
+        runtime.HandleServerSpawned(host);
+    }
+    for (int i = 0; i < 10; ++i)
+    {
+        runtime.Tick(host);
+    }
+    const bool sentFirstServerEvent = std::any_of(host.Requests.begin(), host.Requests.end(), [](const FakeHost::RequestRecord& request) {
+        return request.Url.find("/events/server-connected") != std::string::npos &&
+            request.Body.find("\"sequenceId\":2}") != std::string::npos;
+    });
+    Assert(sentFirstServerEvent, "Eviction of an in-flight event must not acknowledge a different queued event");
+    RemoveTestConfig(configPath);
+}
+
+void Runtime_RestartLosesUnsentEvents()
+{
+    const auto configPath = WriteVpnProtectionConfig("restart-loss");
+    FakeHost host;
+    ConfigureVpnProtectionPlayer(host);
+    {
+        portal_cod4x::PluginRuntime runtime(configPath.string());
+        runtime.Initialize(host, "0.2.0");
+        runtime.HandlePlayerConnected(host, 2);
+    }
+
+    portal_cod4x::PluginRuntime restarted(configPath.string());
+    restarted.Initialize(host, "0.2.0");
+    for (int i = 0; i < 4; ++i)
+    {
+        restarted.Tick(host);
+    }
+    const auto connectedPosts = std::count_if(host.Requests.begin(), host.Requests.end(), [](const FakeHost::RequestRecord& request) {
+        return request.Url.find("/events/player-connected") != std::string::npos;
+    });
+    Assert(connectedPosts == 0, "Restart must not imply replay of an unsent in-memory event");
+    restarted.HandlePlayerConnected(host, 2);
+    restarted.Tick(host);
+    const auto postsAfterNewObservation = std::count_if(host.Requests.begin(), host.Requests.end(), [](const FakeHost::RequestRecord& request) {
+        return request.Url.find("/events/player-connected") != std::string::npos;
+    });
+    Assert(postsAfterNewObservation == 1, "A new post-restart observation should still be emitted");
+    RemoveTestConfig(configPath);
+}
+
+void Runtime_CoverageCountsCapacityLoss()
+{
+    const auto configPath = WriteVpnProtectionConfig("coverage-capacity");
+    FakeHost host;
+    ConfigureVpnProtectionPlayer(host);
+    host.Responses["POST https://example.test/ingest/events/player-disconnected"] = {202, ""};
+    host.Responses["POST https://example.test/ingest/events/server-status"] = {202, ""};
+    portal_cod4x::PluginRuntime runtime(configPath.string());
+    runtime.Initialize(host, "0.2.0");
+    runtime.HandleChatMessage(host, 2, "not a playtime event", false);
+    for (int i = 0; i < 251; ++i)
+    {
+        runtime.HandlePlayerConnected(host, 2);
+        runtime.HandlePlayerDisconnected(host, 2);
+    }
+
+    host.CurrentTime += 61;
+    for (int i = 0; i < 100; ++i)
+    {
+        runtime.Tick(host);
+    }
+    const auto status = std::find_if(host.Requests.begin(), host.Requests.end(), [](const FakeHost::RequestRecord& request) {
+        return request.Url.find("/events/playtime-observation") != std::string::npos &&
+            request.Body.find("\"kind\":4") != std::string::npos;
+    });
+    Assert(status != host.Requests.end(), "Expected a status after the full queue drains");
+    Assert(status->Body.find("\"producerStartedUtc\":\"1970-01-01T01:23:20Z\"") != std::string::npos &&
+        status->Body.find("\"droppedCapacity\":2") != std::string::npos &&
+        status->Body.find("\"droppedAttempts\":0") != std::string::npos &&
+        status->Body.find("\"droppedAge\":0") != std::string::npos,
+        "Status must count both evicted playtime events but not the evicted chat");
+
+    const auto oldEpoch = JsonStringField(status->Body, "producerEpoch");
+    const auto oldRequestCount = host.Requests.size();
+    portal_cod4x::PluginRuntime restarted(configPath.string());
+    restarted.Initialize(host, "0.2.0");
+    host.CurrentTime += 61;
+    for (int i = 0; i < 6; ++i)
+    {
+        restarted.Tick(host);
+    }
+    const auto newStatus = std::find_if(host.Requests.begin() + oldRequestCount, host.Requests.end(), [](const FakeHost::RequestRecord& request) {
+        return request.Url.find("/events/playtime-observation") != std::string::npos &&
+            request.Body.find("\"kind\":4") != std::string::npos;
+    });
+    Assert(newStatus != host.Requests.end() && JsonStringField(newStatus->Body, "producerEpoch") != oldEpoch &&
+        newStatus->Body.find("\"droppedCapacity\":0") != std::string::npos &&
+        newStatus->Body.find("\"droppedAttempts\":0") != std::string::npos &&
+        newStatus->Body.find("\"droppedAge\":0") != std::string::npos,
+        "Restart must use a new epoch with reset counters, without implying continuity");
+    RemoveTestConfig(configPath);
+}
+
+void Runtime_CoverageCountsAgeAndSimultaneousThresholds()
+{
+    const auto configPath = WriteVpnProtectionConfig("coverage-age");
+    FakeHost host;
+    ConfigureVpnProtectionPlayer(host);
+    host.Responses["POST https://example.test/ingest/events/server-status"] = {202, ""};
+    {
+        portal_cod4x::PluginRuntime runtime(configPath.string());
+        runtime.Initialize(host, "0.2.0");
+        runtime.HandlePlayerConnected(host, 2);
+        host.CurrentTime += 901;
+        for (int i = 0; i < 10; ++i)
+        {
+            runtime.Tick(host);
+        }
+        host.CurrentTime += 61;
+        for (int i = 0; i < 8; ++i)
+        {
+            runtime.Tick(host);
+        }
+        const bool sawAge = std::any_of(host.Requests.begin(), host.Requests.end(), [](const FakeHost::RequestRecord& request) {
+            return request.Url.find("/events/playtime-observation") != std::string::npos &&
+                request.Body.find("\"kind\":4") != std::string::npos &&
+                request.Body.find("\"droppedAge\":1") != std::string::npos &&
+                request.Body.find("\"droppedAttempts\":0") != std::string::npos;
+        });
+        Assert(sawAge, "Expired playtime event must count as age loss");
+    }
+
+    FakeHost retryHost;
+    ConfigureVpnProtectionPlayer(retryHost);
+    retryHost.Responses["POST https://example.test/ingest/events/playtime-observation"] = {500, ""};
+    retryHost.Responses["POST https://example.test/ingest/events/server-status"] = {202, ""};
+    portal_cod4x::PluginRuntime runtime(configPath.string());
+    runtime.Initialize(retryHost, "0.2.0");
+    runtime.HandlePlayerConnected(retryHost, 2);
+    for (int i = 0; i < 600; ++i)
+    {
+        runtime.Tick(retryHost);
+        const auto attempts = std::count_if(retryHost.Requests.begin(), retryHost.Requests.end(), [](const FakeHost::RequestRecord& request) {
+            return request.Url.find("/events/playtime-observation") != std::string::npos;
+        });
+        if (attempts == 8)
+        {
+            break;
+        }
+        retryHost.CurrentTime += 1;
+    }
+    retryHost.CurrentTime += 901;
+    runtime.Tick(retryHost);
+    retryHost.Responses["POST https://example.test/ingest/events/playtime-observation"] = {202, ""};
+    retryHost.CurrentTime += 61;
+    for (int i = 0; i < 30; ++i)
+    {
+        runtime.Tick(retryHost);
+    }
+    const bool sawAttempts = std::any_of(retryHost.Requests.begin(), retryHost.Requests.end(), [](const FakeHost::RequestRecord& request) {
+        return request.Url.find("/events/playtime-observation") != std::string::npos &&
+            request.Body.find("\"kind\":4") != std::string::npos &&
+            request.Body.find("\"droppedAttempts\":1") != std::string::npos;
+    });
+    Assert(sawAttempts, "An event exceeding both thresholds must be counted once as an attempt loss");
+    RemoveTestConfig(configPath);
+}
+
+void Runtime_CoverageCountsInFlightEviction()
+{
+    const auto configPath = WriteVpnProtectionConfig("coverage-in-flight");
+    FakeHost host;
+    ConfigureVpnProtectionPlayer(host);
+    host.Responses["POST https://example.test/ingest/events/player-disconnected"] = {202, ""};
+    host.Responses["POST https://example.test/ingest/events/server-status"] = {202, ""};
+    portal_cod4x::PluginRuntime runtime(configPath.string());
+    runtime.Initialize(host, "0.2.0");
+    runtime.HandlePlayerConnected(host, 2);
+    runtime.Tick(host);
+
+    for (int i = 0; i < 250; ++i)
+    {
+        runtime.HandlePlayerDisconnected(host, 2);
+        runtime.HandlePlayerConnected(host, 2);
+    }
+
+    runtime.Tick(host);
+    host.CurrentTime += 61;
+    for (int i = 0; i < 100; ++i)
+    {
+        runtime.Tick(host);
+    }
+    const bool sawEviction = std::any_of(host.Requests.begin(), host.Requests.end(), [](const FakeHost::RequestRecord& request) {
+        return request.Url.find("/events/playtime-observation") != std::string::npos &&
+            request.Body.find("\"kind\":4") != std::string::npos &&
+            request.Body.find("\"droppedCapacity\":2") != std::string::npos;
+    });
+    Assert(sawEviction, "In-flight eviction must count local retention loss even if the request succeeds");
+    RemoveTestConfig(configPath);
+}
+
+void Runtime_CoverageRetainsCountersAcrossStatusRetry()
+{
+    const auto configPath = WriteVpnProtectionConfig("coverage-retry");
+    FakeHost host;
+    ConfigureVpnProtectionPlayer(host);
+    const std::string statusUrl = "https://example.test/ingest/events/playtime-observation";
+    host.Responses["POST " + statusUrl] = {500, ""};
+    host.Responses["POST https://example.test/ingest/events/server-status"] = {202, ""};
+    portal_cod4x::PluginRuntime runtime(configPath.string());
+    runtime.Initialize(host, "0.2.0");
+    runtime.HandlePlayerConnected(host, 2);
+    host.CurrentTime += 901;
+    for (int i = 0; i < 10; ++i)
+    {
+        runtime.Tick(host);
+    }
+    host.Responses["POST " + statusUrl] = {202, ""};
+    host.CurrentTime += 3;
+    for (int i = 0; i < 10; ++i)
+    {
+        runtime.Tick(host);
+    }
+    host.CurrentTime += 61;
+    for (int i = 0; i < 10; ++i)
+    {
+        runtime.Tick(host);
+    }
+
+    std::vector<std::string> statusBodies;
+    for (const auto& request : host.Requests)
+    {
+        if (request.Url == statusUrl)
+        {
+            statusBodies.push_back(request.Body);
+        }
+    }
+    Assert(statusBodies.size() >= 3, "Expected failed status, retry and subsequent snapshot");
+    Assert(JsonStringField(statusBodies[0], "observationId") == JsonStringField(statusBodies[1], "observationId") &&
+        statusBodies[0].find("\"droppedAge\":0") != std::string::npos &&
+        statusBodies[1].find("\"droppedAge\":0") != std::string::npos,
+        "Retry must retain the original snapshot and observation ID");
+    Assert(statusBodies.back().find("\"droppedAge\":1") != std::string::npos,
+        "A later snapshot must report losses discovered after the original snapshot");
+    RemoveTestConfig(configPath);
+}
+
+void Runtime_CoverageUsesFirstPublicationTimeAcrossRetries()
+{
+    const auto configPath = WriteVpnProtectionConfig("coverage-publication-time");
+    FakeHost host;
+    ConfigureVpnProtectionPlayer(host);
+    host.Responses["POST https://example.test/ingest/events/server-status"] = {202, ""};
+    const std::string url = "https://example.test/ingest/events/playtime-observation";
+    host.Responses["POST " + url] = {500, ""};
+    portal_cod4x::PluginRuntime runtime(configPath.string());
+    runtime.Initialize(host, "0.2.0");
+
+    host.CurrentTime += 61;
+    runtime.Tick(host);
+    host.CurrentTime += 5;
+    runtime.Tick(host);
+    runtime.Tick(host);
+    runtime.Tick(host);
+
+    const auto snapshot = std::find_if(host.Requests.begin(), host.Requests.end(), [&](const FakeHost::RequestRecord& request) {
+        return request.Url == url && request.Body.find("\"kind\":4") != std::string::npos;
+    });
+    Assert(snapshot != host.Requests.end(), "Expected a delayed coverage snapshot");
+    const std::string originalBody = snapshot->Body;
+    Assert(JsonStringField(originalBody, "eventUtc") == "1970-01-01T01:24:21Z" &&
+        JsonStringField(originalBody, "eventPublishedUtc") == "1970-01-01T01:24:26Z" &&
+        JsonStringField(originalBody, "producerStartedUtc") == "1970-01-01T01:23:20Z" &&
+        !JsonStringField(originalBody, "producerEpoch").empty() &&
+        originalBody.find("\"droppedCapacity\":0") != std::string::npos &&
+        originalBody.find("\"droppedAttempts\":0") != std::string::npos &&
+        originalBody.find("\"droppedAge\":0") != std::string::npos,
+        "Coverage must carry the epoch, nonnegative counters and actual first-publication time");
+
+    host.Responses["POST " + url] = {202, ""};
+    host.CurrentTime += 3;
+    for (int i = 0; i < 10; ++i)
+    {
+        runtime.Tick(host);
+    }
+    const auto retries = std::count_if(host.Requests.begin(), host.Requests.end(), [&](const FakeHost::RequestRecord& request) {
+        return request.Url == url && request.Body == originalBody;
+    });
+    Assert(retries == 2, "Coverage retry must preserve the entire payload used for replay identity");
+    RemoveTestConfig(configPath);
+}
+
+void Runtime_DedicatedPlaytimeEventsPreserveIdentityAndPrivacy()
+{
+    const auto configPath = WriteVpnProtectionConfig("dedicated-playtime");
+    FakeHost host;
+    ConfigureVpnProtectionPlayer(host);
+    host.CvarValues["mapname"] = "mp_crash";
+    host.Responses["POST https://example.test/ingest/events/player-disconnected"] = {202, ""};
+    host.Responses["POST https://example.test/ingest/events/server-connected"] = {202, ""};
+    host.Responses["POST https://example.test/ingest/events/map-change"] = {202, ""};
+    host.Responses["POST https://example.test/ingest/events/server-status"] = {202, ""};
+    const std::string url = "https://example.test/ingest/events/playtime-observation";
+    host.Responses["POST " + url] = {500, ""};
+    portal_cod4x::PluginRuntime runtime(configPath.string());
+    runtime.Initialize(host, "0.2.0");
+    runtime.HandlePlayerConnect(host, 2, "198.51.100.10");
+    runtime.HandlePlayerConnected(host, 2);
+    for (int i = 0; i < 10; ++i)
+    {
+        runtime.Tick(host);
+    }
+    host.Responses["POST " + url] = {202, ""};
+    host.CurrentTime += 3;
+    for (int i = 0; i < 10; ++i)
+    {
+        runtime.Tick(host);
+    }
+
+    std::vector<std::string> bodies;
+    for (const auto& request : host.Requests)
+    {
+        if (request.Url == url)
+        {
+            bodies.push_back(request.Body);
+        }
+    }
+    Assert(bodies.size() == 2, "Expected dedicated observation retry");
+    const auto observation = JsonStringField(bodies[0], "observationId");
+    Assert(!observation.empty() && observation == JsonStringField(bodies[0], "messageId") &&
+        observation == JsonStringField(bodies[1], "observationId") &&
+        JsonStringField(bodies[0], "eventPublishedUtc") == JsonStringField(bodies[1], "eventPublishedUtc"),
+        "Dedicated observation ID and first-publish time must survive retry");
+    Assert(bodies[0].find("\"kind\":1") != std::string::npos &&
+        bodies[0].find("\"eventUtc\":\"1970-01-01T01:23:20Z\"") != std::string::npos &&
+        bodies[0].find("\"freshness\":1") != std::string::npos &&
+        bodies[0].find("\"isBot\":null") != std::string::npos &&
+        bodies[0].find("198.51.100.10") == std::string::npos &&
+        bodies[0].find("\"ipAddress\"") == std::string::npos,
+        "Dedicated join must use live callback time and omit network address");
+
+    const auto requestCountBeforeReentry = host.Requests.size();
+    runtime.HandleServerExited(host);
+    runtime.HandlePlayerConnected(host, 2);
+    for (int i = 0; i < 10; ++i)
+    {
+        runtime.Tick(host);
+    }
+    const bool emittedMapReentryJoin = std::any_of(host.Requests.begin() + requestCountBeforeReentry, host.Requests.end(), [&](const FakeHost::RequestRecord& request) {
+        return request.Url == url && request.Body.find("\"kind\":1") != std::string::npos;
+    });
+    Assert(!emittedMapReentryJoin, "Map re-entry without a new connection must not emit a join");
+    const auto requestCountBeforeLateConnect = host.Requests.size();
+    runtime.HandlePlayerConnect(host, 2, "198.51.100.10");
+    runtime.HandlePlayerConnected(host, 2);
+    for (int i = 0; i < 10; ++i)
+    {
+        runtime.Tick(host);
+    }
+    const bool emittedLateConnectJoin = std::any_of(host.Requests.begin() + requestCountBeforeLateConnect, host.Requests.end(), [&](const FakeHost::RequestRecord& request) {
+        return request.Url == url && request.Body.find("\"kind\":1") != std::string::npos;
+    });
+    Assert(!emittedLateConnectJoin, "A late connect callback must not create another join");
+    const auto requestCountBeforeReconnect = host.Requests.size();
+    runtime.HandlePlayerDisconnected(host, 2);
+    runtime.HandlePlayerConnect(host, 2, "198.51.100.10");
+    runtime.HandlePlayerConnected(host, 2);
+    runtime.HandleServerSpawned(host);
+    for (int i = 0; i < 30; ++i)
+    {
+        runtime.Tick(host);
+    }
+    std::string joinedBodies;
+    for (std::size_t i = requestCountBeforeReconnect; i < host.Requests.size(); ++i)
+    {
+        if (host.Requests[i].Url == url)
+        {
+            joinedBodies += host.Requests[i].Body;
+        }
+    }
+    Assert(joinedBodies.find("\"kind\":1") != std::string::npos &&
+        joinedBodies.find("\"kind\":2") != std::string::npos &&
+        joinedBodies.find("\"kind\":3") != std::string::npos &&
+        joinedBodies.find("\"kind\":4") != std::string::npos &&
+        joinedBodies.find("\"rosterCompleteness\":2") != std::string::npos &&
+        joinedBodies.find("198.51.100.10") == std::string::npos,
+        "Dedicated reconnect after disconnect, leave, map and partial roster must be emitted without IP");
+    RemoveTestConfig(configPath);
+}
+
+void Runtime_DedicatedPlaytimeAmbiguousReconnectRemainsUncertain()
+{
+    const auto configPath = WriteVpnProtectionConfig("playtime-ambiguous-reconnect");
+    FakeHost host;
+    ConfigureVpnProtectionPlayer(host);
+    host.Responses["POST https://example.test/ingest/events/player-disconnected"] = {202, ""};
+    host.Responses["POST https://example.test/ingest/events/server-status"] = {202, ""};
+    const std::string url = "https://example.test/ingest/events/playtime-observation";
+    portal_cod4x::PluginRuntime runtime(configPath.string());
+    runtime.Initialize(host, "0.2.0");
+    runtime.HandlePlayerConnect(host, 2, "198.51.100.10");
+    runtime.HandlePlayerConnected(host, 2);
+    for (int i = 0; i < 10; ++i)
+    {
+        runtime.Tick(host);
+    }
+
+    // A zero-ID slot could be empty, a bot, or an unresolved player.
+    host.PlayerIds.erase(2);
+    host.PlayerNames.erase(2);
+    host.CurrentTime += 61;
+    const auto beforeSnapshot = host.Requests.size();
+    for (int i = 0; i < 10; ++i)
+    {
+        runtime.Tick(host);
+    }
+    const auto snapshot = std::find_if(host.Requests.begin() + beforeSnapshot, host.Requests.end(), [&](const FakeHost::RequestRecord& request) {
+        return request.Url == url && request.Body.find("\"kind\":4") != std::string::npos;
+    });
+    Assert(snapshot != host.Requests.end(), "Expected dedicated snapshot for unresolved slot");
+    const auto& body = snapshot->Body;
+    Assert(body.front() == '[' && body.back() == ']' &&
+        body.find("\"serverId\":\"11111111-2222-3333-4444-555555555555\"") != std::string::npos &&
+        body.find("\"gameType\":\"CallOfDuty4x\"") != std::string::npos &&
+        !JsonStringField(body, "eventGeneratedUtc").empty() &&
+        !JsonStringField(body, "eventPublishedUtc").empty() &&
+        !JsonStringField(body, "producerEpoch").empty() &&
+        JsonStringField(body, "observationId") == JsonStringField(body, "messageId") &&
+        !JsonStringField(body, "observationId").empty() &&
+        body.find("\"sequenceId\":") != std::string::npos &&
+        body.find("\"producerSequence\":") != std::string::npos &&
+        body.find("\"eventUtc\":\"1970-01-01T01:24:21Z\"") != std::string::npos &&
+        body.find("\"timestampQuality\":3") != std::string::npos &&
+        body.find("\"freshness\":1") != std::string::npos &&
+        body.find("\"rosterCompleteness\":2") != std::string::npos &&
+        body.find("\"players\":[]") != std::string::npos &&
+        body.find("\"producerStartedUtc\":\"1970-01-01T01:23:20Z\"") != std::string::npos &&
+        body.find("\"droppedCapacity\":0") != std::string::npos &&
+        body.find("\"droppedAttempts\":0") != std::string::npos &&
+        body.find("\"droppedAge\":0") != std::string::npos &&
+        body.find("198.51.100.10") == std::string::npos,
+        "Unresolved roster must have the dedicated envelope, partial status and local-only coverage counters");
+
+    host.PlayerIds[2] = 76561198000000001ULL;
+    host.PlayerNames[2] = "PlayerOne";
+    const auto beforeAmbiguousConnect = host.Requests.size();
+    runtime.HandlePlayerConnect(host, 2, "198.51.100.10");
+    runtime.HandlePlayerConnected(host, 2);
+    for (int i = 0; i < 10; ++i)
+    {
+        runtime.Tick(host);
+    }
+    Assert(std::none_of(host.Requests.begin() + beforeAmbiguousConnect, host.Requests.end(), [&](const FakeHost::RequestRecord& request) {
+        return request.Url == url && request.Body.find("\"kind\":1") != std::string::npos;
+    }), "An unresolved slot and same-player callback cannot prove a reconnect");
+
+    const auto beforeKnownReconnect = host.Requests.size();
+    runtime.HandlePlayerDisconnected(host, 2);
+    runtime.HandlePlayerConnect(host, 2, "198.51.100.10");
+    runtime.HandlePlayerConnected(host, 2);
+    for (int i = 0; i < 10; ++i)
+    {
+        runtime.Tick(host);
+    }
+    bool sawLeave = false;
+    bool sawJoin = false;
+    for (auto it = host.Requests.begin() + beforeKnownReconnect; it != host.Requests.end(); ++it)
+    {
+        if (it->Url == url)
+        {
+            sawLeave |= it->Body.find("\"kind\":2") != std::string::npos;
+            sawJoin |= it->Body.find("\"kind\":1") != std::string::npos;
+        }
+    }
+    Assert(sawLeave && sawJoin, "An observed disconnect followed by reconnect must emit both dedicated events");
+    RemoveTestConfig(configPath);
+}
+
+void Runtime_DedicatedPlaytimeTracksResolvedRosterIdentity()
+{
+    const auto configPath = WriteVpnProtectionConfig("playtime-roster-identity");
+    FakeHost host;
+    ConfigureVpnProtectionPlayer(host);
+    host.Responses["POST https://example.test/ingest/events/server-status"] = {202, ""};
+    host.Responses["POST https://example.test/ingest/events/player-disconnected"] = {202, ""};
+    const std::string url = "https://example.test/ingest/events/playtime-observation";
+    portal_cod4x::PluginRuntime runtime(configPath.string());
+    runtime.Initialize(host, "0.2.0");
+    host.CurrentTime += 61;
+    for (int i = 0; i < 10; ++i)
+    {
+        runtime.Tick(host);
+    }
+
+    auto start = host.Requests.size();
+    runtime.HandleServerExited(host);
+    runtime.HandlePlayerConnected(host, 2);
+    for (int i = 0; i < 10; ++i)
+    {
+        runtime.Tick(host);
+    }
+    Assert(std::none_of(host.Requests.begin() + start, host.Requests.end(), [&](const FakeHost::RequestRecord& request) {
+        return request.Url == url && request.Body.find("\"kind\":1") != std::string::npos;
+    }), "A roster-observed player re-entering after a map change must not emit a join");
+
+    host.PlayerIds[2] = 76561198000000002ULL;
+    host.PlayerNames[2] = "PlayerTwo";
+    host.CurrentTime += 61;
+    for (int i = 0; i < 10; ++i)
+    {
+        runtime.Tick(host);
+    }
+    host.PlayerIds[2] = 76561198000000001ULL;
+    host.PlayerNames[2] = "PlayerOne";
+    start = host.Requests.size();
+    runtime.HandlePlayerConnected(host, 2);
+    for (int i = 0; i < 10; ++i)
+    {
+        runtime.Tick(host);
+    }
+    Assert(std::any_of(host.Requests.begin() + start, host.Requests.end(), [&](const FakeHost::RequestRecord& request) {
+        return request.Url == url && request.Body.find("\"kind\":1") != std::string::npos &&
+            request.Body.find("\"playerGuid\":\"76561198000000001\"") != std::string::npos;
+    }), "A resolved replacement occupant must invalidate the previous join guard");
+
+    runtime.HandleServerExited(host);
+    host.PlayerIds.erase(2);
+    host.PlayerNames.erase(2);
+    start = host.Requests.size();
+    runtime.HandlePlayerDisconnected(host, 2);
+    for (int i = 0; i < 10; ++i)
+    {
+        runtime.Tick(host);
+    }
+    Assert(std::any_of(host.Requests.begin() + start, host.Requests.end(), [&](const FakeHost::RequestRecord& request) {
+        return request.Url == url && request.Body.find("\"kind\":2") != std::string::npos &&
+            request.Body.find("\"playerGuid\":\"76561198000000001\"") != std::string::npos &&
+            request.Body.find("\"username\":\"PlayerOne\"") != std::string::npos;
+    }), "A disconnect after level exit must retain the last resolved playtime identity");
+    RemoveTestConfig(configPath);
+}
+
+void Runtime_DedicatedPlaytimeDoesNotGuessUnresolvedDisconnect()
+{
+    const auto configPath = WriteVpnProtectionConfig("playtime-unresolved-disconnect");
+    FakeHost host;
+    ConfigureVpnProtectionPlayer(host);
+    host.Responses["POST https://example.test/ingest/events/server-status"] = {202, ""};
+    const std::string url = "https://example.test/ingest/events/playtime-observation";
+    portal_cod4x::PluginRuntime runtime(configPath.string());
+    runtime.Initialize(host, "0.2.0");
+    runtime.HandlePlayerConnected(host, 2);
+    for (int i = 0; i < 10; ++i)
+    {
+        runtime.Tick(host);
+    }
+    host.PlayerIds.erase(2);
+    host.PlayerNames.erase(2);
+    host.CurrentTime += 61;
+    for (int i = 0; i < 10; ++i)
+    {
+        runtime.Tick(host);
+    }
+    const auto start = host.Requests.size();
+    runtime.HandlePlayerDisconnected(host, 2);
+    for (int i = 0; i < 10; ++i)
+    {
+        runtime.Tick(host);
+    }
+    Assert(std::none_of(host.Requests.begin() + start, host.Requests.end(), [&](const FakeHost::RequestRecord& request) {
+        return request.Url == url && request.Body.find("\"kind\":2") != std::string::npos;
+    }), "An unresolved slot must not attribute a disconnect to a stale player");
+
+    host.PlayerIds[2] = 76561198000000001ULL;
+    host.PlayerNames[2] = "PlayerOne";
+    runtime.HandlePlayerConnected(host, 2);
+    runtime.HandleServerExited(host);
+    host.PlayerIds[2] = 76561198000000002ULL;
+    host.PlayerNames[2] = "PlayerTwo";
+    const auto beforeReplacementDisconnect = host.Requests.size();
+    runtime.HandlePlayerDisconnected(host, 2);
+    for (int i = 0; i < 10; ++i)
+    {
+        runtime.Tick(host);
+    }
+    Assert(std::none_of(host.Requests.begin() + beforeReplacementDisconnect, host.Requests.end(), [&](const FakeHost::RequestRecord& request) {
+        return request.Url == url && request.Body.find("\"kind\":2") != std::string::npos;
+    }), "A different live occupant must not be attributed to the cached player");
+    RemoveTestConfig(configPath);
+}
+
+void Runtime_DedicatedPlaytimeReconcilesUnresolvedEnterWorld()
+{
+    const auto configPath = WriteVpnProtectionConfig("playtime-unresolved-enter-world");
+    const std::string url = "https://example.test/ingest/events/playtime-observation";
+    for (const bool replacement : {false, true})
+    {
+        FakeHost host;
+        ConfigureVpnProtectionPlayer(host);
+        host.Responses["POST https://example.test/ingest/events/player-disconnected"] = {202, ""};
+        portal_cod4x::PluginRuntime runtime(configPath.string());
+        runtime.Initialize(host, "0.2.0");
+        runtime.HandlePlayerConnected(host, 2);
+        for (int i = 0; i < 10; ++i)
+        {
+            runtime.Tick(host);
+        }
+
+        if (replacement)
+        {
+            host.PlayerIds[2] = 76561198000000002ULL;
+        }
+        else
+        {
+            host.PlayerIds.erase(2);
+        }
+        host.PlayerNames.erase(2);
+        runtime.HandlePlayerConnected(host, 2);
+        host.PlayerIds.erase(2);
+        host.PlayerNames[2] = "PlayerOne";
+        const auto start = host.Requests.size();
+        runtime.HandlePlayerDisconnected(host, 2);
+        for (int i = 0; i < 10; ++i)
+        {
+            runtime.Tick(host);
+        }
+        Assert(std::none_of(host.Requests.begin() + start, host.Requests.end(), [&](const FakeHost::RequestRecord& request) {
+            return request.Url == url && request.Body.find("\"kind\":2") != std::string::npos;
+        }), "An unresolved enter-world callback must not attribute a later disconnect to the prior player");
+    }
+
+    FakeHost host;
+    ConfigureVpnProtectionPlayer(host);
+    portal_cod4x::PluginRuntime runtime(configPath.string());
+    runtime.Initialize(host, "0.2.0");
+    runtime.HandlePlayerConnected(host, 2);
+    for (int i = 0; i < 10; ++i)
+    {
+        runtime.Tick(host);
+    }
+    host.PlayerIds[2] = 76561198000000002ULL;
+    host.PlayerNames.erase(2);
+    runtime.HandlePlayerConnected(host, 2);
+    host.PlayerNames[2] = "PlayerTwo";
+    const auto start = host.Requests.size();
+    runtime.HandlePlayerConnected(host, 2);
+    for (int i = 0; i < 10; ++i)
+    {
+        runtime.Tick(host);
+    }
+    Assert(std::any_of(host.Requests.begin() + start, host.Requests.end(), [&](const FakeHost::RequestRecord& request) {
+        return request.Url == url && request.Body.find("\"kind\":1") != std::string::npos &&
+            request.Body.find("\"playerGuid\":\"76561198000000002\"") != std::string::npos;
+    }), "A replacement initially missing a username must emit a join when its identity resolves");
+    RemoveTestConfig(configPath);
+}
+
+void Runtime_DedicatedPlaytimeDisconnectUsesResolvedIdentity()
+{
+    const auto configPath = WriteVpnProtectionConfig("playtime-disconnect-identity");
+    const std::string url = "https://example.test/ingest/events/playtime-observation";
+    for (int scenario = 0; scenario < 3; ++scenario)
+    {
+        FakeHost host;
+        ConfigureVpnProtectionPlayer(host);
+        host.Responses["POST https://example.test/ingest/events/player-disconnected"] = {202, ""};
+        portal_cod4x::PluginRuntime runtime(configPath.string());
+        runtime.Initialize(host, "0.2.0");
+        if (scenario == 0)
+        {
+            runtime.HandlePlayerConnect(host, 2, "");
+            host.PlayerIds.erase(2);
+            runtime.HandlePlayerConnected(host, 2);
+            host.PlayerIds[2] = 76561198000000001ULL;
+            runtime.HandleClientAuthorized(host);
+        }
+        else if (scenario == 1)
+        {
+            host.PlayerNames.erase(2);
+            runtime.HandlePlayerConnected(host, 2);
+            host.PlayerNames[2] = "PlayerOne";
+        }
+        else
+        {
+            runtime.HandlePlayerConnected(host, 2);
+            runtime.HandleServerExited(host);
+            host.PlayerIds[2] = 76561198000000002ULL;
+            host.PlayerNames[2] = "PlayerTwo";
+            runtime.HandlePlayerConnect(host, 2, "");
+            runtime.HandleClientAuthorized(host);
+        }
+        for (int i = 0; i < 10; ++i)
+        {
+            runtime.Tick(host);
+        }
+        if (scenario != 1)
+        {
+            host.PlayerIds.erase(2);
+        }
+        const auto start = host.Requests.size();
+        runtime.HandlePlayerDisconnected(host, 2);
+        for (int i = 0; i < 10; ++i)
+        {
+            runtime.Tick(host);
+        }
+        const auto leave = std::find_if(host.Requests.begin() + start, host.Requests.end(), [&](const FakeHost::RequestRecord& request) {
+            return request.Url == url && request.Body.find("\"kind\":2") != std::string::npos;
+        });
+        Assert(leave != host.Requests.end(), "A resolved disconnect identity must emit a leave");
+        const std::string expectedGuid = scenario == 2 ? "76561198000000002" : "76561198000000001";
+        Assert(leave->Body.find("\"playerGuid\":\"" + expectedGuid + "\"") != std::string::npos,
+            "The leave must identify the authorized occupant, not the stale slot occupant");
+    }
+    FakeHost host;
+    ConfigureVpnProtectionPlayer(host);
+    portal_cod4x::PluginRuntime runtime(configPath.string());
+    runtime.Initialize(host, "0.2.0");
+    runtime.HandlePlayerConnect(host, 2, "");
+    host.PlayerIds.erase(2);
+    runtime.HandlePlayerConnected(host, 2);
+    host.PlayerIds[2] = 76561198000000001ULL;
+    runtime.HandleClientAuthorized(host);
+    runtime.HandlePlayerConnected(host, 2);
+    for (int i = 0; i < 10; ++i)
+    {
+        runtime.Tick(host);
+    }
+    Assert(std::any_of(host.Requests.begin(), host.Requests.end(), [&](const FakeHost::RequestRecord& request) {
+        return request.Url == url && request.Body.find("\"kind\":1") != std::string::npos;
+    }), "Authorization alone must not suppress the player's first enter-world join");
+    RemoveTestConfig(configPath);
 }
 
 void Runtime_EmitsEmptyIpWhenConnectAddressUnavailable()
@@ -1860,6 +2721,20 @@ int main()
     Runtime_EmitsAndFlushesPlayerConnectedEvent();
     Runtime_EmitsPlayerConnectedOncePerConnection();
     Runtime_ServerStatusSnapshot_ReconcilesLiveSlotsAcrossMapRotation();
+    Runtime_PlaytimeMetadataSurvivesRetryAndReconnect();
+    Runtime_InFlightBatchDoesNotAcknowledgeEvictedIndices();
+    Runtime_RestartLosesUnsentEvents();
+    Runtime_CoverageCountsCapacityLoss();
+    Runtime_CoverageCountsAgeAndSimultaneousThresholds();
+    Runtime_CoverageCountsInFlightEviction();
+    Runtime_CoverageRetainsCountersAcrossStatusRetry();
+    Runtime_CoverageUsesFirstPublicationTimeAcrossRetries();
+    Runtime_DedicatedPlaytimeEventsPreserveIdentityAndPrivacy();
+    Runtime_DedicatedPlaytimeAmbiguousReconnectRemainsUncertain();
+    Runtime_DedicatedPlaytimeTracksResolvedRosterIdentity();
+    Runtime_DedicatedPlaytimeDoesNotGuessUnresolvedDisconnect();
+    Runtime_DedicatedPlaytimeReconcilesUnresolvedEnterWorld();
+    Runtime_DedicatedPlaytimeDisconnectUsesResolvedIdentity();
     Runtime_EmitsEmptyIpWhenConnectAddressUnavailable();
     Runtime_AuthorizedIdentity_AllowsDisconnectEventWhenPlayerIdUnavailableAtDisconnect();
     Runtime_DropsPoisonEventsAndUnblocksOtherQueues();
