@@ -156,6 +156,7 @@ private:
         std::string MessageId;
         std::int64_t CreatedUnixSeconds = 0;
         std::size_t AttemptCount = 0;
+        bool Published = false;
     };
 
     struct ConnectedPlayerState
@@ -216,6 +217,11 @@ private:
     std::unordered_map<int, ConnectedPlayerState> connectedPlayers;
     std::uint64_t nextConnectionGeneration = 0;
     std::string producerEpoch;
+    std::int64_t producerStartedUnixSeconds = 0;
+    std::uint64_t droppedPlaytimeCapacity = 0;
+    std::uint64_t droppedPlaytimeAttempts = 0;
+    std::uint64_t droppedPlaytimeAge = 0;
+    std::unordered_map<int, std::string> playtimePlayersBySlot;
 
     // Player GUIDs for which a player-connected event has already been emitted this session.
     // Keyed by GUID (not slot) so it survives the map-rotation boundary (OnExitLevel clears the
@@ -322,6 +328,7 @@ private:
     void DropBufferedEventsById(const std::vector<std::string>& messageIds);
     std::string BuildBaseEventPrefix(std::int64_t nowUnixSeconds, const std::string& messageId, long long sequenceId) const;
     std::string BuildPlaytimeMetadata(std::int64_t nowUnixSeconds, const std::string& messageId, long long sequenceId, int timestampQuality, int rosterCompleteness) const;
+    void BufferPlaytimeObservation(std::int64_t nowUnixSeconds, int kind, const std::string& fields);
     long long NextSequenceId();
     static std::string GenerateMessageId();
     static std::string JsonEscape(std::string_view value);
