@@ -1221,6 +1221,72 @@ void Runtime_DedicatedPlaytimeDoesNotGuessUnresolvedDisconnect()
     RemoveTestConfig(configPath);
 }
 
+void Runtime_DedicatedPlaytimeReconcilesUnresolvedEnterWorld()
+{
+    const auto configPath = WriteVpnProtectionConfig("playtime-unresolved-enter-world");
+    const std::string url = "https://example.test/ingest/events/playtime-observation";
+    for (const bool replacement : {false, true})
+    {
+        FakeHost host;
+        ConfigureVpnProtectionPlayer(host);
+        host.Responses["POST https://example.test/ingest/events/player-disconnected"] = {202, ""};
+        portal_cod4x::PluginRuntime runtime(configPath.string());
+        runtime.Initialize(host, "0.2.0");
+        runtime.HandlePlayerConnected(host, 2);
+        for (int i = 0; i < 10; ++i)
+        {
+            runtime.Tick(host);
+        }
+
+        if (replacement)
+        {
+            host.PlayerIds[2] = 76561198000000002ULL;
+        }
+        else
+        {
+            host.PlayerIds.erase(2);
+        }
+        host.PlayerNames.erase(2);
+        runtime.HandlePlayerConnected(host, 2);
+        host.PlayerIds.erase(2);
+        host.PlayerNames[2] = "PlayerOne";
+        const auto start = host.Requests.size();
+        runtime.HandlePlayerDisconnected(host, 2);
+        for (int i = 0; i < 10; ++i)
+        {
+            runtime.Tick(host);
+        }
+        Assert(std::none_of(host.Requests.begin() + start, host.Requests.end(), [&](const FakeHost::RequestRecord& request) {
+            return request.Url == url && request.Body.find("\"kind\":2") != std::string::npos;
+        }), "An unresolved enter-world callback must not attribute a later disconnect to the prior player");
+    }
+
+    FakeHost host;
+    ConfigureVpnProtectionPlayer(host);
+    portal_cod4x::PluginRuntime runtime(configPath.string());
+    runtime.Initialize(host, "0.2.0");
+    runtime.HandlePlayerConnected(host, 2);
+    for (int i = 0; i < 10; ++i)
+    {
+        runtime.Tick(host);
+    }
+    host.PlayerIds[2] = 76561198000000002ULL;
+    host.PlayerNames.erase(2);
+    runtime.HandlePlayerConnected(host, 2);
+    host.PlayerNames[2] = "PlayerTwo";
+    const auto start = host.Requests.size();
+    runtime.HandlePlayerConnected(host, 2);
+    for (int i = 0; i < 10; ++i)
+    {
+        runtime.Tick(host);
+    }
+    Assert(std::any_of(host.Requests.begin() + start, host.Requests.end(), [&](const FakeHost::RequestRecord& request) {
+        return request.Url == url && request.Body.find("\"kind\":1") != std::string::npos &&
+            request.Body.find("\"playerGuid\":\"76561198000000002\"") != std::string::npos;
+    }), "A replacement initially missing a username must emit a join when its identity resolves");
+    RemoveTestConfig(configPath);
+}
+
 void Runtime_EmitsEmptyIpWhenConnectAddressUnavailable()
 {
     const std::filesystem::path configPath = std::filesystem::temp_directory_path() / "portal-cod4x-plugin.noip.test.json";
@@ -2591,6 +2657,7 @@ int main()
     Runtime_DedicatedPlaytimeAmbiguousReconnectRemainsUncertain();
     Runtime_DedicatedPlaytimeTracksResolvedRosterIdentity();
     Runtime_DedicatedPlaytimeDoesNotGuessUnresolvedDisconnect();
+    Runtime_DedicatedPlaytimeReconcilesUnresolvedEnterWorld();
     Runtime_EmitsEmptyIpWhenConnectAddressUnavailable();
     Runtime_AuthorizedIdentity_AllowsDisconnectEventWhenPlayerIdUnavailableAtDisconnect();
     Runtime_DropsPoisonEventsAndUnblocksOtherQueues();

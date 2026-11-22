@@ -812,13 +812,20 @@ void PluginRuntime::HandlePlayerConnected(ICod4xHost& host, int slot)
     }
 
     const std::uint64_t playerId = host.GetPlayerId(slot);
+    auto previousPlaytimePlayer = playtimePlayersBySlot.find(slot);
     if (playerId == 0)
     {
+        playtimePlayersBySlot[slot].IdentityResolved = false;
         return;
     }
 
     const std::int64_t nowUnixSeconds = host.GetUnixTimeSeconds();
     const std::string currentGuid = std::to_string(playerId);
+    if (previousPlaytimePlayer != playtimePlayersBySlot.end() &&
+        previousPlaytimePlayer->second.PlayerGuid != currentGuid)
+    {
+        previousPlaytimePlayer->second = {currentGuid, {}, false};
+    }
 
     // Always keep the roster state in sync with the live slot, even for a player who carried across
     // a map rotation. OnClientEnterWorld re-fires for every player on each map rotation (OnExitLevel
@@ -840,6 +847,10 @@ void PluginRuntime::HandlePlayerConnected(ICod4xHost& host, int slot)
     playerState.SteamId = host.GetPlayerSteamId(slot);
     playerState.Username = Trim(host.GetPlayerName(slot));
     playerState.Score = host.GetPlayerScore(slot);
+    if (playerState.Username.empty() && playtimePlayersBySlot.find(slot) == playtimePlayersBySlot.end())
+    {
+        playtimePlayersBySlot[slot] = {currentGuid, {}, false};
+    }
     if (playerState.ConnectedAtUnixSeconds == 0)
     {
         playerState.ConnectedAtUnixSeconds = nowUnixSeconds;
@@ -849,7 +860,8 @@ void PluginRuntime::HandlePlayerConnected(ICod4xHost& host, int slot)
     if (!playerState.Username.empty())
     {
         const auto previous = playtimePlayersBySlot.find(slot);
-        if (previous == playtimePlayersBySlot.end() || previous->second.PlayerGuid != currentGuid)
+        if (previous == playtimePlayersBySlot.end() || previous->second.PlayerGuid != currentGuid ||
+            previous->second.Username.empty())
         {
             playtimeFields = ",\"playerGuid\":\"" + JsonEscape(currentGuid) +
                 "\",\"username\":\"" + JsonEscape(playerState.Username) +
@@ -2348,7 +2360,7 @@ void PluginRuntime::FlushServerStatusSnapshot(ICod4xHost& host, std::int64_t now
         auto playtimePlayer = playtimePlayersBySlot.find(slot);
         if (playtimePlayer != playtimePlayersBySlot.end() && playtimePlayer->second.PlayerGuid != currentGuid)
         {
-            playtimePlayersBySlot.erase(playtimePlayer);
+            playtimePlayer->second = {currentGuid, {}, false};
         }
         if (!state.Username.empty())
         {
