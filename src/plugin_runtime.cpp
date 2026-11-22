@@ -929,18 +929,37 @@ void PluginRuntime::HandleClientAuthorized(ICod4xHost& host)
     const std::int64_t nowUnixSeconds = host.GetUnixTimeSeconds();
     for (auto& [slot, state] : connectedPlayers)
     {
+        const std::uint64_t livePlayerId = host.GetPlayerId(slot);
+        const std::string liveGuid = livePlayerId == 0 ? std::string() : std::to_string(livePlayerId);
+        if (!liveGuid.empty())
+        {
+            const auto playtimePlayer = playtimePlayersBySlot.find(slot);
+            if (playtimePlayer != playtimePlayersBySlot.end() &&
+                playtimePlayer->second.PlayerGuid != liveGuid)
+            {
+                playtimePlayer->second = {liveGuid, {}, false};
+            }
+        }
         if (state.PlayerGuid.empty())
         {
-            const std::uint64_t playerId = host.GetPlayerId(slot);
-            if (playerId != 0)
+            if (!liveGuid.empty())
             {
-                state.PlayerGuid = std::to_string(playerId);
+                state.PlayerGuid = liveGuid;
             }
         }
 
         if (state.Username.empty())
         {
             state.Username = Trim(host.GetPlayerName(slot));
+        }
+
+        auto playtimePlayer = playtimePlayersBySlot.find(slot);
+        if (!liveGuid.empty() && state.PlayerGuid == liveGuid && !state.Username.empty() &&
+            playtimePlayer != playtimePlayersBySlot.end() &&
+            (playtimePlayer->second.PlayerGuid.empty() || playtimePlayer->second.PlayerGuid == liveGuid))
+        {
+            playtimePlayer->second.PlayerGuid = liveGuid;
+            playtimePlayer->second.IdentityResolved = true;
         }
 
         if (state.SteamId == 0)
@@ -1011,13 +1030,17 @@ void PluginRuntime::HandlePlayerDisconnected(ICod4xHost& host, int slot)
     {
         const auto livePlayerId = host.GetPlayerId(slot);
         const auto& cached = playtimePlayer->second;
-        if ((cached.IdentityResolved || livePlayerId != 0) && !cached.PlayerGuid.empty() && !cached.Username.empty() &&
+        const bool sameState = state.PlayerGuid.empty() || state.PlayerGuid == cached.PlayerGuid;
+        const std::string& username = cached.Username.empty() && state.PlayerGuid == cached.PlayerGuid
+            ? state.Username : cached.Username;
+        if ((cached.IdentityResolved || livePlayerId != 0) && sameState &&
+            !cached.PlayerGuid.empty() && !username.empty() &&
             (livePlayerId == 0 || std::to_string(livePlayerId) == cached.PlayerGuid))
         {
             const auto nowUnixSeconds = host.GetUnixTimeSeconds();
             BufferPlaytimeObservation(nowUnixSeconds, 2,
                 ",\"playerGuid\":\"" + JsonEscape(cached.PlayerGuid) +
-                    "\",\"username\":\"" + JsonEscape(cached.Username) +
+                    "\",\"username\":\"" + JsonEscape(username) +
                     "\",\"slotId\":" + std::to_string(slot) + ",\"isBot\":null");
         }
         playtimePlayersBySlot.erase(playtimePlayer);
@@ -2786,11 +2809,7 @@ long long PluginRuntime::NextSequenceId()
 
 std::string PluginRuntime::GenerateMessageId()
 {
-    static std::mt19937_64 generator([] {
-        std::random_device source;
-        std::seed_seq seed{source(), source(), source(), source(), source(), source(), source(), source()};
-        return std::mt19937_64(seed);
-    }());
+    std::random_device source;
     static constexpr char kHexChars[] = "0123456789abcdef";
 
     std::uniform_int_distribution<unsigned int> distribution(0, 15);
@@ -2808,7 +2827,7 @@ std::string PluginRuntime::GenerateMessageId()
 
         for (int i = 0; i < groups[groupIndex]; ++i)
         {
-            output.push_back(kHexChars[distribution(generator)]);
+            output.push_back(kHexChars[distribution(source)]);
         }
     }
 

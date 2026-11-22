@@ -1287,6 +1287,82 @@ void Runtime_DedicatedPlaytimeReconcilesUnresolvedEnterWorld()
     RemoveTestConfig(configPath);
 }
 
+void Runtime_DedicatedPlaytimeDisconnectUsesResolvedIdentity()
+{
+    const auto configPath = WriteVpnProtectionConfig("playtime-disconnect-identity");
+    const std::string url = "https://example.test/ingest/events/playtime-observation";
+    for (int scenario = 0; scenario < 3; ++scenario)
+    {
+        FakeHost host;
+        ConfigureVpnProtectionPlayer(host);
+        host.Responses["POST https://example.test/ingest/events/player-disconnected"] = {202, ""};
+        portal_cod4x::PluginRuntime runtime(configPath.string());
+        runtime.Initialize(host, "0.2.0");
+        if (scenario == 0)
+        {
+            runtime.HandlePlayerConnect(host, 2, "");
+            host.PlayerIds.erase(2);
+            runtime.HandlePlayerConnected(host, 2);
+            host.PlayerIds[2] = 76561198000000001ULL;
+            runtime.HandleClientAuthorized(host);
+        }
+        else if (scenario == 1)
+        {
+            host.PlayerNames.erase(2);
+            runtime.HandlePlayerConnected(host, 2);
+            host.PlayerNames[2] = "PlayerOne";
+        }
+        else
+        {
+            runtime.HandlePlayerConnected(host, 2);
+            runtime.HandleServerExited(host);
+            host.PlayerIds[2] = 76561198000000002ULL;
+            host.PlayerNames[2] = "PlayerTwo";
+            runtime.HandlePlayerConnect(host, 2, "");
+            runtime.HandleClientAuthorized(host);
+        }
+        for (int i = 0; i < 10; ++i)
+        {
+            runtime.Tick(host);
+        }
+        if (scenario != 1)
+        {
+            host.PlayerIds.erase(2);
+        }
+        const auto start = host.Requests.size();
+        runtime.HandlePlayerDisconnected(host, 2);
+        for (int i = 0; i < 10; ++i)
+        {
+            runtime.Tick(host);
+        }
+        const auto leave = std::find_if(host.Requests.begin() + start, host.Requests.end(), [&](const FakeHost::RequestRecord& request) {
+            return request.Url == url && request.Body.find("\"kind\":2") != std::string::npos;
+        });
+        Assert(leave != host.Requests.end(), "A resolved disconnect identity must emit a leave");
+        const std::string expectedGuid = scenario == 2 ? "76561198000000002" : "76561198000000001";
+        Assert(leave->Body.find("\"playerGuid\":\"" + expectedGuid + "\"") != std::string::npos,
+            "The leave must identify the authorized occupant, not the stale slot occupant");
+    }
+    FakeHost host;
+    ConfigureVpnProtectionPlayer(host);
+    portal_cod4x::PluginRuntime runtime(configPath.string());
+    runtime.Initialize(host, "0.2.0");
+    runtime.HandlePlayerConnect(host, 2, "");
+    host.PlayerIds.erase(2);
+    runtime.HandlePlayerConnected(host, 2);
+    host.PlayerIds[2] = 76561198000000001ULL;
+    runtime.HandleClientAuthorized(host);
+    runtime.HandlePlayerConnected(host, 2);
+    for (int i = 0; i < 10; ++i)
+    {
+        runtime.Tick(host);
+    }
+    Assert(std::any_of(host.Requests.begin(), host.Requests.end(), [&](const FakeHost::RequestRecord& request) {
+        return request.Url == url && request.Body.find("\"kind\":1") != std::string::npos;
+    }), "Authorization alone must not suppress the player's first enter-world join");
+    RemoveTestConfig(configPath);
+}
+
 void Runtime_EmitsEmptyIpWhenConnectAddressUnavailable()
 {
     const std::filesystem::path configPath = std::filesystem::temp_directory_path() / "portal-cod4x-plugin.noip.test.json";
@@ -2658,6 +2734,7 @@ int main()
     Runtime_DedicatedPlaytimeTracksResolvedRosterIdentity();
     Runtime_DedicatedPlaytimeDoesNotGuessUnresolvedDisconnect();
     Runtime_DedicatedPlaytimeReconcilesUnresolvedEnterWorld();
+    Runtime_DedicatedPlaytimeDisconnectUsesResolvedIdentity();
     Runtime_EmitsEmptyIpWhenConnectAddressUnavailable();
     Runtime_AuthorizedIdentity_AllowsDisconnectEventWhenPlayerIdUnavailableAtDisconnect();
     Runtime_DropsPoisonEventsAndUnblocksOtherQueues();
