@@ -975,6 +975,94 @@ void Runtime_DedicatedPlaytimeEventsPreserveIdentityAndPrivacy()
     RemoveTestConfig(configPath);
 }
 
+void Runtime_DedicatedPlaytimeAmbiguousReconnectRemainsUncertain()
+{
+    const auto configPath = WriteVpnProtectionConfig("playtime-ambiguous-reconnect");
+    FakeHost host;
+    ConfigureVpnProtectionPlayer(host);
+    host.Responses["POST https://example.test/ingest/events/player-disconnected"] = {202, ""};
+    host.Responses["POST https://example.test/ingest/events/server-status"] = {202, ""};
+    const std::string url = "https://example.test/ingest/events/playtime-observation";
+    portal_cod4x::PluginRuntime runtime(configPath.string());
+    runtime.Initialize(host, "0.2.0");
+    runtime.HandlePlayerConnect(host, 2, "198.51.100.10");
+    runtime.HandlePlayerConnected(host, 2);
+    for (int i = 0; i < 10; ++i)
+    {
+        runtime.Tick(host);
+    }
+
+    // A zero-ID slot could be empty, a bot, or an unresolved player.
+    host.PlayerIds.erase(2);
+    host.PlayerNames.erase(2);
+    host.CurrentTime += 61;
+    const auto beforeSnapshot = host.Requests.size();
+    for (int i = 0; i < 10; ++i)
+    {
+        runtime.Tick(host);
+    }
+    const auto snapshot = std::find_if(host.Requests.begin() + beforeSnapshot, host.Requests.end(), [&](const FakeHost::RequestRecord& request) {
+        return request.Url == url && request.Body.find("\"kind\":4") != std::string::npos;
+    });
+    Assert(snapshot != host.Requests.end(), "Expected dedicated snapshot for unresolved slot");
+    const auto& body = snapshot->Body;
+    Assert(body.front() == '[' && body.back() == ']' &&
+        body.find("\"serverId\":\"11111111-2222-3333-4444-555555555555\"") != std::string::npos &&
+        body.find("\"gameType\":\"CallOfDuty4x\"") != std::string::npos &&
+        !JsonStringField(body, "eventGeneratedUtc").empty() &&
+        !JsonStringField(body, "eventPublishedUtc").empty() &&
+        !JsonStringField(body, "producerEpoch").empty() &&
+        JsonStringField(body, "observationId") == JsonStringField(body, "messageId") &&
+        !JsonStringField(body, "observationId").empty() &&
+        body.find("\"sequenceId\":") != std::string::npos &&
+        body.find("\"producerSequence\":") != std::string::npos &&
+        body.find("\"eventUtc\":\"1970-01-01T01:24:21Z\"") != std::string::npos &&
+        body.find("\"timestampQuality\":3") != std::string::npos &&
+        body.find("\"freshness\":1") != std::string::npos &&
+        body.find("\"rosterCompleteness\":2") != std::string::npos &&
+        body.find("\"players\":[]") != std::string::npos &&
+        body.find("\"producerStartedUtc\":\"1970-01-01T01:23:20Z\"") != std::string::npos &&
+        body.find("\"droppedCapacity\":0") != std::string::npos &&
+        body.find("\"droppedAttempts\":0") != std::string::npos &&
+        body.find("\"droppedAge\":0") != std::string::npos &&
+        body.find("198.51.100.10") == std::string::npos,
+        "Unresolved roster must have the dedicated envelope, partial status and local-only coverage counters");
+
+    host.PlayerIds[2] = 76561198000000001ULL;
+    host.PlayerNames[2] = "PlayerOne";
+    const auto beforeAmbiguousConnect = host.Requests.size();
+    runtime.HandlePlayerConnect(host, 2, "198.51.100.10");
+    runtime.HandlePlayerConnected(host, 2);
+    for (int i = 0; i < 10; ++i)
+    {
+        runtime.Tick(host);
+    }
+    Assert(std::none_of(host.Requests.begin() + beforeAmbiguousConnect, host.Requests.end(), [&](const FakeHost::RequestRecord& request) {
+        return request.Url == url && request.Body.find("\"kind\":1") != std::string::npos;
+    }), "An unresolved slot and same-player callback cannot prove a reconnect");
+
+    const auto beforeKnownReconnect = host.Requests.size();
+    runtime.HandlePlayerDisconnected(host, 2);
+    runtime.HandlePlayerConnect(host, 2, "198.51.100.10");
+    runtime.HandlePlayerConnected(host, 2);
+    for (int i = 0; i < 10; ++i)
+    {
+        runtime.Tick(host);
+    }
+    bool sawLeave = false;
+    bool sawJoin = false;
+    for (auto it = host.Requests.begin() + beforeKnownReconnect; it != host.Requests.end(); ++it)
+    {
+        if (it->Url == url)
+        {
+            sawLeave |= it->Body.find("\"kind\":2") != std::string::npos;
+            sawJoin |= it->Body.find("\"kind\":1") != std::string::npos;
+        }
+    }
+    Assert(sawLeave && sawJoin, "An observed disconnect followed by reconnect must emit both dedicated events");
+    RemoveTestConfig(configPath);
+}
+
 void Runtime_EmitsEmptyIpWhenConnectAddressUnavailable()
 {
     const std::filesystem::path configPath = std::filesystem::temp_directory_path() / "portal-cod4x-plugin.noip.test.json";
@@ -2341,6 +2429,7 @@ int main()
     Runtime_CoverageCountsInFlightEviction();
     Runtime_CoverageRetainsCountersAcrossStatusRetry();
     Runtime_DedicatedPlaytimeEventsPreserveIdentityAndPrivacy();
+    Runtime_DedicatedPlaytimeAmbiguousReconnectRemainsUncertain();
     Runtime_EmitsEmptyIpWhenConnectAddressUnavailable();
     Runtime_AuthorizedIdentity_AllowsDisconnectEventWhenPlayerIdUnavailableAtDisconnect();
     Runtime_DropsPoisonEventsAndUnblocksOtherQueues();

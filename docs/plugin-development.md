@@ -45,6 +45,8 @@ version 4.000 alone does not establish that compatibility. Callback timestamps r
 observes the event; hot-loaded players are not credited for earlier time.
 If a disconnect is missed, a same-player reconnect in the same slot cannot be distinguished safely
 from a late connect callback; its join can be suppressed and the resulting coverage remains uncertain.
+A zero-ID slot in a partial roster does not prove a disconnect, and the local discard counters do not
+count callbacks the plugin never observed or joins suppressed by this ambiguity.
 The plugin is the intended CoD4x playtime source; servers without an active plugin have a coverage gap.
 Deploy the ingest route and consumer before releasing the plugin. No production host coverage or
 callback freshness has been verified here.
