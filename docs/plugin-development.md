@@ -33,6 +33,8 @@ rather than treating measured time as complete.
 Playtime roster observations include `playtimeCoverage` with the producer's UTC start time and cumulative
 counts of dedicated playtime observations discarded for capacity, attempts or age during the accompanying producer epoch.
 Each discard is counted once; attempt exhaustion takes precedence if both thresholds are exceeded.
+The observation's producer epoch scopes these counters. Its `eventPublishedUtc` is stamped on the
+first publish attempt and retained on retries; the consumer uses it as the coverage report time.
 These counts report loss of local retention, not confirmed downstream loss: an in-flight request may
 already have been accepted. Counters reset on restart, and losses can occur before a status is delivered,
 so zero counts and a new epoch do not establish complete coverage.

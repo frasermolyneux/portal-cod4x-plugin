@@ -877,6 +877,51 @@ void Runtime_CoverageRetainsCountersAcrossStatusRetry()
     RemoveTestConfig(configPath);
 }
 
+void Runtime_CoverageUsesFirstPublicationTimeAcrossRetries()
+{
+    const auto configPath = WriteVpnProtectionConfig("coverage-publication-time");
+    FakeHost host;
+    ConfigureVpnProtectionPlayer(host);
+    host.Responses["POST https://example.test/ingest/events/server-status"] = {202, ""};
+    const std::string url = "https://example.test/ingest/events/playtime-observation";
+    host.Responses["POST " + url] = {500, ""};
+    portal_cod4x::PluginRuntime runtime(configPath.string());
+    runtime.Initialize(host, "0.2.0");
+
+    host.CurrentTime += 61;
+    runtime.Tick(host);
+    host.CurrentTime += 5;
+    runtime.Tick(host);
+    runtime.Tick(host);
+    runtime.Tick(host);
+
+    const auto snapshot = std::find_if(host.Requests.begin(), host.Requests.end(), [&](const FakeHost::RequestRecord& request) {
+        return request.Url == url && request.Body.find("\"kind\":4") != std::string::npos;
+    });
+    Assert(snapshot != host.Requests.end(), "Expected a delayed coverage snapshot");
+    const std::string originalBody = snapshot->Body;
+    Assert(JsonStringField(originalBody, "eventUtc") == "1970-01-01T01:24:21Z" &&
+        JsonStringField(originalBody, "eventPublishedUtc") == "1970-01-01T01:24:26Z" &&
+        JsonStringField(originalBody, "producerStartedUtc") == "1970-01-01T01:23:20Z" &&
+        !JsonStringField(originalBody, "producerEpoch").empty() &&
+        originalBody.find("\"droppedCapacity\":0") != std::string::npos &&
+        originalBody.find("\"droppedAttempts\":0") != std::string::npos &&
+        originalBody.find("\"droppedAge\":0") != std::string::npos,
+        "Coverage must carry the epoch, nonnegative counters and actual first-publication time");
+
+    host.Responses["POST " + url] = {202, ""};
+    host.CurrentTime += 3;
+    for (int i = 0; i < 10; ++i)
+    {
+        runtime.Tick(host);
+    }
+    const auto retries = std::count_if(host.Requests.begin(), host.Requests.end(), [&](const FakeHost::RequestRecord& request) {
+        return request.Url == url && request.Body == originalBody;
+    });
+    Assert(retries == 2, "Coverage retry must preserve the entire payload used for replay identity");
+    RemoveTestConfig(configPath);
+}
+
 void Runtime_DedicatedPlaytimeEventsPreserveIdentityAndPrivacy()
 {
     const auto configPath = WriteVpnProtectionConfig("dedicated-playtime");
@@ -2428,6 +2473,7 @@ int main()
     Runtime_CoverageCountsAgeAndSimultaneousThresholds();
     Runtime_CoverageCountsInFlightEviction();
     Runtime_CoverageRetainsCountersAcrossStatusRetry();
+    Runtime_CoverageUsesFirstPublicationTimeAcrossRetries();
     Runtime_DedicatedPlaytimeEventsPreserveIdentityAndPrivacy();
     Runtime_DedicatedPlaytimeAmbiguousReconnectRemainsUncertain();
     Runtime_EmitsEmptyIpWhenConnectAddressUnavailable();
