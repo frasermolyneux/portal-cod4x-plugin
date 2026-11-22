@@ -849,7 +849,7 @@ void PluginRuntime::HandlePlayerConnected(ICod4xHost& host, int slot)
     if (!playerState.Username.empty())
     {
         const auto previous = playtimePlayersBySlot.find(slot);
-        if (previous == playtimePlayersBySlot.end() || previous->second != currentGuid)
+        if (previous == playtimePlayersBySlot.end() || previous->second.PlayerGuid != currentGuid)
         {
             playtimeFields = ",\"playerGuid\":\"" + JsonEscape(currentGuid) +
                 "\",\"username\":\"" + JsonEscape(playerState.Username) +
@@ -858,8 +858,8 @@ void PluginRuntime::HandlePlayerConnected(ICod4xHost& host, int slot)
             {
                 playtimeFields += ",\"steamId\":\"" + std::to_string(playerState.SteamId) + "\"";
             }
-            playtimePlayersBySlot[slot] = currentGuid;
         }
+        playtimePlayersBySlot[slot] = {currentGuid, playerState.Username, true};
     }
 
     // playerState.IpAddress may be empty when this slot never fired OnPlayerConnect under the
@@ -994,17 +994,40 @@ void PluginRuntime::HandlePlayerDisconnected(ICod4xHost& host, int slot)
         state.Username = Trim(host.GetPlayerName(slot));
     }
 
-    playtimePlayersBySlot.erase(slot);
+    const auto playtimePlayer = playtimePlayersBySlot.find(slot);
+    if (playtimePlayer != playtimePlayersBySlot.end())
+    {
+        const auto livePlayerId = host.GetPlayerId(slot);
+        const auto& cached = playtimePlayer->second;
+        if ((cached.IdentityResolved || livePlayerId != 0) && !cached.PlayerGuid.empty() && !cached.Username.empty() &&
+            (livePlayerId == 0 || std::to_string(livePlayerId) == cached.PlayerGuid))
+        {
+            const auto nowUnixSeconds = host.GetUnixTimeSeconds();
+            BufferPlaytimeObservation(nowUnixSeconds, 2,
+                ",\"playerGuid\":\"" + JsonEscape(cached.PlayerGuid) +
+                    "\",\"username\":\"" + JsonEscape(cached.Username) +
+                    "\",\"slotId\":" + std::to_string(slot) + ",\"isBot\":null");
+        }
+        playtimePlayersBySlot.erase(playtimePlayer);
+    }
+    else if (!state.PlayerGuid.empty() && !state.Username.empty())
+    {
+        const auto livePlayerId = host.GetPlayerId(slot);
+        if (livePlayerId == 0 || std::to_string(livePlayerId) == state.PlayerGuid)
+        {
+            const auto nowUnixSeconds = host.GetUnixTimeSeconds();
+            BufferPlaytimeObservation(nowUnixSeconds, 2,
+                ",\"playerGuid\":\"" + JsonEscape(state.PlayerGuid) +
+                    "\",\"username\":\"" + JsonEscape(state.Username) +
+                    "\",\"slotId\":" + std::to_string(slot) + ",\"isBot\":null");
+        }
+    }
     if (state.PlayerGuid.empty() || state.Username.empty())
     {
         return;
     }
 
     const std::int64_t nowUnixSeconds = host.GetUnixTimeSeconds();
-    BufferPlaytimeObservation(nowUnixSeconds, 2,
-        ",\"playerGuid\":\"" + JsonEscape(state.PlayerGuid) +
-            "\",\"username\":\"" + JsonEscape(state.Username) +
-            "\",\"slotId\":" + std::to_string(slot) + ",\"isBot\":null");
     const std::string messageId = GenerateMessageId();
     BufferEvent(
         std::string(kQueuePlayerDisconnected),
@@ -2296,6 +2319,11 @@ void PluginRuntime::FlushServerStatusSnapshot(ICod4xHost& host, std::int64_t now
         {
             // Empty slot or bot (bots report id 0) — drop any stale entry for this slot.
             connectedPlayers.erase(slot);
+            const auto playtimePlayer = playtimePlayersBySlot.find(slot);
+            if (playtimePlayer != playtimePlayersBySlot.end())
+            {
+                playtimePlayer->second.IdentityResolved = false;
+            }
             continue;
         }
 
@@ -2316,6 +2344,15 @@ void PluginRuntime::FlushServerStatusSnapshot(ICod4xHost& host, std::int64_t now
         if (state.Username.empty())
         {
             state.Username = Trim(host.GetPlayerName(slot));
+        }
+        auto playtimePlayer = playtimePlayersBySlot.find(slot);
+        if (playtimePlayer != playtimePlayersBySlot.end() && playtimePlayer->second.PlayerGuid != currentGuid)
+        {
+            playtimePlayersBySlot.erase(playtimePlayer);
+        }
+        if (!state.Username.empty())
+        {
+            playtimePlayersBySlot[slot] = {currentGuid, state.Username, true};
         }
         if (state.SteamId == 0)
         {

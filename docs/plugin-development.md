@@ -49,6 +49,9 @@ If a disconnect is missed, a same-player reconnect in the same slot cannot be di
 from a late connect callback; its join can be suppressed and the resulting coverage remains uncertain.
 A zero-ID slot in a partial roster does not prove a disconnect, and the local discard counters do not
 count callbacks the plugin never observed or joins suppressed by this ambiguity.
+Resolved roster identities prevent duplicate joins on map re-entry and are retained across level exit
+for disconnect callbacks. If a later snapshot cannot resolve the slot or identifies a different player,
+the previous identity is not used to invent a leave; missed callbacks can still leave coverage uncertain.
 The plugin is the intended CoD4x playtime source; servers without an active plugin have a coverage gap.
 Deploy the ingest route and consumer before releasing the plugin. No production host coverage or
 callback freshness has been verified here.

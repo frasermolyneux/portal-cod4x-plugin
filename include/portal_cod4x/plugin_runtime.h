@@ -172,6 +172,13 @@ private:
         bool VpnEvaluationQueued = false;
     };
 
+    struct PlaytimePlayerState
+    {
+        std::string PlayerGuid;
+        std::string Username;
+        bool IdentityResolved = false;
+    };
+
     struct ServerOriginatedBan
     {
         std::string PlayerGuid;
@@ -221,7 +228,7 @@ private:
     std::uint64_t droppedPlaytimeCapacity = 0;
     std::uint64_t droppedPlaytimeAttempts = 0;
     std::uint64_t droppedPlaytimeAge = 0;
-    std::unordered_map<int, std::string> playtimePlayersBySlot;
+    std::unordered_map<int, PlaytimePlayerState> playtimePlayersBySlot;
 
     // Player GUIDs for which a player-connected event has already been emitted this session.
     // Keyed by GUID (not slot) so it survives the map-rotation boundary (OnExitLevel clears the
