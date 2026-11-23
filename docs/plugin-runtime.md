@@ -68,6 +68,28 @@ when the plugin loads, or carried across a map change without provable continuit
 null connection ID; the plugin logs the uncertainty and such a player must not be treated as
 a fresh Siege admission. An observed new connection receives a new UUID.
 
+If a real IP arrives after the connect event, the plugin also emits a
+`player-ip-resolved` event with the player GUID, slot and nullable connection ID.
+Both event types mark plugin-owned protection evaluation so consumers do not duplicate it.
+
+## Siege evaluation
+
+Observed connections are evaluated with `siegeEvaluation` enabled, first with a GUID only if
+the IP is unavailable and again when a real IP arrives. The existing VPN decision remains
+independent. Unknown connection continuity is passed as a null connection ID and is not
+eligible for a Siege kick.
+
+A Siege decision must explicitly specify `mode: "Enforce"` and match the live GUID, slot,
+connection ID and generation, with an unexpired decision. The plugin invokes CoD4x's
+`Plugin_DropClient` directly with the kick reason and reports `Dispatched`, which does not
+confirm that the player was dropped. Stale or invalid decisions are reported as `Stale` or
+`Failed`. Outcome reports are retried while the plugin runs; a process restart can leave
+unacknowledged outcomes pending for reconciliation.
+
+Dry-run matches are recorded by the service and return no dispatchable Siege decision.
+Unknown or missing decision modes also fail open. VPN Protection can still enforce its own
+independent decision during a Siege dry run.
+
 ## Version source
 
 Version is sourced from `version.json` and injected by CMake into compile definitions:

@@ -170,6 +170,7 @@ private:
         std::uint64_t SteamId = 0;
         std::uint64_t ConnectionGeneration = 0;
         std::int64_t ConnectedAtUnixSeconds = 0;
+        bool GuidOnlyEvaluationQueued = false;
         bool VpnEvaluationQueued = false;
     };
 
@@ -197,6 +198,15 @@ private:
         std::string IpAddress;
         int SlotId = -1;
         std::uint64_t ConnectionGeneration = 0;
+    };
+
+    struct SiegeOutcome
+    {
+        std::string SessionId;
+        std::string ActionId;
+        std::string ConnectionId;
+        std::string Outcome;
+        std::string Detail;
     };
 
     std::string configPath;
@@ -243,6 +253,11 @@ private:
     std::int64_t vpnEvaluationRequestStartedUnixSeconds = 0;
     std::deque<PendingVpnEvaluation> pendingVpnEvaluations;
     std::optional<PendingVpnEvaluation> activeVpnEvaluation;
+    std::unordered_set<std::string> handledSiegeActions;
+    std::deque<SiegeOutcome> pendingSiegeOutcomes;
+    HttpRequestHandle siegeOutcomeRequest = nullptr;
+    std::int64_t siegeOutcomeRequestStartedUnixSeconds = 0;
+    std::int64_t nextSiegeOutcomeAttemptUnixSeconds = 0;
 
     BanSyncStage banSyncStage = BanSyncStage::Idle;
     HttpRequestHandle banSyncRequest = nullptr;
@@ -277,10 +292,12 @@ private:
     void AbortIngest(ICod4xHost& host, std::int64_t nowUnixSeconds, std::string_view reason);
     void FlushServerStatusSnapshot(ICod4xHost& host, std::int64_t nowUnixSeconds);
 
-    void QueueVpnEvaluation(ConnectedPlayerState& playerState);
+    void QueueVpnEvaluation(ICod4xHost& host, ConnectedPlayerState& playerState);
     void AdvanceVpnEvaluation(ICod4xHost& host, std::int64_t nowUnixSeconds);
     bool StartVpnEvaluationRequest(ICod4xHost& host, std::int64_t nowUnixSeconds);
     void CompleteVpnEvaluation(ICod4xHost& host, const HttpResponse& response);
+    void CompleteSiegeEvaluation(ICod4xHost& host, const std::string& siegeJson, bool vpnMatched);
+    void AdvanceSiegeOutcomes(ICod4xHost& host, std::int64_t nowUnixSeconds);
     void ResetVpnEvaluation(ICod4xHost& host);
     std::string BuildVpnEvaluationPayload(const PendingVpnEvaluation& evaluation) const;
 
@@ -313,6 +330,10 @@ private:
         const std::string& connectionId,
         const std::string& username,
         int slotId);
+    std::string BuildPlayerIpResolvedPayload(
+        std::int64_t nowUnixSeconds,
+        const std::string& messageId,
+        const ConnectedPlayerState& playerState);
     std::string BuildChatMessagePayload(
         std::int64_t nowUnixSeconds,
         const std::string& messageId,
