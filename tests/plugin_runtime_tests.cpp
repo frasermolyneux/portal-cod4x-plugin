@@ -2659,6 +2659,7 @@ void Runtime_VpnProtectionLateIpAndDuplicateCallbacks_QueueOneRequest()
 
     portal_cod4x::PluginRuntime runtime(configPath.string());
     runtime.Initialize(host, "0.2.0");
+    runtime.HandlePlayerConnect(host, 2, "0.0.0.0:28960");
     runtime.HandlePlayerConnected(host, 2);
     runtime.Tick(host);
     runtime.Tick(host);
@@ -2711,6 +2712,117 @@ void Runtime_VpnProtectionSamePlayerReconnect_CancelsStaleRequest()
 
     RemoveTestConfig(configPath);
 }
+
+void Runtime_ConnectionIdCorrelatesEventsAndVpnAndFailsOpenAcrossLevelChange()
+{
+    const auto configPath = WriteVpnProtectionConfig("connection-correlation");
+    FakeHost host;
+    ConfigureVpnProtectionPlayer(host);
+    host.Responses["POST https://example.test/ingest/events/player-disconnected"] = {202, ""};
+    host.Responses["POST https://example.test/ingest/vpn-protection/evaluate"] = {200, "{\"matched\":false}"};
+    portal_cod4x::PluginRuntime runtime(configPath.string());
+    runtime.Initialize(host, "0.2.0");
+    runtime.HandlePlayerConnect(host, 2, "198.51.100.10");
+    runtime.HandlePlayerConnected(host, 2);
+    for (int i = 0; i < 8; ++i) runtime.Tick(host);
+
+    const auto getConnectionId = [](const std::string& body) {
+        const std::string prefix = "\"connectionId\":\"";
+        const auto start = body.find(prefix);
+        if (start == std::string::npos) return std::string{};
+        const auto valueStart = start + prefix.size();
+        return body.substr(valueStart, body.find('"', valueStart) - valueStart);
+    };
+    const auto connect = std::find_if(host.Requests.begin(), host.Requests.end(), [](const auto& request) {
+        return request.Url == "https://example.test/ingest/events/player-connected";
+    });
+    const auto evaluation = std::find_if(host.Requests.begin(), host.Requests.end(), [](const auto& request) {
+        return request.Url == "https://example.test/ingest/vpn-protection/evaluate";
+    });
+    Assert(connect != host.Requests.end() && evaluation != host.Requests.end(), "Expected connect and VPN requests");
+    const auto connectionId = getConnectionId(connect->Body);
+    Assert(connectionId.size() == 36 && getConnectionId(evaluation->Body) == connectionId,
+        "Connect and evaluation must share a UUID");
+
+    runtime.HandleServerExited(host);
+    runtime.HandlePlayerConnected(host, 2);
+    runtime.HandlePlayerDisconnected(host, 2);
+    for (int i = 0; i < 8; ++i) runtime.Tick(host);
+    const auto disconnect = std::find_if(host.Requests.begin(), host.Requests.end(), [](const auto& request) {
+        return request.Url == "https://example.test/ingest/events/player-disconnected";
+    });
+    Assert(disconnect != host.Requests.end() &&
+        disconnect->Body.find("\"connectionId\":null") != std::string::npos,
+        "Unproven map continuity must not assert the previous connection ID");
+    Assert(std::find(host.Logs.begin(), host.Logs.end(),
+        "Player connection continuity is unknown after level change; Siege checks must fail open") != host.Logs.end(),
+        "Unproven map continuity must be logged");
+
+    runtime.HandlePlayerConnect(host, 2, "198.51.100.10");
+    runtime.HandlePlayerConnected(host, 2);
+    for (int i = 0; i < 8; ++i) runtime.Tick(host);
+    const auto reconnect = std::find_if(host.Requests.rbegin(), host.Requests.rend(), [](const auto& request) {
+        return request.Url == "https://example.test/ingest/events/player-connected";
+    });
+    Assert(reconnect != host.Requests.rend() && !getConnectionId(reconnect->Body).empty() &&
+        getConnectionId(reconnect->Body) != connectionId, "Reconnect must receive a fresh connection ID");
+    RemoveTestConfig(configPath);
+}
+
+void Runtime_ConnectCallbackAfterLevelExitStartsNewConnection()
+{
+    const auto configPath = WriteVpnProtectionConfig("connection-after-exit");
+    FakeHost host;
+    ConfigureVpnProtectionPlayer(host);
+    host.Responses["POST https://example.test/ingest/vpn-protection/evaluate"] = {200, "{\"matched\":false}"};
+    portal_cod4x::PluginRuntime runtime(configPath.string());
+    runtime.Initialize(host, "0.2.0");
+    runtime.HandlePlayerConnect(host, 2, "198.51.100.10");
+    runtime.HandlePlayerConnected(host, 2);
+    for (int i = 0; i < 8; ++i) runtime.Tick(host);
+
+    runtime.HandleServerExited(host);
+    runtime.HandlePlayerConnect(host, 2, "198.51.100.10");
+    runtime.HandlePlayerConnected(host, 2);
+    for (int i = 0; i < 8; ++i) runtime.Tick(host);
+    std::vector<std::string> bodies;
+    for (const auto& request : host.Requests)
+    {
+        if (request.Url == "https://example.test/ingest/events/player-connected")
+        {
+            bodies.push_back(request.Body);
+        }
+    }
+    Assert(bodies.size() == 2 && bodies[0] != bodies[1],
+        "A connect callback after level exit must emit a fresh connection");
+    const std::string prefix = "\"connectionId\":\"";
+    const auto first = bodies[0].find(prefix);
+    const auto second = bodies[1].find(prefix);
+    Assert(first != std::string::npos && second != std::string::npos &&
+        bodies[0].substr(first + prefix.size(), 36) != bodies[1].substr(second + prefix.size(), 36),
+        "A connect callback after level exit must use a new connection ID");
+    RemoveTestConfig(configPath);
+}
+
+void Runtime_UnobservedConnectionIsNotAssignedAnAdmissionId()
+{
+    const auto configPath = WriteVpnProtectionConfig("connection-unobserved");
+    FakeHost host;
+    ConfigureVpnProtectionPlayer(host);
+    portal_cod4x::PluginRuntime runtime(configPath.string());
+    runtime.Initialize(host, "0.2.0");
+    runtime.HandlePlayerConnected(host, 2);
+    for (int i = 0; i < 8; ++i) runtime.Tick(host);
+    const auto connect = std::find_if(host.Requests.begin(), host.Requests.end(), [](const auto& request) {
+        return request.Url == "https://example.test/ingest/events/player-connected";
+    });
+    Assert(connect != host.Requests.end() && connect->Body.find("\"connectionId\":null") != std::string::npos,
+        "A player already present when the plugin starts must not receive an admission ID");
+    Assert(std::find(host.Logs.begin(), host.Logs.end(),
+        "Player connection was not observed; Siege checks must fail open") != host.Logs.end(),
+        "Unobserved connections must be logged");
+    RemoveTestConfig(configPath);
+}
 }
 
 int main()
@@ -2749,6 +2861,9 @@ int main()
     Runtime_VpnProtectionSlotReuse_IgnoresDecision();
     Runtime_VpnProtectionLateIpAndDuplicateCallbacks_QueueOneRequest();
     Runtime_VpnProtectionSamePlayerReconnect_CancelsStaleRequest();
+    Runtime_ConnectionIdCorrelatesEventsAndVpnAndFailsOpenAcrossLevelChange();
+    Runtime_ConnectCallbackAfterLevelExitStartsNewConnection();
+    Runtime_UnobservedConnectionIsNotAssignedAnAdmissionId();
     Runtime_HandleClientCommand_DoesNotPrefixMatchLongerToken();
     Runtime_HandleClientCommand_DedupesCrossCallbackPath();
     Runtime_HandleClientCommand_PortalPluginHealth_UsesConsoleAndTellFlow();

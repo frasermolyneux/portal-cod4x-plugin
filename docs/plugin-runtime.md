@@ -60,6 +60,14 @@ The plugin registers two RCON ban-list commands at default power 30:
 
 `dumpportalbanlist` renders one line per cached ban with its CoD4x player identifier and enforcement reason, followed by an `Active portal bans` count. Portal bans remain excluded from `dumpbanlist` so the agent cannot re-import portal-owned records as new server bans.
 
+## Connection correlation
+
+Observed player connections receive a UUID shared by their connect event and VPN evaluation.
+Disconnect events include that UUID when the connection is known. A player already present
+when the plugin loads, or carried across a map change without provable continuity, has a
+null connection ID; the plugin logs the uncertainty and such a player must not be treated as
+a fresh Siege admission. An observed new connection receives a new UUID.
+
 ## Version source
 
 Version is sourced from `version.json` and injected by CMake into compile definitions:

@@ -162,6 +162,7 @@ private:
     struct ConnectedPlayerState
     {
         std::string PlayerGuid;
+        std::string ConnectionId;
         std::string Username;
         std::string IpAddress;
         int SlotId = -1;
@@ -191,6 +192,7 @@ private:
     struct PendingVpnEvaluation
     {
         std::string PlayerGuid;
+        std::string ConnectionId;
         std::string Username;
         std::string IpAddress;
         int SlotId = -1;
@@ -222,6 +224,7 @@ private:
     std::vector<std::string> ingestBatchMessageIds;
     std::deque<BufferedEvent> bufferedEvents;
     std::unordered_map<int, ConnectedPlayerState> connectedPlayers;
+    std::unordered_map<int, ConnectedPlayerState> playersAtLevelExit;
     std::uint64_t nextConnectionGeneration = 0;
     std::string producerEpoch;
     std::int64_t producerStartedUnixSeconds = 0;
@@ -298,6 +301,7 @@ private:
         std::int64_t nowUnixSeconds,
         const std::string& messageId,
         const std::string& playerGuid,
+        const std::string& connectionId,
         std::uint64_t steamId,
         const std::string& username,
         const std::string& ipAddress,
@@ -306,6 +310,7 @@ private:
         std::int64_t nowUnixSeconds,
         const std::string& messageId,
         const std::string& playerGuid,
+        const std::string& connectionId,
         const std::string& username,
         int slotId);
     std::string BuildChatMessagePayload(

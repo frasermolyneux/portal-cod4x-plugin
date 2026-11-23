@@ -775,11 +775,26 @@ void PluginRuntime::HandlePlayerConnect(ICod4xHost& host, int slot, std::string_
         return;
     }
 
+    auto prior = playersAtLevelExit.find(slot);
+    if (prior != playersAtLevelExit.end())
+    {
+        const auto generation = prior->second.ConnectionGeneration;
+        connectEmittedGuids.erase(prior->second.PlayerGuid);
+        std::erase_if(pendingVpnEvaluations, [generation](const PendingVpnEvaluation& evaluation) {
+            return evaluation.ConnectionGeneration == generation;
+        });
+        if (activeVpnEvaluation.has_value() && activeVpnEvaluation->ConnectionGeneration == generation)
+        {
+            ResetVpnEvaluation(host);
+        }
+        playersAtLevelExit.erase(prior);
+    }
     ConnectedPlayerState& playerState = connectedPlayers[slot];
     playerState.SlotId = slot;
     if (playerState.ConnectionGeneration == 0)
     {
         playerState.ConnectionGeneration = ++nextConnectionGeneration;
+        playerState.ConnectionId = GenerateMessageId();
     }
 
     // Only overwrite a previously captured IP when we have a real address for this slot.
@@ -832,6 +847,15 @@ void PluginRuntime::HandlePlayerConnected(ICod4xHost& host, int slot)
     // clears the per-slot map) with no intervening OnPlayerDC; populating connectedPlayers here (and
     // not only for freshly connecting GUIDs) ensures carried-over players remain in the periodic
     // server-status snapshot rather than silently dropping out until they next chat.
+    auto prior = playersAtLevelExit.find(slot);
+    if (connectedPlayers.find(slot) == connectedPlayers.end() && prior != playersAtLevelExit.end() &&
+        prior->second.PlayerGuid == currentGuid)
+    {
+        prior->second.ConnectionId.clear();
+        LogInfo(host, "Player connection continuity is unknown after level change; Siege checks must fail open");
+        connectedPlayers.emplace(slot, std::move(prior->second));
+    }
+    playersAtLevelExit.erase(slot);
     ConnectedPlayerState& playerState = connectedPlayers[slot];
     if (!playerState.PlayerGuid.empty() && playerState.PlayerGuid != currentGuid)
     {
@@ -842,6 +866,7 @@ void PluginRuntime::HandlePlayerConnected(ICod4xHost& host, int slot)
     if (playerState.ConnectionGeneration == 0)
     {
         playerState.ConnectionGeneration = ++nextConnectionGeneration;
+        LogInfo(host, "Player connection was not observed; Siege checks must fail open");
     }
     playerState.PlayerGuid = currentGuid;
     playerState.SteamId = host.GetPlayerSteamId(slot);
@@ -904,6 +929,7 @@ void PluginRuntime::HandlePlayerConnected(ICod4xHost& host, int slot)
             nowUnixSeconds,
             messageId,
             playerState.PlayerGuid,
+            playerState.ConnectionId,
             playerState.SteamId,
             playerState.Username,
             playerState.IpAddress,
@@ -995,6 +1021,15 @@ void PluginRuntime::HandlePlayerDisconnected(ICod4xHost& host, int slot)
         state = stateIt->second;
         connectedPlayers.erase(stateIt);
     }
+    else
+    {
+        auto prior = playersAtLevelExit.find(slot);
+        if (prior != playersAtLevelExit.end())
+        {
+            state = std::move(prior->second);
+        }
+    }
+    playersAtLevelExit.erase(slot);
 
     if (state.PlayerGuid.empty())
     {
@@ -1066,7 +1101,7 @@ void PluginRuntime::HandlePlayerDisconnected(ICod4xHost& host, int slot)
     const std::string messageId = GenerateMessageId();
     BufferEvent(
         std::string(kQueuePlayerDisconnected),
-        BuildPlayerDisconnectedPayload(nowUnixSeconds, messageId, state.PlayerGuid, state.Username, slot),
+        BuildPlayerDisconnectedPayload(nowUnixSeconds, messageId, state.PlayerGuid, state.ConnectionId, state.Username, slot),
         messageId,
         nowUnixSeconds);
 }
@@ -1253,7 +1288,7 @@ void PluginRuntime::HandleServerSpawned(ICod4xHost& host)
     nextServerStatusUnixSeconds = nowUnixSeconds;
 }
 
-void PluginRuntime::HandleServerExited(ICod4xHost&)
+void PluginRuntime::HandleServerExited(ICod4xHost& host)
 {
     // Preserve the once-per-connection guard across the level boundary (players carry over a map
     // rotation without an OnPlayerDC), but prune GUIDs no longer present (e.g. a missed OnPlayerDC)
@@ -1280,6 +1315,15 @@ void PluginRuntime::HandleServerExited(ICod4xHost&)
         }
     }
 
+    playersAtLevelExit.clear();
+    for (auto& [slot, state] : connectedPlayers)
+    {
+        const auto liveId = host.GetPlayerId(slot);
+        if (liveId != 0 && state.PlayerGuid == std::to_string(liveId))
+        {
+            playersAtLevelExit.emplace(slot, std::move(state));
+        }
+    }
     connectedPlayers.clear();
 }
 
@@ -1864,6 +1908,7 @@ void PluginRuntime::QueueVpnEvaluation(ConnectedPlayerState& playerState)
 
     pendingVpnEvaluations.push_back(PendingVpnEvaluation{
         playerState.PlayerGuid,
+        playerState.ConnectionId,
         playerState.Username,
         playerState.IpAddress,
         playerState.SlotId,
@@ -2042,7 +2087,9 @@ std::string PluginRuntime::BuildVpnEvaluationPayload(const PendingVpnEvaluation&
     return "{\"serverId\":\"" + JsonEscape(serverContext.GameServerId) +
         "\",\"ipAddress\":\"" + JsonEscape(evaluation.IpAddress) +
         "\",\"playerGuid\":\"" + JsonEscape(evaluation.PlayerGuid) +
-        "\",\"username\":\"" + JsonEscape(evaluation.Username) +
+        "\",\"connectionId\":" + (evaluation.ConnectionId.empty() ? "null" :
+            "\"" + JsonEscape(evaluation.ConnectionId) + "\"") +
+        ",\"username\":\"" + JsonEscape(evaluation.Username) +
         "\",\"slotId\":" + std::to_string(evaluation.SlotId) + "}";
 }
 
@@ -2461,6 +2508,7 @@ std::string PluginRuntime::BuildPlayerConnectedPayload(
     std::int64_t nowUnixSeconds,
     const std::string& messageId,
     const std::string& playerGuid,
+    const std::string& connectionId,
     std::uint64_t steamId,
     const std::string& username,
     const std::string& ipAddress,
@@ -2470,6 +2518,8 @@ std::string PluginRuntime::BuildPlayerConnectedPayload(
     std::string payload = BuildBaseEventPrefix(nowUnixSeconds, messageId, sequenceId);
     payload += BuildPlaytimeMetadata(nowUnixSeconds, messageId, sequenceId, 2, 0);
     payload += ",\"playerGuid\":\"" + JsonEscape(playerGuid) + "\"";
+    payload += connectionId.empty() ? ",\"connectionId\":null" :
+        ",\"connectionId\":\"" + JsonEscape(connectionId) + "\"";
     payload += ",\"steamId\":\"" + std::to_string(steamId) + "\"";
     payload += ",\"username\":\"" + JsonEscape(username) + "\"";
     payload += ",\"ipAddress\":\"" + JsonEscape(ipAddress) + "\"";
@@ -2483,6 +2533,7 @@ std::string PluginRuntime::BuildPlayerDisconnectedPayload(
     std::int64_t nowUnixSeconds,
     const std::string& messageId,
     const std::string& playerGuid,
+    const std::string& connectionId,
     const std::string& username,
     int slotId)
 {
@@ -2490,6 +2541,8 @@ std::string PluginRuntime::BuildPlayerDisconnectedPayload(
     std::string payload = BuildBaseEventPrefix(nowUnixSeconds, messageId, sequenceId);
     payload += BuildPlaytimeMetadata(nowUnixSeconds, messageId, sequenceId, 2, 0);
     payload += ",\"playerGuid\":\"" + JsonEscape(playerGuid) + "\"";
+    payload += connectionId.empty() ? ",\"connectionId\":null" :
+        ",\"connectionId\":\"" + JsonEscape(connectionId) + "\"";
     payload += ",\"username\":\"" + JsonEscape(username) + "\"";
     payload += ",\"slotId\":" + std::to_string(slotId);
     payload += ",\"isBot\":null";
@@ -2948,16 +3001,18 @@ std::string PluginRuntime::NormalizeIpAddress(std::string ipAddress)
     const std::size_t bracketPos = ipAddress.rfind("]:");
     if (!ipAddress.empty() && ipAddress.front() == '[' && bracketPos != std::string::npos)
     {
-        return ipAddress.substr(1, bracketPos - 1);
+        ipAddress = ipAddress.substr(1, bracketPos - 1);
     }
-
-    const std::size_t colonPos = ipAddress.rfind(':');
-    if (colonPos != std::string::npos && ipAddress.find('.') != std::string::npos)
+    else
     {
-        return ipAddress.substr(0, colonPos);
+        const std::size_t colonPos = ipAddress.rfind(':');
+        if (colonPos != std::string::npos && ipAddress.find('.') != std::string::npos)
+        {
+            ipAddress = ipAddress.substr(0, colonPos);
+        }
     }
 
-    return ipAddress;
+    return ipAddress == "0.0.0.0" || ipAddress == "::" ? std::string() : ipAddress;
 }
 
 std::string PluginRuntime::Trim(std::string value)
