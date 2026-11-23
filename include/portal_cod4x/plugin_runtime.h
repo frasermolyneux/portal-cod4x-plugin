@@ -169,9 +169,10 @@ private:
         int Score = 0;
         std::uint64_t SteamId = 0;
         std::uint64_t ConnectionGeneration = 0;
+        std::uint64_t IpRevision = 0;
         std::int64_t ConnectedAtUnixSeconds = 0;
         bool GuidOnlyEvaluationQueued = false;
-        bool VpnEvaluationQueued = false;
+        std::string LastVpnEvaluationIp;
     };
 
     struct PlaytimePlayerState
@@ -198,6 +199,7 @@ private:
         std::string IpAddress;
         int SlotId = -1;
         std::uint64_t ConnectionGeneration = 0;
+        std::uint64_t IpRevision = 0;
     };
 
     struct SiegeOutcome

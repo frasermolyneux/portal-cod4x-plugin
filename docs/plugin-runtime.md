@@ -68,8 +68,8 @@ when the plugin loads, or carried across a map change without provable continuit
 null connection ID; the plugin logs the uncertainty and such a player must not be treated as
 a fresh Siege admission. An observed new connection receives a new UUID.
 
-If a real IP arrives after the connect event, the plugin also emits a
-`player-ip-resolved` event with the player GUID, slot and nullable connection ID.
+If a real IP arrives or changes after the connect event, the plugin emits a
+`player-ip-resolved` event with a unique observation ID, the player GUID, slot and nullable connection ID.
 Both event types mark plugin-owned protection evaluation so consumers do not duplicate it.
 
 ## Siege evaluation

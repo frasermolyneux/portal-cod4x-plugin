@@ -2725,6 +2725,50 @@ void Runtime_VpnProtectionLateIpAndDuplicateCallbacks_QueueSeparateChecks()
     RemoveTestConfig(configPath);
 }
 
+void Runtime_IpObservationsHaveStableRetryIdsAndDistinctChangeIds()
+{
+    const auto configPath = WriteVpnProtectionConfig("ip-observation-ids");
+    FakeHost host;
+    ConfigureVpnProtectionPlayer(host);
+    const std::string ipUrl = "https://example.test/ingest/events/player-ip-resolved";
+    host.Responses["POST " + ipUrl] = {503, ""};
+    host.Responses["POST https://example.test/ingest/vpn-protection/evaluate"] = {200, "{\"matched\":false}"};
+    portal_cod4x::PluginRuntime runtime(configPath.string());
+    runtime.Initialize(host, "0.2.0");
+    runtime.HandlePlayerConnect(host, 2, "");
+    runtime.HandlePlayerConnected(host, 2);
+    for (int i = 0; i < 8; ++i) runtime.Tick(host);
+    runtime.HandlePlayerConnect(host, 2, "198.51.100.10");
+    for (int i = 0; i < 8; ++i) runtime.Tick(host);
+    host.Responses["POST " + ipUrl] = {202, ""};
+    host.CurrentTime += 3;
+    for (int i = 0; i < 8; ++i) runtime.Tick(host);
+    runtime.HandlePlayerConnect(host, 2, "198.51.100.11");
+    runtime.HandlePlayerConnect(host, 2, "198.51.100.11");
+    for (int i = 0; i < 8; ++i) runtime.Tick(host);
+
+    std::vector<std::string> bodies;
+    for (const auto& request : host.Requests)
+    {
+        if (request.Url == ipUrl) bodies.push_back(request.Body);
+    }
+    Assert(bodies.size() == 3, "Expected one retry and one distinct changed-IP event");
+    const auto messageId = [](const std::string& body) {
+        const std::string prefix = "\"messageId\":\"";
+        const auto start = body.find(prefix);
+        return start == std::string::npos ? std::string{} : body.substr(start + prefix.size(), 36);
+    };
+    const auto firstId = messageId(bodies[0]);
+    Assert(firstId.size() == 36 && messageId(bodies[1]) == firstId && messageId(bodies[2]).size() == 36 &&
+        messageId(bodies[2]) != firstId, "Retries must preserve IDs and new observations must receive new IDs");
+    Assert(bodies[2].find("\"ipAddress\":\"198.51.100.11\"") != std::string::npos,
+        "Changed IP event must contain the new address");
+    Assert(std::count_if(host.Requests.begin(), host.Requests.end(), [](const auto& request) {
+        return request.Url == "https://example.test/ingest/vpn-protection/evaluate";
+    }) == 3, "Each distinct IP must be evaluated without duplicating identical callbacks");
+    RemoveTestConfig(configPath);
+}
+
 void Runtime_VpnProtectionSamePlayerReconnect_CancelsStaleRequest()
 {
     const auto configPath = WriteVpnProtectionConfig("same-player-reconnect");
@@ -3024,6 +3068,39 @@ void Runtime_SiegeDropCanSynchronouslyInvokeDisconnect()
     RemoveTestConfig(configPath);
 }
 
+void Runtime_IpChangeInvalidatesInFlightDecisions()
+{
+    for (int scenario = 0; scenario < 2; ++scenario)
+    {
+        const auto configPath = WriteVpnProtectionConfig("ip-change-stale-" + std::to_string(scenario));
+        FakeHost host;
+        ConfigureVpnProtectionPlayer(host);
+        host.InjectEvaluationConnectionId = true;
+        host.Responses["POST https://example.test/ingest/vpn-protection/evaluate"] = {
+            200, scenario == 0 ? "{\"matched\":true,\"action\":\"Ban\",\"reason\":\"VPN\"}" :
+                SiegeResponse("1970-01-01T01:30:00Z")};
+        host.Responses["POST https://example.test/ingest/siege-mode/outcome"] = {204, ""};
+        portal_cod4x::PluginRuntime runtime(configPath.string());
+        runtime.Initialize(host, "0.2.0");
+        runtime.HandlePlayerConnect(host, 2, "198.51.100.10");
+        runtime.HandlePlayerConnected(host, 2);
+        runtime.Tick(host);
+        runtime.HandlePlayerConnect(host, 2, "198.51.100.11");
+        host.Responses["POST https://example.test/ingest/vpn-protection/evaluate"] = {200, "{\"matched\":false}"};
+        for (int i = 0; i < 6; ++i) runtime.Tick(host);
+        Assert(host.ExecutedCommands.empty() && host.DroppedPlayers.empty(),
+            "A decision for an old IP must never enforce against the new observation");
+        if (scenario == 1)
+        {
+            Assert(std::any_of(host.Requests.begin(), host.Requests.end(), [](const auto& request) {
+                return request.Url == "https://example.test/ingest/siege-mode/outcome" &&
+                    request.Body.find("\"outcome\":\"Stale\"") != std::string::npos;
+            }), "A stale Siege claim must be reported");
+        }
+        RemoveTestConfig(configPath);
+    }
+}
+
 void Runtime_SiegeAndVpnConflictsNeverDoubleEnforce()
 {
     const auto configPath = WriteVpnProtectionConfig("siege-vpn-conflict");
@@ -3085,6 +3162,7 @@ int main()
     Runtime_VpnProtectionTransportFailure_FailsOpen();
     Runtime_VpnProtectionSlotReuse_IgnoresDecision();
     Runtime_VpnProtectionLateIpAndDuplicateCallbacks_QueueSeparateChecks();
+    Runtime_IpObservationsHaveStableRetryIdsAndDistinctChangeIds();
     Runtime_VpnProtectionSamePlayerReconnect_CancelsStaleRequest();
     Runtime_ConnectionIdCorrelatesEventsAndVpnAndFailsOpenAcrossLevelChange();
     Runtime_ConnectCallbackAfterLevelExitStartsNewConnection();
@@ -3093,6 +3171,7 @@ int main()
     Runtime_SiegeStaleAndFailedDecisionsAreReported();
     Runtime_SiegeDryRunAndUnrecognizedModeNeverDispatch();
     Runtime_SiegeDropCanSynchronouslyInvokeDisconnect();
+    Runtime_IpChangeInvalidatesInFlightDecisions();
     Runtime_SiegeAndVpnConflictsNeverDoubleEnforce();
     Runtime_HandleClientCommand_DoesNotPrefixMatchLongerToken();
     Runtime_HandleClientCommand_DedupesCrossCallbackPath();

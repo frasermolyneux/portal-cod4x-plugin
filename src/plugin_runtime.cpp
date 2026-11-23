@@ -919,8 +919,12 @@ void PluginRuntime::HandlePlayerConnect(ICod4xHost& host, int slot, std::string_
     const std::string normalizedIp = NormalizeIpAddress(std::string(ipAddress));
     if (!normalizedIp.empty())
     {
-        const bool newlyResolved = playerState.IpAddress.empty();
+        const bool newlyResolved = playerState.IpAddress != normalizedIp;
         playerState.IpAddress = normalizedIp;
+        if (newlyResolved)
+        {
+            ++playerState.IpRevision;
+        }
         const auto liveId = host.GetPlayerId(slot);
         if (newlyResolved && !playerState.PlayerGuid.empty() && liveId != 0 &&
             std::to_string(liveId) == playerState.PlayerGuid &&
@@ -985,7 +989,7 @@ void PluginRuntime::HandlePlayerConnected(ICod4xHost& host, int slot)
         prior->second.ConnectionGeneration = ++nextConnectionGeneration;
         prior->second.IpAddress.clear();
         prior->second.GuidOnlyEvaluationQueued = false;
-        prior->second.VpnEvaluationQueued = false;
+        prior->second.LastVpnEvaluationIp.clear();
         LogInfo(host, "Player connection continuity is unknown after level change; Siege checks must fail open");
         connectedPlayers.emplace(slot, std::move(prior->second));
     }
@@ -2031,7 +2035,7 @@ void PluginRuntime::QueueVpnEvaluation(ICod4xHost& host, ConnectedPlayerState& p
     }
 
     const bool hasIp = !playerState.IpAddress.empty();
-    if ((hasIp && playerState.VpnEvaluationQueued) ||
+    if ((hasIp && playerState.LastVpnEvaluationIp == playerState.IpAddress) ||
         (!hasIp && (playerState.ConnectionId.empty() || playerState.GuidOnlyEvaluationQueued)))
     {
         return;
@@ -2049,10 +2053,11 @@ void PluginRuntime::QueueVpnEvaluation(ICod4xHost& host, ConnectedPlayerState& p
         playerState.Username,
         playerState.IpAddress,
         playerState.SlotId,
-        playerState.ConnectionGeneration});
+        playerState.ConnectionGeneration,
+        playerState.IpRevision});
     if (hasIp)
     {
-        playerState.VpnEvaluationQueued = true;
+        playerState.LastVpnEvaluationIp = playerState.IpAddress;
     }
     else
     {
@@ -2123,6 +2128,7 @@ bool PluginRuntime::StartVpnEvaluationRequest(ICod4xHost& host, std::int64_t now
         if (playerIt == connectedPlayers.end() ||
             playerIt->second.PlayerGuid != evaluation.PlayerGuid ||
             playerIt->second.ConnectionGeneration != evaluation.ConnectionGeneration ||
+            (!evaluation.IpAddress.empty() && playerIt->second.IpRevision != evaluation.IpRevision) ||
             host.GetPlayerId(evaluation.SlotId) == 0 ||
             std::to_string(host.GetPlayerId(evaluation.SlotId)) != evaluation.PlayerGuid)
         {
@@ -2197,6 +2203,7 @@ void PluginRuntime::CompleteVpnEvaluation(ICod4xHost& host, const HttpResponse& 
     if (playerIt == connectedPlayers.end() ||
         playerIt->second.PlayerGuid != evaluation.PlayerGuid ||
         playerIt->second.ConnectionGeneration != evaluation.ConnectionGeneration ||
+        playerIt->second.IpRevision != evaluation.IpRevision ||
         livePlayerId == 0 ||
         std::to_string(livePlayerId) != evaluation.PlayerGuid)
     {
@@ -2277,6 +2284,7 @@ void PluginRuntime::CompleteSiegeEvaluation(ICod4xHost& host, const std::string&
         player == connectedPlayers.end() || player->second.ConnectionId != evaluation.ConnectionId ||
         player->second.ConnectionGeneration != evaluation.ConnectionGeneration ||
         player->second.PlayerGuid != evaluation.PlayerGuid ||
+        (!evaluation.IpAddress.empty() && player->second.IpRevision != evaluation.IpRevision) ||
         liveId == 0 || std::to_string(liveId) != evaluation.PlayerGuid)
     {
         outcome.Detail = "Connection no longer matches";
