@@ -200,6 +200,7 @@ private:
         int SlotId = -1;
         std::uint64_t ConnectionGeneration = 0;
         std::uint64_t IpRevision = 0;
+        bool SiegeEvaluation = true;
     };
 
     struct SiegeOutcome
@@ -209,6 +210,12 @@ private:
         std::string ConnectionId;
         std::string Outcome;
         std::string Detail;
+    };
+
+    struct HandledSiegeAction
+    {
+        std::int64_t RetainUntilUnixSeconds = 0;
+        bool OutcomePending = true;
     };
 
     std::string configPath;
@@ -255,7 +262,7 @@ private:
     std::int64_t vpnEvaluationRequestStartedUnixSeconds = 0;
     std::deque<PendingVpnEvaluation> pendingVpnEvaluations;
     std::optional<PendingVpnEvaluation> activeVpnEvaluation;
-    std::unordered_set<std::string> handledSiegeActions;
+    std::unordered_map<std::string, HandledSiegeAction> handledSiegeActions;
     std::deque<SiegeOutcome> pendingSiegeOutcomes;
     HttpRequestHandle siegeOutcomeRequest = nullptr;
     std::int64_t siegeOutcomeRequestStartedUnixSeconds = 0;

@@ -85,6 +85,9 @@ connection ID and generation, with an unexpired decision. The plugin invokes CoD
 confirm that the player was dropped. Stale or invalid decisions are reported as `Stale` or
 `Failed`. Outcome reports are retried while the plugin runs; a process restart can leave
 unacknowledged outcomes pending for reconciliation.
+The plugin retains acknowledged action IDs until 15 minutes after their expiry and retains
+unacknowledged outcomes for retry. If 1,000 actions remain tracked, it fails open for new
+Siege evaluations until space is available; IP-based VPN evaluation continues independently.
 
 Dry-run matches are recorded by the service and return no dispatchable Siege decision.
 Unknown or missing decision modes also fail open. VPN Protection can still enforce its own

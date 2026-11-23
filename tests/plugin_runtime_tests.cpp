@@ -2893,6 +2893,74 @@ void Runtime_ConnectCallbackAfterLevelExitStartsNewConnection()
     RemoveTestConfig(configPath);
 }
 
+void Runtime_ReconnectAfterLevelExitRetiresPriorState()
+{
+    for (int scenario = 0; scenario < 2; ++scenario)
+    {
+        const auto configPath = WriteVpnProtectionConfig("reconnect-level-" + std::to_string(scenario));
+        FakeHost host;
+        ConfigureVpnProtectionPlayer(host);
+        host.Responses["POST https://example.test/ingest/events/server-status"] = {202, ""};
+        host.Responses["POST https://example.test/ingest/vpn-protection/evaluate"] = {200, "{\"matched\":false}"};
+        portal_cod4x::PluginRuntime runtime(configPath.string());
+        runtime.Initialize(host, "0.2.0");
+        runtime.HandlePlayerConnect(host, 2, "198.51.100.10");
+        runtime.HandlePlayerConnected(host, 2);
+        for (int i = 0; i < 8; ++i) runtime.Tick(host);
+        if (scenario == 1) host.PlayerIds.erase(2);
+        runtime.HandleServerExited(host);
+        host.PlayerIds[2] = 76561198000000001ULL;
+        if (scenario == 0)
+        {
+            host.CurrentTime += 61;
+            runtime.Tick(host);
+            runtime.HandleClientAuthorized(host);
+        }
+        runtime.HandlePlayerConnect(host, 2, "198.51.100.10");
+        runtime.HandlePlayerConnected(host, 2);
+        for (int i = 0; i < 12; ++i) runtime.Tick(host);
+        std::vector<std::string> bodies;
+        for (const auto& request : host.Requests)
+        {
+            if (request.Url == "https://example.test/ingest/events/player-connected") bodies.push_back(request.Body);
+        }
+        const std::string prefix = "\"connectionId\":\"";
+        Assert(bodies.size() == 2, "An observed reconnect must emit a second connect event");
+        const auto first = bodies[0].find(prefix);
+        const auto second = bodies[1].find(prefix);
+        Assert(first != std::string::npos && second != std::string::npos &&
+            bodies[0].substr(first + prefix.size(), 36) != bodies[1].substr(second + prefix.size(), 36),
+            "An observed reconnect must get a fresh correlation ID");
+        RemoveTestConfig(configPath);
+    }
+}
+
+void Runtime_DisconnectAfterLevelExitDoesNotReuseAnotherPlayersIdentity()
+{
+    const auto configPath = WriteVpnProtectionConfig("disconnect-replaced-level");
+    FakeHost host;
+    ConfigureVpnProtectionPlayer(host);
+    host.Responses["POST https://example.test/ingest/events/player-disconnected"] = {202, ""};
+    portal_cod4x::PluginRuntime runtime(configPath.string());
+    runtime.Initialize(host, "0.2.0");
+    runtime.HandlePlayerConnect(host, 2, "198.51.100.10");
+    runtime.HandlePlayerConnected(host, 2);
+    for (int i = 0; i < 8; ++i) runtime.Tick(host);
+    runtime.HandleServerExited(host);
+    host.PlayerIds[2] = 76561198000000002ULL;
+    host.PlayerNames[2] = "OtherPlayer";
+    runtime.HandlePlayerDisconnected(host, 2);
+    for (int i = 0; i < 8; ++i) runtime.Tick(host);
+    const auto event = std::find_if(host.Requests.begin(), host.Requests.end(), [](const auto& request) {
+        return request.Url == "https://example.test/ingest/events/player-disconnected";
+    });
+    Assert(event != host.Requests.end() && event->Body.find("\"playerGuid\":\"76561198000000002\"") != std::string::npos &&
+        event->Body.find("\"username\":\"OtherPlayer\"") != std::string::npos &&
+        event->Body.find("\"connectionId\":null") != std::string::npos,
+        "A reused slot disconnect must not be attributed to the prior player");
+    RemoveTestConfig(configPath);
+}
+
 void Runtime_UnobservedConnectionIsNotAssignedAnAdmissionId()
 {
     const auto configPath = WriteVpnProtectionConfig("connection-unobserved");
@@ -3125,6 +3193,97 @@ void Runtime_SiegeAndVpnConflictsNeverDoubleEnforce()
     }), "The conflicting Siege action must be reported stale");
     RemoveTestConfig(configPath);
 }
+
+void Runtime_SiegeStillEnforcesWhenVpnCannotDispatch()
+{
+    for (int scenario = 0; scenario < 3; ++scenario)
+    {
+        const auto configPath = WriteVpnProtectionConfig("siege-vpn-failure-" + std::to_string(scenario));
+        FakeHost host;
+        ConfigureVpnProtectionPlayer(host);
+        host.InjectEvaluationConnectionId = true;
+        host.ExecuteServerCommandSucceeds = scenario != 2;
+        std::string response = SiegeResponse("1970-01-01T01:30:00Z");
+        const std::string vpn = scenario == 0 ? "\"matched\":true,\"action\":\"Unknown\",\"reason\":\"VPN\"" :
+            scenario == 1 ? "\"matched\":true,\"action\":\"Kick\",\"reason\":\"\"" :
+            "\"matched\":true,\"action\":\"Kick\",\"reason\":\"VPN\"";
+        response.replace(response.find("\"matched\":false"), 15, vpn);
+        host.Responses["POST https://example.test/ingest/vpn-protection/evaluate"] = {200, response};
+        host.Responses["POST https://example.test/ingest/siege-mode/outcome"] = {204, ""};
+        portal_cod4x::PluginRuntime runtime(configPath.string());
+        runtime.Initialize(host, "0.2.0");
+        runtime.HandlePlayerConnect(host, 2, "198.51.100.10");
+        runtime.HandlePlayerConnected(host, 2);
+        for (int i = 0; i < 4; ++i) runtime.Tick(host);
+        Assert(host.DroppedPlayers.size() == 1, "A failed VPN dispatch must not suppress a valid Siege decision");
+        Assert(std::any_of(host.Requests.begin(), host.Requests.end(), [](const auto& request) {
+            return request.Url == "https://example.test/ingest/siege-mode/outcome" &&
+                request.Body.find("\"outcome\":\"Dispatched\"") != std::string::npos;
+        }), "The independent Siege dispatch must be reported");
+        RemoveTestConfig(configPath);
+    }
+}
+
+void Runtime_SiegeTrackingBackpressurePreservesVpnAndRetries()
+{
+    for (int acknowledged = 0; acknowledged < 2; ++acknowledged)
+    {
+        const auto configPath = WriteVpnProtectionConfig("siege-capacity-" + std::to_string(acknowledged));
+        FakeHost host;
+        ConfigureVpnProtectionPlayer(host);
+        host.InjectEvaluationConnectionId = true;
+        host.Responses["POST https://example.test/ingest/siege-mode/outcome"] = {acknowledged ? 204 : 503, ""};
+        portal_cod4x::PluginRuntime runtime(configPath.string());
+        runtime.Initialize(host, "0.2.0");
+        for (int i = 0; i < 1000; ++i)
+        {
+            std::string response = SiegeResponse("1970-01-01T01:30:00Z");
+            const std::string suffix = std::to_string(i);
+            response.replace(response.find("eeeeeeeeeeee"), 12, std::string(12 - suffix.size(), '0') + suffix);
+            host.Responses["POST https://example.test/ingest/vpn-protection/evaluate"] = {200, response};
+            runtime.HandlePlayerConnect(host, 2, "198.51." + std::to_string(i / 254) + "." + std::to_string(i % 254 + 1));
+            if (i == 0) runtime.HandlePlayerConnected(host, 2);
+            runtime.Tick(host);
+            runtime.Tick(host);
+        }
+        Assert(host.DroppedPlayers.size() == 1000, "All tracked actions must dispatch before reaching capacity");
+        host.Responses["POST https://example.test/ingest/vpn-protection/evaluate"] = {
+            200, "{\"matched\":true,\"action\":\"Kick\",\"reason\":\"VPN\"}"};
+        runtime.HandlePlayerConnect(host, 2, "203.0.113.1");
+        for (int i = 0; i < 3; ++i) runtime.Tick(host);
+        Assert(host.DroppedPlayers.size() == 1000, "Capacity must fail open for Siege");
+        Assert(std::any_of(host.Requests.begin(), host.Requests.end(), [](const auto& request) {
+            return request.Url == "https://example.test/ingest/vpn-protection/evaluate" &&
+                request.Body.find("\"ipAddress\":\"203.0.113.1\"") != std::string::npos &&
+                request.Body.find("\"siegeEvaluation\":false") != std::string::npos;
+        }), "A full Siege tracker must opt out while still evaluating VPN");
+        Assert(std::find(host.ExecutedCommands.begin(), host.ExecutedCommands.end(), "onlykick 2 \"VPN\"") !=
+            host.ExecutedCommands.end(), "VPN enforcement must continue under Siege backpressure");
+
+        if (acknowledged)
+        {
+            host.CurrentTime = 6301;
+            std::string response = SiegeResponse("1970-01-01T02:00:00Z");
+            response.replace(response.find("eeeeeeeeeeee"), 12, "ffffffffffff");
+            host.Responses["POST https://example.test/ingest/vpn-protection/evaluate"] = {200, response};
+            runtime.HandlePlayerConnect(host, 2, "203.0.113.2");
+            for (int i = 0; i < 3; ++i) runtime.Tick(host);
+            Assert(host.DroppedPlayers.size() == 1001, "Acknowledged actions must expire and release capacity");
+        }
+        else
+        {
+            host.CurrentTime = 6301;
+            runtime.HandlePlayerConnect(host, 2, "203.0.113.2");
+            for (int i = 0; i < 3; ++i) runtime.Tick(host);
+            Assert(host.DroppedPlayers.size() == 1000, "Unacknowledged actions must remain tracked after expiry");
+            const auto outcomeCount = std::count_if(host.Requests.begin(), host.Requests.end(), [](const auto& request) {
+                return request.Url == "https://example.test/ingest/siege-mode/outcome";
+            });
+            Assert(outcomeCount >= 2, "Unacknowledged outcomes must remain retryable under backpressure");
+        }
+        RemoveTestConfig(configPath);
+    }
+}
 }
 
 int main()
@@ -3166,6 +3325,8 @@ int main()
     Runtime_VpnProtectionSamePlayerReconnect_CancelsStaleRequest();
     Runtime_ConnectionIdCorrelatesEventsAndVpnAndFailsOpenAcrossLevelChange();
     Runtime_ConnectCallbackAfterLevelExitStartsNewConnection();
+    Runtime_ReconnectAfterLevelExitRetiresPriorState();
+    Runtime_DisconnectAfterLevelExitDoesNotReuseAnotherPlayersIdentity();
     Runtime_UnobservedConnectionIsNotAssignedAnAdmissionId();
     Runtime_SiegeGuidOnlyDecisionDispatchesOnceAndRetriesOutcome();
     Runtime_SiegeStaleAndFailedDecisionsAreReported();
@@ -3173,6 +3334,8 @@ int main()
     Runtime_SiegeDropCanSynchronouslyInvokeDisconnect();
     Runtime_IpChangeInvalidatesInFlightDecisions();
     Runtime_SiegeAndVpnConflictsNeverDoubleEnforce();
+    Runtime_SiegeStillEnforcesWhenVpnCannotDispatch();
+    Runtime_SiegeTrackingBackpressurePreservesVpnAndRetries();
     Runtime_HandleClientCommand_DoesNotPrefixMatchLongerToken();
     Runtime_HandleClientCommand_DedupesCrossCallbackPath();
     Runtime_HandleClientCommand_PortalPluginHealth_UsesConsoleAndTellFlow();

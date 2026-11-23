@@ -33,6 +33,8 @@ constexpr std::size_t kIngestMaxBatchEvents = 100;
 constexpr std::size_t kIngestMaxBatchBytes = 200 * 1024;
 constexpr int kActiveBanPageSize = 200;
 constexpr std::size_t kMaxPendingVpnEvaluations = 64;
+constexpr std::size_t kMaxTrackedSiegeActions = 1000;
+constexpr std::int64_t kSiegeActionRetentionSeconds = 15 * 60;
 
 constexpr std::string_view kQueuePlayerConnected = "player-connected";
 constexpr std::string_view kQueuePlayerDisconnected = "player-disconnected";
@@ -903,6 +905,7 @@ void PluginRuntime::HandlePlayerConnect(ICod4xHost& host, int slot, std::string_
         std::erase_if(pendingVpnEvaluations, [generation](const PendingVpnEvaluation& evaluation) {
             return evaluation.ConnectionGeneration == generation;
         });
+        connectedPlayers.erase(slot);
         playersAtLevelExit.erase(prior);
     }
     ConnectedPlayerState& playerState = connectedPlayers[slot];
@@ -1171,12 +1174,21 @@ void PluginRuntime::HandlePlayerDisconnected(ICod4xHost& host, int slot)
     }
     playersAtLevelExit.erase(slot);
 
+    const std::uint64_t livePlayerId = host.GetPlayerId(slot);
+    if (livePlayerId != 0 && !state.PlayerGuid.empty() && state.PlayerGuid != std::to_string(livePlayerId))
+    {
+        connectEmittedGuids.erase(state.PlayerGuid);
+        std::erase_if(pendingVpnEvaluations, [&](const PendingVpnEvaluation& evaluation) {
+            return evaluation.ConnectionGeneration == state.ConnectionGeneration;
+        });
+        state = ConnectedPlayerState{};
+    }
+
     if (state.PlayerGuid.empty())
     {
-        const std::uint64_t playerId = host.GetPlayerId(slot);
-        if (playerId != 0)
+        if (livePlayerId != 0)
         {
-            state.PlayerGuid = std::to_string(playerId);
+            state.PlayerGuid = std::to_string(livePlayerId);
         }
     }
 
@@ -1197,7 +1209,6 @@ void PluginRuntime::HandlePlayerDisconnected(ICod4xHost& host, int slot)
     const auto playtimePlayer = playtimePlayersBySlot.find(slot);
     if (playtimePlayer != playtimePlayersBySlot.end())
     {
-        const auto livePlayerId = host.GetPlayerId(slot);
         const auto& cached = playtimePlayer->second;
         const bool sameState = state.PlayerGuid.empty() || state.PlayerGuid == cached.PlayerGuid;
         const std::string& username = cached.Username.empty() && state.PlayerGuid == cached.PlayerGuid
@@ -1216,7 +1227,6 @@ void PluginRuntime::HandlePlayerDisconnected(ICod4xHost& host, int slot)
     }
     else if (!state.PlayerGuid.empty() && !state.Username.empty())
     {
-        const auto livePlayerId = host.GetPlayerId(slot);
         if (livePlayerId == 0 || std::to_string(livePlayerId) == state.PlayerGuid)
         {
             const auto nowUnixSeconds = host.GetUnixTimeSeconds();
@@ -1429,11 +1439,14 @@ void PluginRuntime::HandleServerExited(ICod4xHost& host)
     // so the set cannot grow unbounded.
     std::unordered_set<std::string> stillConnected;
     stillConnected.reserve(connectedPlayers.size());
-    for (const auto& entry : connectedPlayers)
+    playersAtLevelExit.clear();
+    for (auto& [slot, state] : connectedPlayers)
     {
-        if (!entry.second.PlayerGuid.empty())
+        const auto liveId = host.GetPlayerId(slot);
+        if (!state.PlayerGuid.empty() && (liveId == 0 || state.PlayerGuid == std::to_string(liveId)))
         {
-            stillConnected.insert(entry.second.PlayerGuid);
+            stillConnected.insert(state.PlayerGuid);
+            playersAtLevelExit.emplace(slot, std::move(state));
         }
     }
 
@@ -1449,15 +1462,6 @@ void PluginRuntime::HandleServerExited(ICod4xHost& host)
         }
     }
 
-    playersAtLevelExit.clear();
-    for (auto& [slot, state] : connectedPlayers)
-    {
-        const auto liveId = host.GetPlayerId(slot);
-        if (liveId != 0 && state.PlayerGuid == std::to_string(liveId))
-        {
-            playersAtLevelExit.emplace(slot, std::move(state));
-        }
-    }
     connectedPlayers.clear();
 }
 
@@ -2119,6 +2123,9 @@ void PluginRuntime::AdvanceVpnEvaluation(ICod4xHost& host, std::int64_t nowUnixS
 
 bool PluginRuntime::StartVpnEvaluationRequest(ICod4xHost& host, std::int64_t nowUnixSeconds)
 {
+    std::erase_if(handledSiegeActions, [nowUnixSeconds](const auto& entry) {
+        return !entry.second.OutcomePending && entry.second.RetainUntilUnixSeconds <= nowUnixSeconds;
+    });
     while (!pendingVpnEvaluations.empty())
     {
         PendingVpnEvaluation evaluation = std::move(pendingVpnEvaluations.front());
@@ -2135,6 +2142,15 @@ bool PluginRuntime::StartVpnEvaluationRequest(ICod4xHost& host, std::int64_t now
             continue;
         }
 
+        if (handledSiegeActions.size() >= kMaxTrackedSiegeActions)
+        {
+            LogError(host, "Siege action tracking is full; Siege evaluation skipped and player remains connected");
+            if (evaluation.IpAddress.empty())
+            {
+                continue;
+            }
+            evaluation.SiegeEvaluation = false;
+        }
         activeVpnEvaluation = std::move(evaluation);
         std::string headers = BuildSubscriptionKeyHeaders(loadedConfig->IngestSubscriptionKey);
         headers += "Content-Type: application/json\r\n";
@@ -2180,63 +2196,63 @@ void PluginRuntime::CompleteVpnEvaluation(ICod4xHost& host, const HttpResponse& 
     {
         LogInfo(host, "VPN evaluation unavailable; continuing with independent Siege decision");
     }
-    if (!siegeJson.empty())
-    {
-        CompleteSiegeEvaluation(host, siegeJson, vpnMatched);
-    }
-    if (!vpnMatched)
-    {
-        return;
-    }
+    const auto dispatchVpn = [&]() {
+        if (!vpnMatched)
+        {
+            return false;
+        }
+        const auto action = ExtractJsonStringValue(vpnJson, "action");
+        const auto reason = ExtractJsonStringValue(vpnJson, "reason");
+        if (!action.has_value() || !reason.has_value() || !IsSafeCommandReason(*reason))
+        {
+            LogError(host, "VPN Protection returned an invalid action or reason; player remains connected");
+            return false;
+        }
+        const PendingVpnEvaluation& evaluation = *activeVpnEvaluation;
+        const auto playerIt = connectedPlayers.find(evaluation.SlotId);
+        const std::uint64_t livePlayerId = host.GetPlayerId(evaluation.SlotId);
+        if (playerIt == connectedPlayers.end() ||
+            playerIt->second.PlayerGuid != evaluation.PlayerGuid ||
+            playerIt->second.ConnectionGeneration != evaluation.ConnectionGeneration ||
+            playerIt->second.IpRevision != evaluation.IpRevision ||
+            livePlayerId == 0 ||
+            std::to_string(livePlayerId) != evaluation.PlayerGuid)
+        {
+            LogInfo(host, "VPN Protection decision ignored because the player is no longer connected");
+            return false;
+        }
+        const std::string normalizedAction = ToLowerInvariant(*action);
+        std::string command;
+        if (normalizedAction == "ban")
+        {
+            command = "banClient " + std::to_string(evaluation.SlotId) + " " + QuoteCommandReason(*reason);
+        }
+        else if (normalizedAction == "kick")
+        {
+            command = "onlykick " + std::to_string(evaluation.SlotId) + " " + QuoteCommandReason(*reason);
+        }
+        else
+        {
+            LogError(host, "VPN Protection returned an unsupported action; player remains connected");
+            return false;
+        }
+        if (!host.ExecuteServerCommand(command))
+        {
+            LogError(host, "VPN Protection failed to execute " + normalizedAction + " for player " + evaluation.PlayerGuid);
+            return false;
+        }
+        LogInfo(host, "VPN Protection executed " + normalizedAction + " for player " + evaluation.PlayerGuid);
+        return true;
+    };
 
-    const auto action = ExtractJsonStringValue(vpnJson, "action");
-    const auto reason = ExtractJsonStringValue(vpnJson, "reason");
-    if (!action.has_value() || !reason.has_value() || !IsSafeCommandReason(*reason))
+    const bool vpnDispatched = dispatchVpn();
+    if (!siegeJson.empty() && activeVpnEvaluation->SiegeEvaluation)
     {
-        LogError(host, "VPN Protection returned an invalid action or reason; player remains connected");
-        return;
+        CompleteSiegeEvaluation(host, siegeJson, vpnDispatched);
     }
-
-    const PendingVpnEvaluation& evaluation = *activeVpnEvaluation;
-    const auto playerIt = connectedPlayers.find(evaluation.SlotId);
-    const std::uint64_t livePlayerId = host.GetPlayerId(evaluation.SlotId);
-    if (playerIt == connectedPlayers.end() ||
-        playerIt->second.PlayerGuid != evaluation.PlayerGuid ||
-        playerIt->second.ConnectionGeneration != evaluation.ConnectionGeneration ||
-        playerIt->second.IpRevision != evaluation.IpRevision ||
-        livePlayerId == 0 ||
-        std::to_string(livePlayerId) != evaluation.PlayerGuid)
+    else if (!siegeJson.empty())
     {
-        LogInfo(host, "VPN Protection decision ignored because the player is no longer connected");
-        return;
-    }
-
-    const std::string normalizedAction = ToLowerInvariant(*action);
-    std::string command;
-    if (normalizedAction == "ban")
-    {
-        command = "banClient " + std::to_string(evaluation.SlotId) + " " + QuoteCommandReason(*reason);
-    }
-    else if (normalizedAction == "kick")
-    {
-        command = "onlykick " + std::to_string(evaluation.SlotId) + " " + QuoteCommandReason(*reason);
-    }
-    else
-    {
-        return;
-    }
-
-    if (host.ExecuteServerCommand(command))
-    {
-        LogInfo(
-            host,
-            "VPN Protection executed " + normalizedAction + " for player " + evaluation.PlayerGuid);
-    }
-    else
-    {
-        LogError(
-            host,
-            "VPN Protection failed to execute " + normalizedAction + " for player " + evaluation.PlayerGuid);
+        LogError(host, "Unexpected Siege decision while evaluation disabled; player remains connected");
     }
 }
 
@@ -2259,7 +2275,11 @@ void PluginRuntime::CompleteSiegeEvaluation(ICod4xHost& host, const std::string&
         LogError(host, "Siege decision has invalid correlation identifiers; player remains connected");
         return;
     }
-    if (!handledSiegeActions.insert(ToLowerInvariant(*actionId)).second)
+    const auto expiry = expiresAt ? ParseUtcExpiry(*expiresAt) : std::nullopt;
+    const auto retentionStart = std::max(expiry.value_or(host.GetUnixTimeSeconds()), host.GetUnixTimeSeconds());
+    const auto retentionEnd = retentionStart > std::numeric_limits<std::int64_t>::max() - kSiegeActionRetentionSeconds
+        ? std::numeric_limits<std::int64_t>::max() : retentionStart + kSiegeActionRetentionSeconds;
+    if (!handledSiegeActions.emplace(ToLowerInvariant(*actionId), HandledSiegeAction{retentionEnd, true}).second)
     {
         LogInfo(host, "Duplicate Siege action ignored");
         return;
@@ -2270,7 +2290,6 @@ void PluginRuntime::CompleteSiegeEvaluation(ICod4xHost& host, const std::string&
     const auto liveId = evaluation.SlotId >= 0 && evaluation.SlotId < host.GetSlotCount()
         ? host.GetPlayerId(evaluation.SlotId) : 0;
     SiegeOutcome outcome{*sessionId, *actionId, *connectionId, "Stale", {}};
-    const auto expiry = expiresAt ? ParseUtcExpiry(*expiresAt) : std::nullopt;
     if (!expiry)
     {
         outcome.Outcome = "Failed";
@@ -2336,6 +2355,11 @@ void PluginRuntime::AdvanceSiegeOutcomes(ICod4xHost& host, std::int64_t nowUnixS
         siegeOutcomeRequest = nullptr;
         if (status == HttpRequestStatus::Completed && response.StatusCode == 204)
         {
+            const auto action = handledSiegeActions.find(ToLowerInvariant(pendingSiegeOutcomes.front().ActionId));
+            if (action != handledSiegeActions.end())
+            {
+                action->second.OutcomePending = false;
+            }
             pendingSiegeOutcomes.pop_front();
         }
         else
@@ -2393,7 +2417,7 @@ std::string PluginRuntime::BuildVpnEvaluationPayload(const PendingVpnEvaluation&
         "\",\"playerGuid\":\"" + JsonEscape(evaluation.PlayerGuid) +
         "\",\"connectionId\":" + (evaluation.ConnectionId.empty() ? "null" :
             "\"" + JsonEscape(evaluation.ConnectionId) + "\"") +
-        ",\"siegeEvaluation\":true" +
+        ",\"siegeEvaluation\":" + (evaluation.SiegeEvaluation ? "true" : "false") +
         ",\"username\":\"" + JsonEscape(evaluation.Username) +
         "\",\"slotId\":" + std::to_string(evaluation.SlotId) + "}";
 }
