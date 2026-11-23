@@ -2142,15 +2142,6 @@ bool PluginRuntime::StartVpnEvaluationRequest(ICod4xHost& host, std::int64_t now
             continue;
         }
 
-        if (handledSiegeActions.size() >= kMaxTrackedSiegeActions)
-        {
-            LogError(host, "Siege action tracking is full; Siege evaluation skipped and player remains connected");
-            if (evaluation.IpAddress.empty())
-            {
-                continue;
-            }
-            evaluation.SiegeEvaluation = false;
-        }
         activeVpnEvaluation = std::move(evaluation);
         std::string headers = BuildSubscriptionKeyHeaders(loadedConfig->IngestSubscriptionKey);
         headers += "Content-Type: application/json\r\n";
@@ -2246,13 +2237,9 @@ void PluginRuntime::CompleteVpnEvaluation(ICod4xHost& host, const HttpResponse& 
     };
 
     const bool vpnDispatched = dispatchVpn();
-    if (!siegeJson.empty() && activeVpnEvaluation->SiegeEvaluation)
+    if (!siegeJson.empty())
     {
         CompleteSiegeEvaluation(host, siegeJson, vpnDispatched);
-    }
-    else if (!siegeJson.empty())
-    {
-        LogError(host, "Unexpected Siege decision while evaluation disabled; player remains connected");
     }
 }
 
@@ -2275,15 +2262,54 @@ void PluginRuntime::CompleteSiegeEvaluation(ICod4xHost& host, const std::string&
         LogError(host, "Siege decision has invalid correlation identifiers; player remains connected");
         return;
     }
-    const auto expiry = expiresAt ? ParseUtcExpiry(*expiresAt) : std::nullopt;
-    const auto retentionStart = std::max(expiry.value_or(host.GetUnixTimeSeconds()), host.GetUnixTimeSeconds());
-    const auto retentionEnd = retentionStart > std::numeric_limits<std::int64_t>::max() - kSiegeActionRetentionSeconds
-        ? std::numeric_limits<std::int64_t>::max() : retentionStart + kSiegeActionRetentionSeconds;
-    if (!handledSiegeActions.emplace(ToLowerInvariant(*actionId), HandledSiegeAction{retentionEnd, true}).second)
+    const std::string actionKey = ToLowerInvariant(*actionId);
+    if (handledSiegeActions.contains(actionKey))
     {
         LogInfo(host, "Duplicate Siege action ignored");
         return;
     }
+
+    if (handledSiegeActions.size() >= kMaxTrackedSiegeActions)
+    {
+        auto acknowledged = handledSiegeActions.end();
+        for (auto it = handledSiegeActions.begin(); it != handledSiegeActions.end(); ++it)
+        {
+            if (!it->second.OutcomePending &&
+                (acknowledged == handledSiegeActions.end() ||
+                    it->second.RetainUntilUnixSeconds < acknowledged->second.RetainUntilUnixSeconds))
+            {
+                acknowledged = it;
+            }
+        }
+        if (acknowledged != handledSiegeActions.end())
+        {
+            handledSiegeActions.erase(acknowledged);
+        }
+        else
+        {
+            auto evicted = pendingSiegeOutcomes.begin();
+            if (siegeOutcomeRequest != nullptr && evicted != pendingSiegeOutcomes.end())
+            {
+                ++evicted;
+            }
+            if (evicted == pendingSiegeOutcomes.end())
+            {
+                LogError(host, "Siege tracking state is inconsistent; decision not dispatched");
+                return;
+            }
+            LogError(host, "Siege outcome retry buffer full; report lost and remains pending for reconciliation: sessionId=" +
+                evicted->SessionId + " actionId=" + evicted->ActionId + " connectionId=" + evicted->ConnectionId +
+                " outcome=" + evicted->Outcome + " detail=" + evicted->Detail);
+            handledSiegeActions.erase(ToLowerInvariant(evicted->ActionId));
+            pendingSiegeOutcomes.erase(evicted);
+        }
+    }
+
+    const auto expiry = expiresAt ? ParseUtcExpiry(*expiresAt) : std::nullopt;
+    const auto retentionStart = std::max(expiry.value_or(host.GetUnixTimeSeconds()), host.GetUnixTimeSeconds());
+    const auto retentionEnd = retentionStart > std::numeric_limits<std::int64_t>::max() - kSiegeActionRetentionSeconds
+        ? std::numeric_limits<std::int64_t>::max() : retentionStart + kSiegeActionRetentionSeconds;
+    handledSiegeActions.emplace(actionKey, HandledSiegeAction{retentionEnd, true});
 
     const auto& evaluation = *activeVpnEvaluation;
     const auto player = connectedPlayers.find(evaluation.SlotId);
@@ -2417,7 +2443,7 @@ std::string PluginRuntime::BuildVpnEvaluationPayload(const PendingVpnEvaluation&
         "\",\"playerGuid\":\"" + JsonEscape(evaluation.PlayerGuid) +
         "\",\"connectionId\":" + (evaluation.ConnectionId.empty() ? "null" :
             "\"" + JsonEscape(evaluation.ConnectionId) + "\"") +
-        ",\"siegeEvaluation\":" + (evaluation.SiegeEvaluation ? "true" : "false") +
+        ",\"siegeEvaluation\":true" +
         ",\"username\":\"" + JsonEscape(evaluation.Username) +
         "\",\"slotId\":" + std::to_string(evaluation.SlotId) + "}";
 }

@@ -83,11 +83,13 @@ A Siege decision must explicitly specify `mode: "Enforce"` and match the live GU
 connection ID and generation, with an unexpired decision. The plugin invokes CoD4x's
 `Plugin_DropClient` directly with the kick reason and reports `Dispatched`, which does not
 confirm that the player was dropped. Stale or invalid decisions are reported as `Stale` or
-`Failed`. Outcome reports are retried while the plugin runs; a process restart can leave
-unacknowledged outcomes pending for reconciliation.
-The plugin retains acknowledged action IDs until 15 minutes after their expiry and retains
-unacknowledged outcomes for retry. If 1,000 actions remain tracked, it fails open for new
-Siege evaluations until space is available; IP-based VPN evaluation continues independently.
+`Failed`. Retained outcome reports are retried while the plugin runs.
+The service's one-shot claim prevents redispatch after a repeated evaluation, including a lost
+response. The plugin also keeps a bounded defensive cache of up to 1,000 action IDs, evicting
+acknowledged IDs as needed without stopping Siege. If all 1,000 outcomes are unacknowledged,
+the oldest retry (excluding an in-flight request) is evicted and its correlation and outcome
+are logged. Its service-side claim remains pending/unknown for reconciliation; the lost callback
+is not retried. A restart can likewise lose any unacknowledged in-memory outcomes.
 
 Dry-run matches are recorded by the service and return no dispatchable Siege decision.
 Unknown or missing decision modes also fail open. VPN Protection can still enforce its own

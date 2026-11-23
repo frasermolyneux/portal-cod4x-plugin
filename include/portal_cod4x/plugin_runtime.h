@@ -200,7 +200,6 @@ private:
         int SlotId = -1;
         std::uint64_t ConnectionGeneration = 0;
         std::uint64_t IpRevision = 0;
-        bool SiegeEvaluation = true;
     };
 
     struct SiegeOutcome
