@@ -34,7 +34,7 @@ struct NativeAction
     NativeActionTarget Target;
     NativeEffect Effect = NativeEffect::Unsupported;
     std::string Text;
-    std::int64_t ExpiresUnixSeconds = 0;
+    std::int64_t ExpiresUnixTicks = 0;
     bool Enforce = false;
 
     bool operator==(const NativeAction&) const = default;

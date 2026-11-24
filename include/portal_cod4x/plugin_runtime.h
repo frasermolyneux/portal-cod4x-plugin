@@ -100,7 +100,8 @@ public:
     };
 
     explicit PluginRuntime(std::string configPath = std::string(kDefaultConfigFilePath),
-        std::function<std::int64_t()> utcClock = {});
+        std::function<std::int64_t()> utcClock = {},
+        std::function<std::int64_t()> utcTicksClock = {});
 
     int Initialize(ICod4xHost& host, std::string_view version, std::string_view prefix = kDefaultBotPrefix);
     void Shutdown(ICod4xHost& host);
@@ -195,12 +196,12 @@ private:
     struct PortalBan
     {
         std::string Message;
-        std::optional<std::int64_t> ExpiresUnixSeconds;
+        std::optional<std::int64_t> ExpiresUnixTicks;
 
         void Merge(const PortalBan& other)
         {
-            if (ExpiresUnixSeconds &&
-                (!other.ExpiresUnixSeconds || *other.ExpiresUnixSeconds > *ExpiresUnixSeconds))
+            if (ExpiresUnixTicks &&
+                (!other.ExpiresUnixTicks || *other.ExpiresUnixTicks > *ExpiresUnixTicks))
             {
                 *this = other;
             }
@@ -239,6 +240,7 @@ private:
 
     std::string configPath;
     std::function<std::int64_t()> utcClock;
+    std::function<std::int64_t()> utcTicksClock;
     std::string pluginVersion = "0.0.0-unknown";
     std::string chatPrefix = std::string(kDefaultBotPrefix);
     std::string lastHandledCommandToken;

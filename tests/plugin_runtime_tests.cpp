@@ -3454,11 +3454,80 @@ void Runtime_PortalTempBansExpireOfflineWithoutAffectingPermanentBans()
     RemoveTestConfig(config);
 }
 
+void Runtime_FractionalPortalExpiryHonorsExactUtcInstant()
+{
+    for (int scenario = 0; scenario < 2; ++scenario)
+    {
+        const auto config = WriteRuntimeConfig("portal-fractional-expiry-" + std::to_string(scenario));
+        FakeHost host;
+        ConfigureTestPlayer(host);
+        host.CurrentSubsecondTicks = scenario == 0 ? 4999999 : 5000000;
+        const std::string url = "GET https://example.test/ingest/active-bans?gameType=CallOfDuty4x&skipEntries=0&takeEntries=200";
+        host.Responses[url] = {200, "{\"data\":{\"items\":["
+            "{\"type\":\"TempBan\",\"expires\":\"1970-01-01T01:23:20.4000000Z\",\"player\":{\"guid\":\"76561198000000001\"}},"
+            "{\"type\":\"TempBan\",\"expires\":\"1970-01-01T01:23:20.5000000\",\"player\":{\"guid\":\"76561198000000001\"}}]}}"};
+        portal_cod4x::PluginRuntime runtime(config.string(), [&] { return host.CurrentTime; },
+            [&] { return host.GetUnixTime100Nanoseconds(); });
+        runtime.Initialize(host, "0.3.0");
+        TickFrames(runtime, host);
+        std::string reason;
+        Assert((host.DroppedPlayers.size() == 1) == (scenario == 0),
+            "Refresh must proactively enforce an unexpired fractional ban but not one at expiry");
+        Assert(runtime.TryGetPlayerBanMessage(76561198000000001ULL, reason) == (scenario == 0),
+            "Refresh must retain the latest fractional expiry within the same second");
+        if (scenario == 0)
+        {
+            host.Responses[url] = {503, ""};
+            Assert(runtime.TryGetAuthenticatedPlayerBanMessage(76561198000000001ULL, reason),
+                "The admission hook must enforce the fractional ban one tick before expiry");
+            host.CurrentSubsecondTicks = 5000000;
+            Assert(!runtime.TryGetPlayerBanMessage(76561198000000001ULL, reason) &&
+                !runtime.TryGetAuthenticatedPlayerBanMessage(76561198000000001ULL, reason) &&
+                runtime.RenderPortalBanListDump().find("76561198000000001") == std::string::npos,
+                "The exact expiry instant must stop offline admission and active-list enforcement");
+        }
+        RemoveTestConfig(config);
+    }
+}
+
+void Runtime_FractionalCommandExpiryHonorsExactUtcInstant()
+{
+    for (int scenario = 0; scenario < 3; ++scenario)
+    {
+        const auto config = WriteRuntimeConfig("rules-fractional-expiry-" + std::to_string(scenario));
+        FakeHost host;
+        ConfigureTestPlayer(host);
+        host.CurrentSubsecondTicks = scenario == 1 ? 5000000 : 4999999;
+        host.ResponseFactory = [scenario](const auto& request) -> portal_cod4x::HttpResponse {
+            if (!request.Url.ends_with("/evaluate")) return {200, RulesReply()};
+            const auto trigger = *RulesJsonReader::Parse(request.Body);
+            auto command = CommandForTrigger(trigger);
+            command.Fields["expiresAtUtc"] = *RulesJsonReader::Parse(scenario == 2 ?
+                "\"1970-01-01T01:23:20.50000001Z\"" : "\"1970-01-01T01:23:20.5000000Z\"");
+            return {200, RulesReply(command.Dump())};
+        };
+        portal_cod4x::PluginRuntime runtime(config.string());
+        runtime.Initialize(host, "0.3.0");
+        runtime.HandlePlayerConnect(host, 2, "198.51.100.10");
+        runtime.HandlePlayerConnected(host, 2);
+        TickFrames(runtime, host, 12);
+        Assert(host.DroppedPlayers.size() == (scenario == 0 ? 1U : 0U),
+            "A native effect may dispatch one tick before expiry, never at expiry or for unrepresentable precision");
+        const auto expected = scenario == 0 ? "\"outcome\":\"Dispatched\"" :
+            scenario == 1 ? "\"outcome\":\"Stale\"" : "\"outcome\":\"Failed\"";
+        Assert(std::any_of(host.Requests.begin(), host.Requests.end(), [&](const auto& request) {
+            return request.Url.ends_with("/outcomes") && request.Body.find(expected) != std::string::npos;
+        }), "Fractional command boundary must return the correct explicit outcome");
+        RemoveTestConfig(config);
+    }
+}
+
 void Runtime_PortalBanRefreshRejectsMalformedExpiryWithoutClearingValidCache()
 {
     const std::vector<std::string> invalidExpires{
         "", ",\"expires\":null", ",\"expires\":42", ",\"expires\":\"invalid\"",
         ",\"expires\":\"2026-02-31T12:00:00Z\"", ",\"expires\":\"1970-01-01T01:30:00+02:00\"",
+        ",\"expires\":\"1970-01-01T01:30:00.00000001Z\"",
         ",\"expires\":\"1970-01-01T01:30:00Z\",\"Expires\":null"};
     for (std::size_t scenario = 0; scenario < invalidExpires.size(); ++scenario)
     {
@@ -3541,7 +3610,7 @@ void NativeExecutor_PreventsDuplicateAndCapacityReplay()
     host.CurrentTime = 5000;
     portal_cod4x::NativeActionTarget target{"76561198000000001",
         "11111111-2222-3333-4444-555555555555", 2, 1};
-    portal_cod4x::NativeAction action{"effect-0", target, portal_cod4x::NativeEffect::Drop, "Reason", 5400, true};
+    portal_cod4x::NativeAction action{"effect-0", target, portal_cod4x::NativeEffect::Drop, "Reason", 5400LL * 10000000, true};
     portal_cod4x::NativeActionExecutor executor;
     host.OnDrop = [&](int) {
         Assert(executor.Execute(host, action, target).Outcome == "Dispatched",
@@ -3640,6 +3709,8 @@ int main()
     Runtime_RulesIndependentFeatureContinuationsAreNotLost();
     Runtime_RulesSnapshotsRetainRuntimeAndExactDisconnectIdentity();
     Runtime_PortalTempBansExpireOfflineWithoutAffectingPermanentBans();
+    Runtime_FractionalPortalExpiryHonorsExactUtcInstant();
+    Runtime_FractionalCommandExpiryHonorsExactUtcInstant();
     Runtime_PortalBanRefreshRejectsMalformedExpiryWithoutClearingValidCache();
     Runtime_PortalBanOverlapAcrossPagesAndElapsedRefresh();
     RulesJson_RejectsAmbiguousExecutablePayloads();

@@ -143,6 +143,8 @@ The command runtime descriptor must match this plugin's executor ID, version, pr
 instance ID, start time and identity model. Agent-observed connections cannot execute here;
 plugin targets require a non-null generation. Trigger correlation must match the retained
 observation before a new native effect is dispatched.
+Command and portal-ban UTC expiry retain 100-nanosecond precision; nonzero precision beyond
+seven fractional digits is rejected rather than rounded or truncated.
 
 Only explicit Enforce dispatches native effects. DryRun reports `WouldExecute` with no drop
 or chat; missing/unknown modes fail closed for native effects. Text must be nonempty,

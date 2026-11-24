@@ -23,7 +23,7 @@ std::optional<NativeActionResult> NativeActionExecutor::PreviousResult(const Nat
 NativeActionResult NativeActionExecutor::Execute(ICod4xHost& host, const NativeAction& action,
                                                  const NativeActionTarget& liveTarget)
 {
-    const auto now = host.GetUnixTimeSeconds();
+    const auto now = host.GetUnixTime100Nanoseconds();
     if (action.ExecutionId.empty())
     {
         return {"Failed", "Missing execution identity"};
@@ -34,7 +34,7 @@ NativeActionResult NativeActionExecutor::Execute(ICod4xHost& host, const NativeA
         return *previous;
     }
 
-    if (action.ExpiresUnixSeconds <= now)
+    if (action.ExpiresUnixTicks <= now)
     {
         return {"Stale", "Command expired"};
     }
@@ -70,7 +70,7 @@ NativeActionResult NativeActionExecutor::Execute(ICod4xHost& host, const NativeA
         return result;
     }
 
-    std::erase_if(handledActions, [now](const auto& entry) { return entry.second.Action.ExpiresUnixSeconds <= now; });
+    std::erase_if(handledActions, [now](const auto& entry) { return entry.second.Action.ExpiresUnixTicks <= now; });
     if (handledActions.size() >= kMaxHandledActions)
     {
         // Never evict a live command identity: a repeated response could repeat a native effect.

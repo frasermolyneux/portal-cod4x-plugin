@@ -79,7 +79,30 @@ std::optional<std::int64_t> PluginRuntime::ParseUtcTimestamp(const std::string& 
     {
         return std::nullopt;
     }
-    return static_cast<std::int64_t>(timestamp);
+    std::int64_t fraction = 0;
+    const auto dot = value.find('.', 19);
+    if (dot != std::string::npos)
+    {
+        std::size_t digits = 0;
+        for (auto index = dot + 1; index < value.size() && value[index] >= '0' && value[index] <= '9'; ++index)
+        {
+            if (digits < 7)
+            {
+                fraction = fraction * 10 + (value[index] - '0');
+            }
+            else if (value[index] != '0')
+            {
+                return std::nullopt;
+            }
+            ++digits;
+        }
+        while (digits < 7)
+        {
+            fraction *= 10;
+            ++digits;
+        }
+    }
+    return static_cast<std::int64_t>(timestamp) * 10000000 + fraction;
 }
 
 namespace
@@ -361,7 +384,7 @@ bool PluginRuntime::CompleteRulesEvaluation(ICod4xHost& host, const HttpResponse
                          slot && *slot >= 0 && *slot <= std::numeric_limits<int>::max() ? static_cast<int>(*slot) : -1,
                          generation.value_or(0)};
         const auto expiry = expiryText ? ParseUtcTimestamp(*expiryText) : std::nullopt;
-        action.ExpiresUnixSeconds = expiry.value_or(0);
+        action.ExpiresUnixTicks = expiry.value_or(0);
         action.Enforce = mode == "Enforce";
         const auto type = effect->String("type");
         if (type == "DropPlayer")
@@ -387,7 +410,8 @@ bool PluginRuntime::CompleteRulesEvaluation(ICod4xHost& host, const HttpResponse
                  runtime->String("version") != pluginVersion || runtime->Integer("protocolVersion") != 1 ||
                  !runtimeInstance || CanonicalId(*runtimeInstance) != CanonicalId(producerEpoch) ||
                  runtime->String("identityModel") != "PluginRuntimeGeneration" ||
-                 ParseUtcTimestamp(runtime->String("startedAtUtc").value_or("")) != producerStartedUnixSeconds)
+                 ParseUtcTimestamp(runtime->String("startedAtUtc").value_or("")) !=
+                     producerStartedUnixSeconds * 10000000)
         {
             result = {"Stale", "Command executor runtime no longer matches"};
         }

@@ -4,6 +4,7 @@
 #include <algorithm>
 #include <array>
 #include <cctype>
+#include <chrono>
 #include <ctime>
 #include <fstream>
 #include <iomanip>
@@ -585,9 +586,16 @@ std::string BuildOnlineBroadcastMessage(std::string_view prefix, std::string_vie
     return normalizedPrefix + " Portal Plugin is online (version " + normalizedVersion + ")";
 }
 
-PluginRuntime::PluginRuntime(std::string configPath, std::function<std::int64_t()> utcClock)
+PluginRuntime::PluginRuntime(std::string configPath, std::function<std::int64_t()> utcClock,
+    std::function<std::int64_t()> utcTicksClock)
     : configPath(std::move(configPath)),
-      utcClock(utcClock ? std::move(utcClock) : [] { return static_cast<std::int64_t>(std::time(nullptr)); })
+      utcClock(utcClock ? utcClock : [] { return static_cast<std::int64_t>(std::time(nullptr)); }),
+      utcTicksClock(utcTicksClock ? std::move(utcTicksClock) : utcClock ?
+          std::function<std::int64_t()>([clock = std::move(utcClock)] { return clock() * 10000000; }) :
+          std::function<std::int64_t()>([] {
+              using Ticks = std::chrono::duration<std::int64_t, std::ratio<1, 10000000>>;
+              return std::chrono::duration_cast<Ticks>(std::chrono::system_clock::now().time_since_epoch()).count();
+          }))
 {
 }
 
@@ -1486,7 +1494,7 @@ bool PluginRuntime::TryFindPlayerBanMessage(std::uint64_t playerId, std::string&
 
     const auto portalIt = activeBanMessagesByPlayerGuid.find(playerGuid);
     if (portalIt != activeBanMessagesByPlayerGuid.end() &&
-        (!portalIt->second.ExpiresUnixSeconds || *portalIt->second.ExpiresUnixSeconds > utcClock()))
+        (!portalIt->second.ExpiresUnixTicks || *portalIt->second.ExpiresUnixTicks > utcTicksClock()))
     {
         message = portalIt->second.Message.empty() ? std::string(kDefaultBanMessage) : portalIt->second.Message;
         return true;
@@ -1609,10 +1617,10 @@ std::string PluginRuntime::RenderPortalBanListDump() const
     std::vector<std::pair<std::string, std::string>> portalBans;
     {
         std::lock_guard<std::mutex> guard(activeBanCacheMutex);
-        const auto now = utcClock();
+        const auto now = utcTicksClock();
         for (const auto& [guid, ban] : activeBanMessagesByPlayerGuid)
         {
-            if (!ban.ExpiresUnixSeconds || *ban.ExpiresUnixSeconds > now)
+            if (!ban.ExpiresUnixTicks || *ban.ExpiresUnixTicks > now)
                 portalBans.emplace_back(guid, ban.Message);
         }
     }
@@ -2222,7 +2230,7 @@ std::optional<PluginRuntime::ActiveBanPage> PluginRuntime::ParseActiveBans(const
     if (!items || items->Type != RulesJson::Kind::Array) return std::nullopt;
     ActiveBanPage page;
     page.ItemCount = items->Items.size();
-    const auto now = utcClock();
+    const auto now = utcTicksClock();
     for (const auto& item : items->Items)
     {
         const auto* type = field(item, "type");
@@ -2240,11 +2248,11 @@ std::optional<PluginRuntime::ActiveBanPage> PluginRuntime::ParseActiveBans(const
         {
             // Repository SQL DateTime values without a zone are UTC, never machine-local time.
             if (expires->Type != RulesJson::Kind::String) return std::nullopt;
-            ban.ExpiresUnixSeconds = ParseUtcTimestamp(expires->Scalar, true);
-            if (!ban.ExpiresUnixSeconds) return std::nullopt;
+            ban.ExpiresUnixTicks = ParseUtcTimestamp(expires->Scalar, true);
+            if (!ban.ExpiresUnixTicks) return std::nullopt;
         }
         else if (temporary) return std::nullopt;
-        if (ban.ExpiresUnixSeconds && *ban.ExpiresUnixSeconds <= now) continue;
+        if (ban.ExpiresUnixTicks && *ban.ExpiresUnixTicks <= now) continue;
         const auto [it, inserted] = page.Bans.emplace(Trim(guid->Scalar), ban);
         if (!inserted) it->second.Merge(ban);
     }
@@ -2954,10 +2962,10 @@ std::vector<std::string> PluginRuntime::BuildPortalPluginHealthReportLines(std::
     std::size_t activeBanCacheCount = 0;
     {
         std::lock_guard<std::mutex> guard(activeBanCacheMutex);
-        const auto now = utcClock();
+        const auto now = utcTicksClock();
         activeBanCacheCount = static_cast<std::size_t>(std::count_if(
             activeBanMessagesByPlayerGuid.begin(), activeBanMessagesByPlayerGuid.end(), [now](const auto& entry) {
-                return !entry.second.ExpiresUnixSeconds || *entry.second.ExpiresUnixSeconds > now;
+                return !entry.second.ExpiresUnixTicks || *entry.second.ExpiresUnixTicks > now;
             }));
     }
 
