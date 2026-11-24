@@ -149,8 +149,9 @@ or chat; missing/unknown modes fail closed for native effects. Text must be none
 at most 256 UTF-8 bytes and contain no C0/DEL controls. Unsupported effects report
 `SkippedUnsupported` without preventing other supported commands.
 
-Results echo `gameServerId`, execution/action/logical-effect identity and the complete correlation, with a
-timestamp and detail. `Dispatched` means the native API was invoked, **not** confirmed Applied.
+Results echo `gameServerId`, execution/action/logical-effect identity and the complete correlation, with an
+actual UTC subsecond timestamp and detail. A cached dispatch retains its original timestamp on redelivery.
+`Dispatched` means the native API was invoked, **not** confirmed Applied.
 Expired/replaced connections report Stale, malformed commands report Failed when safely
 correlatable, and malformed envelopes/identities are logged without dispatch.
 

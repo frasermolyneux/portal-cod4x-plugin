@@ -81,6 +81,7 @@ public:
     virtual bool CanPlayerUseCommand(int slot, std::string_view commandName) const = 0;
 
     virtual std::int64_t GetUnixTimeSeconds() const = 0;
+    virtual std::int64_t GetUnixTime100Nanoseconds() const = 0;
 };
 
 inline constexpr std::string_view kDefaultBotPrefix = "^4[^1XI-BOT^4]^7";
@@ -403,6 +404,7 @@ private:
     static std::string GenerateMessageId();
     static std::string JsonEscape(std::string_view value);
     static std::string ToIso8601Utc(std::int64_t unixSeconds);
+    static std::string ToIso8601UtcPrecise(std::int64_t unixTicks);
     static std::string StampPublishedUtc(std::string payloadJson, std::int64_t nowUnixSeconds);
     static std::string QueueEndpointPath(std::string_view ingestBaseUrl, std::string_view queueName);
     static std::string NormalizeIpAddress(std::string ipAddress);

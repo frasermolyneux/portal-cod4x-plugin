@@ -422,8 +422,9 @@ bool PluginRuntime::CompleteRulesEvaluation(ICod4xHost& host, const HttpResponse
             "{\"protocolVersion\":1,\"executionId\":" + RulesJson::Quote(*executionId) +
             ",\"gameServerId\":" + RulesJson::Quote(*serverId) + ",\"actionId\":" + RulesJson::Quote(*actionId) +
             ",\"logicalEffectId\":" + RulesJson::Quote(*logicalEffectId) + ",\"correlation\":" + correlation->Dump() +
-            ",\"outcome\":" + RulesJson::Quote(result.Outcome) +
-            ",\"occurredAtUtc\":" + RulesJson::Quote(ToIso8601Utc(host.GetUnixTimeSeconds())) +
+            ",\"outcome\":" + RulesJson::Quote(result.Outcome) + ",\"occurredAtUtc\":" +
+            RulesJson::Quote(ToIso8601UtcPrecise(result.OccurredUnixTicks ? *result.OccurredUnixTicks
+                                                                          : host.GetUnixTime100Nanoseconds())) +
             ",\"detail\":" + RulesJson::Quote(result.Detail) + "}";
         auto outcomeTarget = target;
         outcomeTarget.ExecutionIds = {*executionId};

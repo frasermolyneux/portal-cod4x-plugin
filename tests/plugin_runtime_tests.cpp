@@ -51,6 +51,7 @@ public:
     std::unordered_map<std::string, bool> CommandPermissions;
     std::unordered_map<std::string, std::string> CvarValues;
     std::int64_t CurrentTime = 0;
+    std::int64_t CurrentSubsecondTicks = 0;
     bool ExecuteServerCommandSucceeds = true;
     bool HoldRulesOutcome = false;
     int OpenRequests = 0;
@@ -189,6 +190,11 @@ public:
     std::int64_t GetUnixTimeSeconds() const override
     {
         return CurrentTime;
+    }
+
+    std::int64_t GetUnixTime100Nanoseconds() const override
+    {
+        return CurrentTime * 10000000 + CurrentSubsecondTicks;
     }
 
 private:
@@ -2905,6 +2911,7 @@ void Runtime_RulesRejectUnsafeOrStaleCommandsIndependently()
         };
         portal_cod4x::PluginRuntime runtime(config.string());
         runtime.Initialize(host, "0.3.0");
+        host.CurrentSubsecondTicks = 42;
         runtime.HandlePlayerConnect(host, 2, "198.51.100.10");
         runtime.HandlePlayerConnected(host, 2);
         TickFrames(runtime, host, 10);
@@ -2916,7 +2923,8 @@ void Runtime_RulesRejectUnsafeOrStaleCommandsIndependently()
             const auto expected = scenario == 0 ? "\"outcome\":\"WouldExecute\"" :
                 "\"outcome\":\"SkippedUnsupported\"";
             Assert(std::any_of(host.Requests.begin(), host.Requests.end(), [&](const auto& request) {
-                return request.Url.ends_with("/outcomes") && request.Body.find(expected) != std::string::npos;
+                return request.Url.ends_with("/outcomes") && request.Body.find(expected) != std::string::npos &&
+                    request.Body.find("\"occurredAtUtc\":\"1970-01-01T01:23:20.0000042Z\"") != std::string::npos;
             }), "Dry run and unsupported effects must report explicit outcomes");
         }
         RemoveTestConfig(config);
@@ -3173,13 +3181,19 @@ void Runtime_RulesRedeliveryRetainsDispatchedAfterDisconnect()
             const auto result = *RulesJsonReader::Parse(request.Body);
             Assert(result.String("outcome") == "Dispatched",
                 "Redelivery must preserve the original native outcome after synchronous disconnect");
+            Assert(result.String("occurredAtUtc") == "1970-01-01T01:23:20.1234567Z",
+                "The actual subsecond dispatch timestamp must survive later redelivery");
             return {200, RulesReply({}, outcomes == 1 ? "\"aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee\"" : "")};
         }
         return {200, RulesReply(CommandForTrigger(trigger).Dump())};
     };
     portal_cod4x::PluginRuntime runtime(config.string());
     runtime.Initialize(host, "0.3.0");
-    host.OnDrop = [&](int slot) { runtime.HandlePlayerDisconnected(host, slot); };
+    host.CurrentSubsecondTicks = 1234000;
+    host.OnDrop = [&](int slot) {
+        host.CurrentSubsecondTicks = 1234567;
+        runtime.HandlePlayerDisconnected(host, slot);
+    };
     runtime.HandlePlayerConnect(host, 2, "198.51.100.10");
     runtime.HandlePlayerConnected(host, 2);
     TickFrames(runtime, host);

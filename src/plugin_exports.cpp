@@ -7,6 +7,7 @@
 #include <ctime>
 #include <algorithm>
 #include <array>
+#include <chrono>
 #include <optional>
 #include <string>
 #include <string_view>
@@ -336,6 +337,12 @@ public:
     std::int64_t GetUnixTimeSeconds() const override
     {
         return static_cast<std::int64_t>(std::time(nullptr));
+    }
+
+    std::int64_t GetUnixTime100Nanoseconds() const override
+    {
+        using Ticks = std::chrono::duration<std::int64_t, std::ratio<1, 10000000>>;
+        return std::chrono::duration_cast<Ticks>(std::chrono::system_clock::now().time_since_epoch()).count();
     }
 };
 

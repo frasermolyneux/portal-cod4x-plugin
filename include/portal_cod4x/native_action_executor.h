@@ -44,6 +44,7 @@ struct NativeActionResult
 {
     std::string Outcome;
     std::string Detail;
+    std::optional<std::int64_t> OccurredUnixTicks = std::nullopt;
 };
 
 class NativeActionExecutor

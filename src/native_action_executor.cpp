@@ -78,6 +78,7 @@ NativeActionResult NativeActionExecutor::Execute(ICod4xHost& host, const NativeA
     }
 
     // Reserve identity and outcome before host callbacks, which can synchronously disconnect.
+    result.OccurredUnixTicks = host.GetUnixTime100Nanoseconds();
     handledActions.emplace(action.ExecutionId, HandledAction{action, result});
     switch (action.Effect)
     {
@@ -92,6 +93,11 @@ NativeActionResult NativeActionExecutor::Execute(ICod4xHost& host, const NativeA
         break;
     case NativeEffect::Unsupported:
         break;
+    }
+    result.OccurredUnixTicks = host.GetUnixTime100Nanoseconds();
+    if (const auto handled = handledActions.find(action.ExecutionId); handled != handledActions.end())
+    {
+        handled->second.Result = result;
     }
     return result;
 }

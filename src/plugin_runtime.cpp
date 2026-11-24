@@ -2858,6 +2858,23 @@ std::string PluginRuntime::ToIso8601Utc(std::int64_t unixSeconds)
     return output.str();
 }
 
+std::string PluginRuntime::ToIso8601UtcPrecise(std::int64_t unixTicks)
+{
+    constexpr std::int64_t ticksPerSecond = 10000000;
+    auto seconds = unixTicks / ticksPerSecond;
+    auto fraction = unixTicks % ticksPerSecond;
+    if (fraction < 0)
+    {
+        --seconds;
+        fraction += ticksPerSecond;
+    }
+    auto timestamp = ToIso8601Utc(seconds);
+    timestamp.pop_back();
+    std::ostringstream output;
+    output << timestamp << '.' << std::setfill('0') << std::setw(7) << fraction << 'Z';
+    return output.str();
+}
+
 std::string PluginRuntime::StampPublishedUtc(std::string payloadJson, std::int64_t nowUnixSeconds)
 {
     constexpr std::string_view kToken = "\"eventPublishedUtc\":\"";
