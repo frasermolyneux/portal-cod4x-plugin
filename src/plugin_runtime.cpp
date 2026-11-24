@@ -300,6 +300,70 @@ std::optional<std::string> ExtractJsonStringValue(const std::string& json, const
     return JsonUnescape(match[1].str());
 }
 
+std::optional<std::unordered_map<std::string, std::string>> ParseSiegeDecision(const std::string& json)
+{
+    std::unordered_map<std::string, std::string> fields;
+    std::size_t pos = 0;
+    const auto skipWhitespace = [&]() {
+        while (pos < json.size() && std::isspace(static_cast<unsigned char>(json[pos]))) ++pos;
+    };
+    const auto parseString = [&]() -> std::optional<std::string> {
+        if (pos >= json.size() || json[pos++] != '"') return std::nullopt;
+        const auto start = pos;
+        while (pos < json.size())
+        {
+            const auto c = static_cast<unsigned char>(json[pos++]);
+            if (c == '"') return JsonUnescape(json.substr(start, pos - start - 1));
+            if (c < 0x20) return std::nullopt;
+            if (c != '\\') continue;
+            if (pos >= json.size()) return std::nullopt;
+            const char escaped = json[pos++];
+            if (escaped == 'u')
+            {
+                if (pos + 4 > json.size()) return std::nullopt;
+                for (int i = 0; i < 4; ++i)
+                {
+                    if (!std::isxdigit(static_cast<unsigned char>(json[pos++]))) return std::nullopt;
+                }
+            }
+            else if (std::string_view("\"\\/bfnrt").find(escaped) == std::string_view::npos)
+            {
+                return std::nullopt;
+            }
+        }
+        return std::nullopt;
+    };
+
+    skipWhitespace();
+    if (pos >= json.size() || json[pos++] != '{') return std::nullopt;
+    skipWhitespace();
+    if (pos < json.size() && json[pos] == '}') ++pos;
+    else
+    {
+        for (;;)
+        {
+            skipWhitespace();
+            auto key = parseString();
+            skipWhitespace();
+            if (!key || pos >= json.size() || json[pos++] != ':') return std::nullopt;
+            skipWhitespace();
+            auto value = parseString();
+            if (!value || !fields.emplace(std::move(*key), std::move(*value)).second) return std::nullopt;
+            skipWhitespace();
+            if (pos >= json.size()) return std::nullopt;
+            if (json[pos] == '}')
+            {
+                ++pos;
+                break;
+            }
+            if (json[pos++] != ',') return std::nullopt;
+        }
+    }
+    skipWhitespace();
+    if (pos != json.size()) return std::nullopt;
+    return fields;
+}
+
 std::optional<std::pair<std::size_t, std::size_t>> FindTopLevelJsonObject(
     const std::string& json, std::string_view key)
 {
@@ -2245,17 +2309,27 @@ void PluginRuntime::CompleteVpnEvaluation(ICod4xHost& host, const HttpResponse& 
 
 void PluginRuntime::CompleteSiegeEvaluation(ICod4xHost& host, const std::string& siegeJson, bool vpnMatched)
 {
-    const auto mode = ExtractJsonStringValue(siegeJson, "mode");
+    const auto fields = ParseSiegeDecision(siegeJson);
+    if (!fields)
+    {
+        LogError(host, "Invalid Siege decision; player remains connected");
+        return;
+    }
+    const auto getField = [&](const char* key) -> std::optional<std::string> {
+        const auto it = fields->find(key);
+        return it == fields->end() ? std::nullopt : std::optional<std::string>(it->second);
+    };
+    const auto mode = getField("mode");
     if (!mode || *mode != "Enforce")
     {
         LogInfo(host, "Siege decision is not explicitly enforceable; player remains connected");
         return;
     }
-    const auto sessionId = ExtractJsonStringValue(siegeJson, "sessionId");
-    const auto actionId = ExtractJsonStringValue(siegeJson, "actionId");
-    const auto connectionId = ExtractJsonStringValue(siegeJson, "connectionId");
-    const auto expiresAt = ExtractJsonStringValue(siegeJson, "expiresAtUtc");
-    const auto reason = ExtractJsonStringValue(siegeJson, "reason");
+    const auto sessionId = getField("sessionId");
+    const auto actionId = getField("actionId");
+    const auto connectionId = getField("connectionId");
+    const auto expiresAt = getField("expiresAtUtc");
+    const auto reason = getField("reason");
     if (!sessionId || !actionId || !connectionId ||
         !IsUuid(*sessionId) || !IsUuid(*actionId) || !IsUuid(*connectionId))
     {

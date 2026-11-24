@@ -3120,6 +3120,36 @@ void Runtime_SiegeDryRunAndUnrecognizedModeNeverDispatch()
     }
 }
 
+void Runtime_SiegeRejectsNestedAndMalformedDecisionFields()
+{
+    for (int scenario = 0; scenario < 5; ++scenario)
+    {
+        const auto configPath = WriteVpnProtectionConfig("siege-invalid-fields-" + std::to_string(scenario));
+        FakeHost host;
+        ConfigureVpnProtectionPlayer(host);
+        host.InjectEvaluationConnectionId = true;
+        std::string response = SiegeResponse("1970-01-01T01:30:00Z");
+        const auto mode = response.find("\"mode\":\"Enforce\"");
+        if (scenario == 0) response.replace(mode, 16, "\"metadata\":{\"mode\":\"Enforce\"}");
+        if (scenario == 1) response.replace(mode, 16, "\"mode\":\"Enforce\",\"mode\":\"DryRun\"");
+        if (scenario == 2) response.replace(mode, 16, "\"mode\":null,\"metadata\":{\"mode\":\"Enforce\"}");
+        if (scenario == 3) response.replace(mode, 16, "\"mode\":\"Enforce\" \"extra\":\"value\"");
+        if (scenario == 4) response.replace(mode, 16, "\"metadata\":\"\\\"mode\\\":\\\"Enforce\\\"\"");
+        host.Responses["POST https://example.test/ingest/vpn-protection/evaluate"] = {200, response};
+        portal_cod4x::PluginRuntime runtime(configPath.string());
+        runtime.Initialize(host, "0.2.0");
+        runtime.HandlePlayerConnect(host, 2, "198.51.100.10");
+        runtime.HandlePlayerConnected(host, 2);
+        for (int i = 0; i < 4; ++i) runtime.Tick(host);
+        Assert(host.DroppedPlayers.empty() && host.ExecutedCommands.empty(),
+            "Nested, duplicate, or malformed decision fields must never dispatch a Siege drop");
+        Assert(std::none_of(host.Requests.begin(), host.Requests.end(), [](const auto& request) {
+            return request.Url == "https://example.test/ingest/siege-mode/outcome";
+        }), "Invalid Siege decisions must not report a dispatched action");
+        RemoveTestConfig(configPath);
+    }
+}
+
 void Runtime_SiegeDropCanSynchronouslyInvokeDisconnect()
 {
     const auto configPath = WriteVpnProtectionConfig("siege-reentrant-disconnect");
@@ -3360,6 +3390,7 @@ int main()
     Runtime_SiegeGuidOnlyDecisionDispatchesOnceAndRetriesOutcome();
     Runtime_SiegeStaleAndFailedDecisionsAreReported();
     Runtime_SiegeDryRunAndUnrecognizedModeNeverDispatch();
+    Runtime_SiegeRejectsNestedAndMalformedDecisionFields();
     Runtime_SiegeDropCanSynchronouslyInvokeDisconnect();
     Runtime_IpChangeInvalidatesInFlightDecisions();
     Runtime_SiegeAndVpnConflictsNeverDoubleEnforce();
