@@ -60,40 +60,159 @@ The plugin registers two RCON ban-list commands at default power 30:
 
 `dumpportalbanlist` renders one line per cached ban with its CoD4x player identifier and enforcement reason, followed by an `Active portal bans` count. Portal bans remain excluded from `dumpbanlist` so the agent cannot re-import portal-owned records as new server bans.
 
+Portalplugin itself enforces synchronized bans through `OnPlayerGetBanStatus`,
+`OnPlayerGotAuthInfo` and proactive drops after a successful active-ban refresh; this does not
+require simplebanlist. `/active-bans` passes through Repository `AdminActionDto` records.
+The cache retains nullable `expires` UTC values (including zone-less SQL UTC date-times);
+temporary entries stop enforcing locally at expiry even while refresh is offline. Permanent
+null/omitted expiry stays permanent. Overlapping records for one GUID merge with permanent
+taking precedence, otherwise the latest expiry, including across response pages.
+An elapsed record cannot trigger a proactive drop. Malformed temporary expiry or a malformed
+page rejects the refresh with a diagnostic and preserves the previous valid cache, rather than
+turning the entry into a permanent ban or clearing valid bans.
+
+New cloud records reach the cache on a successful configured refresh (15-900 seconds,
+default 120), not instantaneously. Initial native DropPlayer dispatch does not prove that the
+record has already propagated or that reconnect enforcement is confirmed. Existing records
+and native server-originated bans remain separate and are not deleted by the rules cutover.
+
 ## Connection correlation
 
-Observed player connections receive a UUID shared by their connect event and VPN evaluation.
+Observed player connections receive a UUID shared by their connect event and rules trigger.
 Disconnect events include that UUID when the connection is known. A player already present
 when the plugin loads, or carried across a map change without provable continuity, has a
 null connection ID; the plugin logs the uncertainty and such a player must not be treated as
-a fresh Siege admission. An observed new connection receives a new UUID.
+a fresh admission. An observed new connection receives a new UUID.
 
 If a real IP arrives or changes after the connect event, the plugin emits a
 `player-ip-resolved` event with a unique observation ID, the player GUID, slot and nullable connection ID.
-Both event types mark plugin-owned protection evaluation so consumers do not duplicate it.
+Both event types include `connectionGeneration` (an unsigned 64-bit local generation),
+`runtime` (actual loaded plugin ID/version/capabilities) and `rulesEvaluatedByPlugin: true`.
+Connect and IP triggers reuse the corresponding event observation ID when emitted together.
+The cloud owns durable deduplication of mirrored observations and later enrichment; the flag
+is not permission to skip independent feature work. Status roster entries include the nullable
+connection ID and generation, but a partial status snapshot cannot prove continuity across gaps.
+The status queue reaches server-events, not the server agent: it is not a direct agent identity
+handoff API. Source switches must retain unknown continuity unless independently established.
+Status/disconnect metadata includes `snapshotId` (the existing message ID), `sequence` (the
+existing sequence counter), `observedAtUtc` and `runtime.instanceId`/`runtime.startedAtUtc`
+(the existing producer epoch/start). Status rows explicitly say Connected or Unknown;
+only an observed disconnect with the exact runtime/connection/generation can tombstone a
+binding. Unknown rows and missing rows never do. Status is produced every 60 seconds when
+callbacks run, but delivery has no bounded worst case during backoff/offline periods, so use
+observation time rather than receipt time for freshness.
 
-## Siege evaluation
+## Universal rules adapter (0.3+, protocol 1)
 
-Observed connections are evaluated with `siegeEvaluation` enabled, first with a GUID only if
-the IP is unavailable and again when a real IP arrives. The existing VPN decision remains
-independent. Unknown connection continuity is passed as a null connection ID and is not
-eligible for a Siege kick.
+The plugin is a trigger adapter and native executor, not a rules interpreter. Server-events
+owns feature subscriptions, rule matching/order, action dependencies, persistent moderation
+records, forum posts and durable continuation. There are no VPN/Siege-specific decision routes
+or legacy-format fallback.
 
-A Siege decision must explicitly specify `mode: "Enforce"` and match the live GUID, slot,
-connection ID and generation, with an unexpired decision. The plugin invokes CoD4x's
-`Plugin_DropClient` directly with the kick reason and reports `Dispatched`, which does not
-confirm that the player was dropped. Stale or invalid decisions are reported as `Stale` or
-`Failed`. Retained outcome reports are retried while the plugin runs.
-The service's one-shot claim prevents redispatch after a repeated evaluation, including a lost
-response. The plugin also keeps a bounded defensive cache of up to 1,000 action IDs, evicting
-acknowledged IDs as needed without stopping Siege. If all 1,000 outcomes are unacknowledged,
-the oldest retry (excluding an in-flight request) is evicted and its correlation and outcome
-are logged. Its service-side claim remains pending/unknown for reconciliation; the lost callback
-is not retried. A restart can likewise lose any unacknowledged in-memory outcomes.
+| Route (relative to `ingestBaseUrl`) | Request | Response |
+|---|---|---|
+| `POST /rules/evaluate` | Bare normalized trigger | `{protocolVersion:1, commands:[], executionIds:[]}` |
+| `POST /rules/outcomes` | Bare correlated per-action result | Same envelope, including ready continuation commands |
+| `POST /rules/poll` | Server, slot, GUID, connection ID/generation and unfinished `executionIds` | Same envelope |
 
-Dry-run matches are recorded by the service and return no dispatchable Siege decision.
-Unknown or missing decision modes also fail open. VPN Protection can still enforce its own
-independent decision during a Siege dry run.
+Triggers use `player.connected` and `player.ip-resolved`, `protocolVersion: 1`,
+`triggerOccurrenceId`, `observationId`, `occurredAtUtc`, `gameServerId`, `gameType`,
+`playerGuid`, nullable `playerIpAddress`, optional `username` and the connection target.
+Normalized game type is the actual host's `CallOfDuty4x`; legacy event/config strings remain
+unchanged. Unknown connection continuity never sends a normalized evaluation with a null ID.
+The runtime ID is `cod4x-plugin`, with `identityModel: PluginRuntimeGeneration` and a new
+instance UUID per startup; its capabilities are exactly:
+
+- `cod4x.player.drop` (`effect.type: DropPlayer`, `reason`)
+- `cod4x.chat.public` (`effect.type: PublicMessage`, `message`)
+- `cod4x.chat.private` (`effect.type: PrivateMessage`, `message`)
+
+No native Ban/TempBan capability or native temporary-ban duration is advertised.
+Observation needs no native effect. KickOnly uses DropPlayer; KickWithRecord, Ban and TempBan
+require cloud-owned records (including expiry), existing active-ban synchronization where
+applicable, and only the targeted native effect delegated to the plugin. Existing ban-cache
+enforcement, admin action records and unrelated welcome behavior are unchanged.
+
+Each command carries protocol version, `executionId`, `actionId`, `logicalEffectId`,
+complete `correlation`, server/slot/GUID/connection ID/generation, UTC expiry, explicit
+`mode: Enforce|DryRun` and a typed effect. Execution occurs only on the host callback thread,
+after non-blocking HTTP completes. Every action rechecks the current target, live host GUID
+and originating request IP revision. A synchronous native disconnect invalidates subsequent
+targeted commands safely. No arbitrary server-command text is accepted.
+The command runtime descriptor must match this plugin's executor ID, version, protocol,
+instance ID, start time and identity model. Agent-observed connections cannot execute here;
+plugin targets require a non-null generation. Trigger correlation must match the retained
+observation before a new native effect is dispatched.
+Command and portal-ban UTC expiry retain 100-nanosecond precision; nonzero precision beyond
+seven fractional digits is rejected rather than rounded or truncated.
+
+Only explicit Enforce dispatches native effects. DryRun reports `WouldExecute` with no drop
+or chat; missing/unknown modes fail closed for native effects. Text must be nonempty,
+at most 256 UTF-8 bytes and contain no C0/DEL controls. Unsupported effects report
+`SkippedUnsupported` without preventing other supported commands.
+
+Results echo `gameServerId`, execution/action/logical-effect identity and the complete correlation, with an
+actual UTC subsecond timestamp and detail. A cached dispatch retains its original timestamp on redelivery.
+`Dispatched` means the native API was invoked, **not** confirmed Applied.
+Expired/replaced connections report Stale, malformed commands report Failed when safely
+correlatable, and malformed envelopes/identities are logged without dispatch.
+
+The plugin retains at most 64 queued triggers, 64 continuation contexts and 1,000 pending
+outcomes; overflow is logged. New commands are not executed when their outcome cannot be
+retained. A separate cache reserves up to 1,000 unexpired dispatched logical-effect IDs
+**before** calling native APIs. It does not evict live IDs to make room for another effect;
+capacity exhaustion reports Failed instead of risking duplicate effects. Unsupported, failed
+and DryRun actions do not consume native-effect deduplication capacity.
+
+Outcome failures and malformed acknowledgements retry with the same payload. Polls resume
+unfinished cloud work without keeping an HTTP request open; individual requests time out
+after 10 seconds, polling retries after failure and continuation retention ends after
+15 minutes with a reconciliation diagnostic. The cloud must never blindly redeliver an
+ambiguous destructive effect. All buffers and the deduplication cache are memory-only:
+unload/restart loses unacknowledged results, so exactly-once native execution is not promised.
+`OnTerminate` releases in-flight requests and logs unresolved outcomes/continuations.
+
+Evaluate replies may set `retryTrigger: true` (default false) when a provider failed before
+durably starting a feature. Healthy commands and execution IDs are consumed immediately.
+The plugin retries the identical original trigger after five seconds, retaining its occurrence,
+timestamp and connection/IP snapshot; outcomes/polls never request a trigger retry.
+Successful evaluate replies with false stop this recovery. Transport failures also retain
+the original evaluate payload. Recovery expires 120 seconds after the original observation,
+never extended by retries, or earlier on connection/IP invalidation, with an explicit diagnostic.
+This is bounded delivery recovery, not a local feature cursor or rules interpreter.
+
+## Coordinated installation and loaded-version proof
+
+Source merges to main automatically build/tag release artifacts. Hold the breaking merge
+until the coordinator confirms feature shutdown/reset and compatible cloud/APIM/agent
+dependencies are ready. Keep converted features disabled throughout installation.
+
+Use the existing agent installer and unchanged artifact names/paths. Record the exact
+artifact semantic version, source commit, platform/architecture and SHA-256 of the extracted
+DLL/SO. Ensure the old module is actually unloaded, replace the binary, then load it; a file
+copy, release upload or successful best-effort unload alone is not installation evidence.
+Verify the existing server-agent `IsCod4xPluginSourceEnabled` setting selects the intended
+exclusive producer for connect/IP/status events. Loading the plugin does not itself switch
+the agent source mode; an incorrect or unsynchronized transition can publish distinct
+connection IDs from both producers. Refresh/restart the agent through its normal lifecycle
+after changing its existing source-mode configuration, then verify the selected source before
+re-enabling features.
+Do not restart a game server or run production kicks/bans as validation without authorization.
+
+Verify the actual loaded module with the existing plugin info mechanism and invoke
+`portalpluginhealth` through the server console/RCON. Its output must show the expected exact
+`pluginVersion`, `loadedConfig=true`, the correct `gameServerId`, and:
+
+```text
+rulesProtocolVersion=1 nativeCapabilities=cod4x.player.drop,cod4x.chat.public,cod4x.chat.private
+```
+
+Health also shows pending trigger/outcome/continuation counts. Confirm a fresh server status
+with matching loaded `runtime.version`, protocol and capability metadata reaches cloud
+consumers. Real host RCON output capture and loaded-module behavior require server validation;
+unit tests and artifact hashes do not establish this. Recreate/re-enable rules only under the
+coordinator's clean-slate rollout. Rollback requires matching cloud protocol and module versions;
+the 0.3 plugin never interprets the old feature decision format.
 
 ## Version source
 

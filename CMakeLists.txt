@@ -46,6 +46,8 @@ if(NOT PORTAL_COD4X_PLUGIN_VERSION)
 endif()
 
 add_library(portal_cod4x_core STATIC
+  src/native_action_executor.cpp
+  src/rules_adapter.cpp
   src/plugin_runtime.cpp
 )
 

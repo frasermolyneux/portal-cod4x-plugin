@@ -1,4 +1,5 @@
 #include "portal_cod4x/plugin_runtime.h"
+#include "rules_json.h"
 
 #include <algorithm>
 #include <cstdlib>
@@ -50,9 +51,11 @@ public:
     std::unordered_map<std::string, bool> CommandPermissions;
     std::unordered_map<std::string, std::string> CvarValues;
     std::int64_t CurrentTime = 0;
+    std::int64_t CurrentSubsecondTicks = 0;
     bool ExecuteServerCommandSucceeds = true;
-    bool InjectEvaluationConnectionId = false;
-    bool HoldSiegeOutcome = false;
+    bool HoldRulesOutcome = false;
+    int OpenRequests = 0;
+    std::function<portal_cod4x::HttpResponse(const RequestRecord&)> ResponseFactory;
     std::function<void(int)> OnDrop;
 
     void BroadcastChat(std::string_view message) override
@@ -95,26 +98,19 @@ public:
 
         const std::string key = std::string(method) + " " + std::string(url);
         auto* pending = new PendingRequest{};
-        pending->IsSiegeOutcome = url == "https://example.test/ingest/siege-mode/outcome";
+        ++OpenRequests;
+        pending->IsRulesOutcome = url == "https://example.test/ingest/rules/outcomes";
 
         const auto it = Responses.find(key);
-        if (it != Responses.end())
+        if (ResponseFactory && std::string_view(url).find("/rules/") != std::string_view::npos)
+        {
+            pending->HasResponse = true;
+            pending->Response = ResponseFactory(Requests.back());
+        }
+        else if (it != Responses.end())
         {
             pending->HasResponse = true;
             pending->Response = it->second;
-            if (InjectEvaluationConnectionId && url == "https://example.test/ingest/vpn-protection/evaluate")
-            {
-                const std::string prefix = "\"connectionId\":\"";
-                const std::string requestBody(body);
-                const auto start = requestBody.find(prefix);
-                const auto placeholder = pending->Response.Body.find("$connectionId");
-                if (start != std::string::npos && placeholder != std::string::npos)
-                {
-                    const auto valueStart = start + prefix.size();
-                    const auto valueEnd = requestBody.find('"', valueStart);
-                    pending->Response.Body.replace(placeholder, 13, requestBody.substr(valueStart, valueEnd - valueStart));
-                }
-            }
         }
         else if (url == "https://example.test/ingest/events/playtime-observation" ||
             url == "https://example.test/ingest/events/player-ip-resolved")
@@ -131,7 +127,7 @@ public:
         portal_cod4x::HttpResponse& response) override
     {
         auto* pending = static_cast<PendingRequest*>(handle);
-        if (pending != nullptr && pending->IsSiegeOutcome && HoldSiegeOutcome)
+        if (pending != nullptr && pending->IsRulesOutcome && HoldRulesOutcome)
         {
             return portal_cod4x::HttpRequestStatus::Pending;
         }
@@ -146,6 +142,7 @@ public:
 
     void EndHttpRequest(portal_cod4x::HttpRequestHandle handle) override
     {
+        --OpenRequests;
         delete static_cast<PendingRequest*>(handle);
     }
 
@@ -195,11 +192,16 @@ public:
         return CurrentTime;
     }
 
+    std::int64_t GetUnixTime100Nanoseconds() const override
+    {
+        return CurrentTime * 10000000 + CurrentSubsecondTicks;
+    }
+
 private:
     struct PendingRequest
     {
         bool HasResponse = false;
-        bool IsSiegeOutcome = false;
+        bool IsRulesOutcome = false;
         portal_cod4x::HttpResponse Response;
     };
 };
@@ -213,10 +215,10 @@ void Assert(bool condition, const char* message)
     }
 }
 
-std::filesystem::path WriteVpnProtectionConfig(std::string_view testName)
+std::filesystem::path WriteRuntimeConfig(std::string_view testName)
 {
     const std::filesystem::path configPath = std::filesystem::temp_directory_path() /
-        ("portal-cod4x-plugin.vpn." + std::string(testName) + ".json");
+        ("portal-cod4x-plugin.runtime." + std::string(testName) + ".json");
     std::ofstream configFile(configPath);
     configFile
         << "{"
@@ -229,7 +231,7 @@ std::filesystem::path WriteVpnProtectionConfig(std::string_view testName)
     return configPath;
 }
 
-void ConfigureVpnProtectionPlayer(FakeHost& host)
+void ConfigureTestPlayer(FakeHost& host)
 {
     host.CurrentTime = 5000;
     host.PlayerIds[2] = 76561198000000001ULL;
@@ -550,9 +552,9 @@ std::string JsonStringField(const std::string& payload, const std::string& field
 
 void Runtime_PlaytimeMetadataSurvivesRetryAndReconnect()
 {
-    const auto configPath = WriteVpnProtectionConfig("playtime");
+    const auto configPath = WriteRuntimeConfig("playtime");
     FakeHost host;
-    ConfigureVpnProtectionPlayer(host);
+    ConfigureTestPlayer(host);
     const std::string connectUrl = "https://example.test/ingest/events/player-connected";
     host.Responses["POST " + connectUrl] = {500, ""};
     host.Responses["POST https://example.test/ingest/events/player-disconnected"] = {202, ""};
@@ -652,9 +654,9 @@ void Runtime_PlaytimeMetadataSurvivesRetryAndReconnect()
 
 void Runtime_InFlightBatchDoesNotAcknowledgeEvictedIndices()
 {
-    const auto configPath = WriteVpnProtectionConfig("batch-eviction");
+    const auto configPath = WriteRuntimeConfig("batch-eviction");
     FakeHost host;
-    ConfigureVpnProtectionPlayer(host);
+    ConfigureTestPlayer(host);
     host.Responses["POST https://example.test/ingest/events/chat-message"] = {202, ""};
     host.Responses["POST https://example.test/ingest/events/server-connected"] = {202, ""};
     host.Responses["POST https://example.test/ingest/events/map-change"] = {202, ""};
@@ -672,7 +674,7 @@ void Runtime_InFlightBatchDoesNotAcknowledgeEvictedIndices()
     }
     const bool sentFirstServerEvent = std::any_of(host.Requests.begin(), host.Requests.end(), [](const FakeHost::RequestRecord& request) {
         return request.Url.find("/events/server-connected") != std::string::npos &&
-            request.Body.find("\"sequenceId\":2}") != std::string::npos;
+            request.Body.find("\"sequenceId\":2,") != std::string::npos;
     });
     Assert(sentFirstServerEvent, "Eviction of an in-flight event must not acknowledge a different queued event");
     RemoveTestConfig(configPath);
@@ -680,9 +682,9 @@ void Runtime_InFlightBatchDoesNotAcknowledgeEvictedIndices()
 
 void Runtime_RestartLosesUnsentEvents()
 {
-    const auto configPath = WriteVpnProtectionConfig("restart-loss");
+    const auto configPath = WriteRuntimeConfig("restart-loss");
     FakeHost host;
-    ConfigureVpnProtectionPlayer(host);
+    ConfigureTestPlayer(host);
     {
         portal_cod4x::PluginRuntime runtime(configPath.string());
         runtime.Initialize(host, "0.2.0");
@@ -710,9 +712,9 @@ void Runtime_RestartLosesUnsentEvents()
 
 void Runtime_CoverageCountsCapacityLoss()
 {
-    const auto configPath = WriteVpnProtectionConfig("coverage-capacity");
+    const auto configPath = WriteRuntimeConfig("coverage-capacity");
     FakeHost host;
-    ConfigureVpnProtectionPlayer(host);
+    ConfigureTestPlayer(host);
     host.Responses["POST https://example.test/ingest/events/player-disconnected"] = {202, ""};
     host.Responses["POST https://example.test/ingest/events/server-status"] = {202, ""};
     portal_cod4x::PluginRuntime runtime(configPath.string());
@@ -763,9 +765,9 @@ void Runtime_CoverageCountsCapacityLoss()
 
 void Runtime_CoverageCountsAgeAndSimultaneousThresholds()
 {
-    const auto configPath = WriteVpnProtectionConfig("coverage-age");
+    const auto configPath = WriteRuntimeConfig("coverage-age");
     FakeHost host;
-    ConfigureVpnProtectionPlayer(host);
+    ConfigureTestPlayer(host);
     host.Responses["POST https://example.test/ingest/events/server-status"] = {202, ""};
     {
         portal_cod4x::PluginRuntime runtime(configPath.string());
@@ -791,7 +793,7 @@ void Runtime_CoverageCountsAgeAndSimultaneousThresholds()
     }
 
     FakeHost retryHost;
-    ConfigureVpnProtectionPlayer(retryHost);
+    ConfigureTestPlayer(retryHost);
     retryHost.Responses["POST https://example.test/ingest/events/playtime-observation"] = {500, ""};
     retryHost.Responses["POST https://example.test/ingest/events/server-status"] = {202, ""};
     portal_cod4x::PluginRuntime runtime(configPath.string());
@@ -828,9 +830,9 @@ void Runtime_CoverageCountsAgeAndSimultaneousThresholds()
 
 void Runtime_CoverageCountsInFlightEviction()
 {
-    const auto configPath = WriteVpnProtectionConfig("coverage-in-flight");
+    const auto configPath = WriteRuntimeConfig("coverage-in-flight");
     FakeHost host;
-    ConfigureVpnProtectionPlayer(host);
+    ConfigureTestPlayer(host);
     host.Responses["POST https://example.test/ingest/events/player-disconnected"] = {202, ""};
     host.Responses["POST https://example.test/ingest/events/server-status"] = {202, ""};
     portal_cod4x::PluginRuntime runtime(configPath.string());
@@ -861,9 +863,9 @@ void Runtime_CoverageCountsInFlightEviction()
 
 void Runtime_CoverageRetainsCountersAcrossStatusRetry()
 {
-    const auto configPath = WriteVpnProtectionConfig("coverage-retry");
+    const auto configPath = WriteRuntimeConfig("coverage-retry");
     FakeHost host;
-    ConfigureVpnProtectionPlayer(host);
+    ConfigureTestPlayer(host);
     const std::string statusUrl = "https://example.test/ingest/events/playtime-observation";
     host.Responses["POST " + statusUrl] = {500, ""};
     host.Responses["POST https://example.test/ingest/events/server-status"] = {202, ""};
@@ -907,9 +909,9 @@ void Runtime_CoverageRetainsCountersAcrossStatusRetry()
 
 void Runtime_CoverageUsesFirstPublicationTimeAcrossRetries()
 {
-    const auto configPath = WriteVpnProtectionConfig("coverage-publication-time");
+    const auto configPath = WriteRuntimeConfig("coverage-publication-time");
     FakeHost host;
-    ConfigureVpnProtectionPlayer(host);
+    ConfigureTestPlayer(host);
     host.Responses["POST https://example.test/ingest/events/server-status"] = {202, ""};
     const std::string url = "https://example.test/ingest/events/playtime-observation";
     host.Responses["POST " + url] = {500, ""};
@@ -952,9 +954,9 @@ void Runtime_CoverageUsesFirstPublicationTimeAcrossRetries()
 
 void Runtime_DedicatedPlaytimeEventsPreserveIdentityAndPrivacy()
 {
-    const auto configPath = WriteVpnProtectionConfig("dedicated-playtime");
+    const auto configPath = WriteRuntimeConfig("dedicated-playtime");
     FakeHost host;
-    ConfigureVpnProtectionPlayer(host);
+    ConfigureTestPlayer(host);
     host.CvarValues["mapname"] = "mp_crash";
     host.Responses["POST https://example.test/ingest/events/player-disconnected"] = {202, ""};
     host.Responses["POST https://example.test/ingest/events/server-connected"] = {202, ""};
@@ -1050,9 +1052,9 @@ void Runtime_DedicatedPlaytimeEventsPreserveIdentityAndPrivacy()
 
 void Runtime_DedicatedPlaytimeAmbiguousReconnectRemainsUncertain()
 {
-    const auto configPath = WriteVpnProtectionConfig("playtime-ambiguous-reconnect");
+    const auto configPath = WriteRuntimeConfig("playtime-ambiguous-reconnect");
     FakeHost host;
-    ConfigureVpnProtectionPlayer(host);
+    ConfigureTestPlayer(host);
     host.Responses["POST https://example.test/ingest/events/player-disconnected"] = {202, ""};
     host.Responses["POST https://example.test/ingest/events/server-status"] = {202, ""};
     const std::string url = "https://example.test/ingest/events/playtime-observation";
@@ -1138,9 +1140,9 @@ void Runtime_DedicatedPlaytimeAmbiguousReconnectRemainsUncertain()
 
 void Runtime_DedicatedPlaytimeTracksResolvedRosterIdentity()
 {
-    const auto configPath = WriteVpnProtectionConfig("playtime-roster-identity");
+    const auto configPath = WriteRuntimeConfig("playtime-roster-identity");
     FakeHost host;
-    ConfigureVpnProtectionPlayer(host);
+    ConfigureTestPlayer(host);
     host.Responses["POST https://example.test/ingest/events/server-status"] = {202, ""};
     host.Responses["POST https://example.test/ingest/events/player-disconnected"] = {202, ""};
     const std::string url = "https://example.test/ingest/events/playtime-observation";
@@ -1202,9 +1204,9 @@ void Runtime_DedicatedPlaytimeTracksResolvedRosterIdentity()
 
 void Runtime_DedicatedPlaytimeDoesNotGuessUnresolvedDisconnect()
 {
-    const auto configPath = WriteVpnProtectionConfig("playtime-unresolved-disconnect");
+    const auto configPath = WriteRuntimeConfig("playtime-unresolved-disconnect");
     FakeHost host;
-    ConfigureVpnProtectionPlayer(host);
+    ConfigureTestPlayer(host);
     host.Responses["POST https://example.test/ingest/events/server-status"] = {202, ""};
     const std::string url = "https://example.test/ingest/events/playtime-observation";
     portal_cod4x::PluginRuntime runtime(configPath.string());
@@ -1251,12 +1253,12 @@ void Runtime_DedicatedPlaytimeDoesNotGuessUnresolvedDisconnect()
 
 void Runtime_DedicatedPlaytimeReconcilesUnresolvedEnterWorld()
 {
-    const auto configPath = WriteVpnProtectionConfig("playtime-unresolved-enter-world");
+    const auto configPath = WriteRuntimeConfig("playtime-unresolved-enter-world");
     const std::string url = "https://example.test/ingest/events/playtime-observation";
     for (const bool replacement : {false, true})
     {
         FakeHost host;
-        ConfigureVpnProtectionPlayer(host);
+        ConfigureTestPlayer(host);
         host.Responses["POST https://example.test/ingest/events/player-disconnected"] = {202, ""};
         portal_cod4x::PluginRuntime runtime(configPath.string());
         runtime.Initialize(host, "0.2.0");
@@ -1290,7 +1292,7 @@ void Runtime_DedicatedPlaytimeReconcilesUnresolvedEnterWorld()
     }
 
     FakeHost host;
-    ConfigureVpnProtectionPlayer(host);
+    ConfigureTestPlayer(host);
     portal_cod4x::PluginRuntime runtime(configPath.string());
     runtime.Initialize(host, "0.2.0");
     runtime.HandlePlayerConnected(host, 2);
@@ -1317,12 +1319,12 @@ void Runtime_DedicatedPlaytimeReconcilesUnresolvedEnterWorld()
 
 void Runtime_DedicatedPlaytimeDisconnectUsesResolvedIdentity()
 {
-    const auto configPath = WriteVpnProtectionConfig("playtime-disconnect-identity");
+    const auto configPath = WriteRuntimeConfig("playtime-disconnect-identity");
     const std::string url = "https://example.test/ingest/events/playtime-observation";
     for (int scenario = 0; scenario < 3; ++scenario)
     {
         FakeHost host;
-        ConfigureVpnProtectionPlayer(host);
+        ConfigureTestPlayer(host);
         host.Responses["POST https://example.test/ingest/events/player-disconnected"] = {202, ""};
         portal_cod4x::PluginRuntime runtime(configPath.string());
         runtime.Initialize(host, "0.2.0");
@@ -1372,7 +1374,7 @@ void Runtime_DedicatedPlaytimeDisconnectUsesResolvedIdentity()
             "The leave must identify the authorized occupant, not the stale slot occupant");
     }
     FakeHost host;
-    ConfigureVpnProtectionPlayer(host);
+    ConfigureTestPlayer(host);
     portal_cod4x::PluginRuntime runtime(configPath.string());
     runtime.Initialize(host, "0.2.0");
     runtime.HandlePlayerConnect(host, 2, "");
@@ -1842,8 +1844,8 @@ void Runtime_LoadsActiveBanCacheAndAnswersBanQuery()
     host.Responses["GET https://example.test/ingest/active-bans?gameType=CallOfDuty4x&skipEntries=0&takeEntries=200"] = {
         200,
         "{\"data\":{\"items\":["
-        "{\"adminActionId\":\"22222222-2222-2222-2222-222222222222\",\"player\":{\"guid\":\"76561198000000002\"}},"
-        "{\"adminActionId\":\"11111111-1111-1111-1111-111111111111\",\"player\":{\"guid\":\"76561198000000001\"}}]}}"};
+        "{\"adminActionId\":\"22222222-2222-2222-2222-222222222222\",\"type\":\"Ban\",\"player\":{\"guid\":\"76561198000000002\"}},"
+        "{\"adminActionId\":\"11111111-1111-1111-1111-111111111111\",\"type\":\"Ban\",\"player\":{\"guid\":\"76561198000000001\"}}]}}"};
 
     portal_cod4x::PluginRuntime runtime(configPath.string());
     const int initializeResult = runtime.Initialize(host, "1.2.3", "^4[^1XI-BOT^4]^7");
@@ -1879,7 +1881,7 @@ void Runtime_LoadsActiveBanCacheAndAnswersBanQuery()
 
 void Runtime_ActiveBanSyncProactivelyDropsConnectedBannedPlayer()
 {
-    const auto configPath = WriteVpnProtectionConfig("proactive-ban-drop");
+    const auto configPath = WriteRuntimeConfig("proactive-ban-drop");
     FakeHost host;
     host.CurrentTime = 4000;
     host.PlayerIds[4] = 76561198000000004ULL;
@@ -1887,7 +1889,7 @@ void Runtime_ActiveBanSyncProactivelyDropsConnectedBannedPlayer()
     host.Responses["GET https://example.test/ingest/active-bans?gameType=CallOfDuty4x&skipEntries=0&takeEntries=200"] = {
         200,
         "{\"data\":{\"items\":[{\"adminActionId\":\"44444444-4444-4444-4444-444444444444\","
-        "\"player\":{\"guid\":\"76561198000000004\"}}]}}"};
+        "\"type\":\"Ban\",\"player\":{\"guid\":\"76561198000000004\"}}]}}"};
 
     portal_cod4x::PluginRuntime runtime(configPath.string());
     Assert(runtime.Initialize(host, "1.2.3") == 0, "PluginRuntime initialize should succeed");
@@ -2044,7 +2046,7 @@ void Runtime_ServerOriginBanRendersDumpBanListAndEvictsOnImport()
     // Portal now reports the ban as active (agent imported it) -> plugin evicts it from the pending set.
     host.Responses["GET https://example.test/ingest/active-bans?gameType=CallOfDuty4x&skipEntries=0&takeEntries=200"] = {
         200,
-        "{\"data\":{\"items\":[{\"player\":{\"guid\":\"76561198000000009\"}}]}}"};
+        "{\"data\":{\"items\":[{\"type\":\"Ban\",\"player\":{\"guid\":\"76561198000000009\"}}]}}"};
 
     host.CurrentTime += 200; // advance past the refresh interval so the next sync fires
     for (int i = 0; i < 6; ++i)
@@ -2119,7 +2121,7 @@ void Runtime_PortalLiftedBanIssuesNativeUnban()
     host.CurrentTime = 4000;
     host.Responses["GET https://example.test/ingest/active-bans?gameType=CallOfDuty4x&skipEntries=0&takeEntries=200"] = {
         200,
-        "{\"data\":{\"items\":[{\"player\":{\"guid\":\"76561198000000051\"}}]}}"};
+        "{\"data\":{\"items\":[{\"type\":\"Ban\",\"player\":{\"guid\":\"76561198000000051\"}}]}}"};
 
     portal_cod4x::PluginRuntime runtime(configPath.string());
     const int initializeResult = runtime.Initialize(host, "1.2.3", "^4[^1XI-BOT^4]^7");
@@ -2238,7 +2240,7 @@ void Runtime_JsonUnescapeDecodesUnicodeEscapesInConfigStrings()
 
 void Runtime_ServerOriginBanResolvesLegacyIdToCanonicalPuidFromRoster()
 {
-    const auto configPath = WriteVpnProtectionConfig("legacy-ban-resolve");
+    const auto configPath = WriteRuntimeConfig("legacy-ban-resolve");
     FakeHost host;
     host.CurrentTime = 4000;
 
@@ -2532,214 +2534,14 @@ void Runtime_HandleChatMessage_StripsLeadingControlByteFromPayload()
     std::filesystem::remove(configPath, ignoreError);
 }
 
-void Runtime_VpnProtectionBan_ExecutesVerifiedCommand()
-{
-    const auto configPath = WriteVpnProtectionConfig("ban");
-    FakeHost host;
-    ConfigureVpnProtectionPlayer(host);
-    host.Responses["POST https://example.test/ingest/vpn-protection/evaluate"] = {
-        200,
-        "{\"matched\":true,\"action\":\"Ban\",\"reason\":\"VPN Protection\",\"matchedRuleIds\":[\"vpn\"]}"};
-
-    portal_cod4x::PluginRuntime runtime(configPath.string());
-    runtime.Initialize(host, "0.2.0");
-    runtime.HandlePlayerConnect(host, 2, "198.51.100.10:28960");
-    runtime.HandlePlayerConnected(host, 2);
-    runtime.Tick(host);
-    runtime.Tick(host);
-
-    Assert(std::find(host.ExecutedCommands.begin(), host.ExecutedCommands.end(),
-        "banClient 2 \"VPN Protection\"") != host.ExecutedCommands.end(),
-        "Expected verified VPN Protection banClient command");
-    Assert(std::find(host.Logs.begin(), host.Logs.end(),
-        "VPN Protection executed ban for player 76561198000000001") != host.Logs.end(),
-        "Expected successful VPN Protection ban in the plugin log");
-    const auto request = std::find_if(host.Requests.begin(), host.Requests.end(), [](const FakeHost::RequestRecord& item) {
-        return item.Url == "https://example.test/ingest/vpn-protection/evaluate";
-    });
-    Assert(request != host.Requests.end(), "Expected VPN Protection evaluation request");
-    Assert(request->Body.find("\"playerGuid\":\"76561198000000001\"") != std::string::npos,
-        "Expected player guid in VPN evaluation payload");
-    Assert(request->Body.find("\"ipAddress\":\"198.51.100.10\"") != std::string::npos,
-        "Expected normalized IP in VPN evaluation payload");
-
-    RemoveTestConfig(configPath);
-}
-
-void Runtime_VpnProtectionKick_ExecutesOnlyKick()
-{
-    const auto configPath = WriteVpnProtectionConfig("kick");
-    FakeHost host;
-    ConfigureVpnProtectionPlayer(host);
-    host.Responses["POST https://example.test/ingest/vpn-protection/evaluate"] = {
-        200,
-        "{\"matched\":true,\"action\":\"Kick\",\"reason\":\"High risk VPN\"}"};
-
-    portal_cod4x::PluginRuntime runtime(configPath.string());
-    runtime.Initialize(host, "0.2.0");
-    runtime.HandlePlayerConnect(host, 2, "198.51.100.10");
-    runtime.HandlePlayerConnected(host, 2);
-    runtime.Tick(host);
-    runtime.Tick(host);
-
-    Assert(std::find(host.ExecutedCommands.begin(), host.ExecutedCommands.end(),
-        "onlykick 2 \"High risk VPN\"") != host.ExecutedCommands.end(),
-        "Expected verified VPN Protection onlykick command");
-    Assert(std::find(host.Logs.begin(), host.Logs.end(),
-        "VPN Protection executed kick for player 76561198000000001") != host.Logs.end(),
-        "Expected successful VPN Protection kick in the plugin log");
-    RemoveTestConfig(configPath);
-}
-
-void Runtime_VpnProtectionCommandFailure_LogsErrorWithoutSuccess()
-{
-    const auto configPath = WriteVpnProtectionConfig("command-failure");
-    FakeHost host;
-    ConfigureVpnProtectionPlayer(host);
-    host.ExecuteServerCommandSucceeds = false;
-    host.Responses["POST https://example.test/ingest/vpn-protection/evaluate"] = {
-        200,
-        "{\"matched\":true,\"action\":\"Kick\",\"reason\":\"High risk VPN\"}"};
-
-    portal_cod4x::PluginRuntime runtime(configPath.string());
-    runtime.Initialize(host, "0.2.0");
-    runtime.HandlePlayerConnect(host, 2, "198.51.100.10");
-    runtime.HandlePlayerConnected(host, 2);
-    runtime.Tick(host);
-    runtime.Tick(host);
-
-    Assert(std::find(host.Logs.begin(), host.Logs.end(),
-        "VPN Protection failed to execute kick for player 76561198000000001") != host.Logs.end(),
-        "Expected failed VPN Protection kick in the plugin log");
-    Assert(std::find(host.Logs.begin(), host.Logs.end(),
-        "VPN Protection executed kick for player 76561198000000001") == host.Logs.end(),
-        "Failed VPN Protection kick must not emit a success log");
-    RemoveTestConfig(configPath);
-}
-
-void Runtime_VpnProtectionNoMatch_DoesNotExecuteCommand()
-{
-    const auto configPath = WriteVpnProtectionConfig("no-match");
-    FakeHost host;
-    ConfigureVpnProtectionPlayer(host);
-    host.Responses["POST https://example.test/ingest/vpn-protection/evaluate"] = {
-        200,
-        "{\"matched\":false,\"action\":\"Unknown\",\"reason\":\"\"}"};
-
-    portal_cod4x::PluginRuntime runtime(configPath.string());
-    runtime.Initialize(host, "0.2.0");
-    runtime.HandlePlayerConnect(host, 2, "198.51.100.10");
-    runtime.HandlePlayerConnected(host, 2);
-    runtime.Tick(host);
-    runtime.Tick(host);
-
-    Assert(host.ExecutedCommands.empty(), "No-match VPN evaluation must not execute a command");
-    RemoveTestConfig(configPath);
-}
-
-void Runtime_VpnProtectionTransportFailure_FailsOpen()
-{
-    const auto configPath = WriteVpnProtectionConfig("transport-failure");
-    FakeHost host;
-    ConfigureVpnProtectionPlayer(host);
-
-    portal_cod4x::PluginRuntime runtime(configPath.string());
-    runtime.Initialize(host, "0.2.0");
-    runtime.HandlePlayerConnect(host, 2, "198.51.100.10");
-    runtime.HandlePlayerConnected(host, 2);
-    runtime.Tick(host);
-    runtime.Tick(host);
-
-    Assert(host.ExecutedCommands.empty(), "Failed VPN evaluation must leave the player connected");
-    RemoveTestConfig(configPath);
-}
-
-void Runtime_VpnProtectionSlotReuse_IgnoresDecision()
-{
-    const auto configPath = WriteVpnProtectionConfig("slot-reuse");
-    FakeHost host;
-    ConfigureVpnProtectionPlayer(host);
-    host.Responses["POST https://example.test/ingest/vpn-protection/evaluate"] = {
-        200,
-        "{\"matched\":true,\"action\":\"Ban\",\"reason\":\"VPN Protection\"}"};
-
-    portal_cod4x::PluginRuntime runtime(configPath.string());
-    runtime.Initialize(host, "0.2.0");
-    runtime.HandlePlayerConnect(host, 2, "198.51.100.10");
-    runtime.HandlePlayerConnected(host, 2);
-    runtime.Tick(host);
-    host.PlayerIds[2] = 76561198000000002ULL;
-    host.PlayerNames[2] = "OtherPlayer";
-    runtime.Tick(host);
-
-    Assert(host.ExecutedCommands.empty(), "VPN decision for a reused slot must be ignored");
-    RemoveTestConfig(configPath);
-}
-
-void Runtime_VpnProtectionLateIpAndDuplicateCallbacks_QueueSeparateChecks()
-{
-    const auto configPath = WriteVpnProtectionConfig("request-count");
-    FakeHost host;
-    ConfigureVpnProtectionPlayer(host);
-    host.Responses["POST https://example.test/ingest/vpn-protection/evaluate"] = {
-        200,
-        "{\"matched\":false}"};
-    host.Responses["POST https://example.test/ingest/events/player-ip-resolved"] = {202, ""};
-
-    portal_cod4x::PluginRuntime runtime(configPath.string());
-    runtime.Initialize(host, "0.2.0");
-    runtime.HandlePlayerConnect(host, 2, "0.0.0.0:28960");
-    runtime.HandlePlayerConnected(host, 2);
-    runtime.Tick(host);
-    runtime.Tick(host);
-    const auto requestsWithoutIp = std::count_if(host.Requests.begin(), host.Requests.end(), [](const FakeHost::RequestRecord& item) {
-        return item.Url == "https://example.test/ingest/vpn-protection/evaluate";
-    });
-    Assert(requestsWithoutIp == 1, "Missing IP must trigger one GUID-only Siege evaluation");
-
-    runtime.HandlePlayerConnect(host, 2, "198.51.100.10");
-    runtime.HandlePlayerConnected(host, 2);
-    runtime.HandlePlayerConnected(host, 2);
-    runtime.Tick(host);
-    runtime.Tick(host);
-    const auto requestsAfterLateIp = std::count_if(host.Requests.begin(), host.Requests.end(), [](const FakeHost::RequestRecord& item) {
-        return item.Url == "https://example.test/ingest/vpn-protection/evaluate";
-    });
-    Assert(requestsAfterLateIp == 2, "Expected a separate VPN evaluation when the IP callback arrives late");
-    runtime.HandlePlayerConnect(host, 2, "198.51.100.10");
-    for (int i = 0; i < 8; ++i) runtime.Tick(host);
-    const auto resolved = std::find_if(host.Requests.begin(), host.Requests.end(), [](const auto& item) {
-        return item.Url == "https://example.test/ingest/events/player-ip-resolved";
-    });
-    const auto connect = std::find_if(host.Requests.begin(), host.Requests.end(), [](const auto& item) {
-        return item.Url == "https://example.test/ingest/events/player-connected";
-    });
-    Assert(resolved != host.Requests.end() && connect != host.Requests.end() &&
-        resolved->Body.find("\"ipAddress\":\"198.51.100.10\"") != std::string::npos &&
-        resolved->Body.find("\"slotId\":2") != std::string::npos &&
-        resolved->Body.find("\"protectionEvaluatedByPlugin\":true") != std::string::npos &&
-        connect->Body.find("\"protectionEvaluatedByPlugin\":true") != std::string::npos,
-        "A late IP must emit a correlated IP-resolved event");
-    const std::string idPrefix = "\"connectionId\":\"";
-    const auto idStart = connect->Body.find(idPrefix);
-    Assert(idStart != std::string::npos &&
-        resolved->Body.find(connect->Body.substr(idStart, idPrefix.size() + 36)) != std::string::npos,
-        "Late IP event must use the original connection ID");
-    Assert(std::count_if(host.Requests.begin(), host.Requests.end(), [](const auto& item) {
-        return item.Url == "https://example.test/ingest/events/player-ip-resolved";
-    }) == 1, "Duplicate IP callbacks must not emit duplicate IP-resolved events");
-
-    RemoveTestConfig(configPath);
-}
-
 void Runtime_IpObservationsHaveStableRetryIdsAndDistinctChangeIds()
 {
-    const auto configPath = WriteVpnProtectionConfig("ip-observation-ids");
+    const auto configPath = WriteRuntimeConfig("ip-observation-ids");
     FakeHost host;
-    ConfigureVpnProtectionPlayer(host);
+    ConfigureTestPlayer(host);
     const std::string ipUrl = "https://example.test/ingest/events/player-ip-resolved";
     host.Responses["POST " + ipUrl] = {503, ""};
-    host.Responses["POST https://example.test/ingest/vpn-protection/evaluate"] = {200, "{\"matched\":false}"};
+    host.Responses["POST https://example.test/ingest/rules/evaluate"] = {200, "{\"matched\":false}"};
     portal_cod4x::PluginRuntime runtime(configPath.string());
     runtime.Initialize(host, "0.2.0");
     runtime.HandlePlayerConnect(host, 2, "");
@@ -2771,51 +2573,18 @@ void Runtime_IpObservationsHaveStableRetryIdsAndDistinctChangeIds()
     Assert(bodies[2].find("\"ipAddress\":\"198.51.100.11\"") != std::string::npos,
         "Changed IP event must contain the new address");
     Assert(std::count_if(host.Requests.begin(), host.Requests.end(), [](const auto& request) {
-        return request.Url == "https://example.test/ingest/vpn-protection/evaluate";
+        return request.Url == "https://example.test/ingest/rules/evaluate";
     }) == 3, "Each distinct IP must be evaluated without duplicating identical callbacks");
     RemoveTestConfig(configPath);
 }
 
-void Runtime_VpnProtectionSamePlayerReconnect_CancelsStaleRequest()
+void Runtime_ConnectionIdCorrelatesEventsAndRulesAndFailsOpenAcrossLevelChange()
 {
-    const auto configPath = WriteVpnProtectionConfig("same-player-reconnect");
+    const auto configPath = WriteRuntimeConfig("connection-correlation");
     FakeHost host;
-    ConfigureVpnProtectionPlayer(host);
-    host.Responses["POST https://example.test/ingest/vpn-protection/evaluate"] = {
-        200,
-        "{\"matched\":true,\"action\":\"Kick\",\"reason\":\"VPN Protection\"}"};
-
-    portal_cod4x::PluginRuntime runtime(configPath.string());
-    runtime.Initialize(host, "0.2.0");
-    runtime.HandlePlayerConnect(host, 2, "198.51.100.10");
-    runtime.HandlePlayerConnected(host, 2);
-    runtime.Tick(host);
-
-    runtime.HandlePlayerDisconnected(host, 2);
-    runtime.HandlePlayerConnect(host, 2, "198.51.100.10");
-    runtime.HandlePlayerConnected(host, 2);
-    runtime.Tick(host);
-    runtime.Tick(host);
-    runtime.Tick(host);
-
-    const auto requestCount = std::count_if(host.Requests.begin(), host.Requests.end(), [](const FakeHost::RequestRecord& item) {
-        return item.Url == "https://example.test/ingest/vpn-protection/evaluate";
-    });
-    Assert(requestCount == 2, "Expected a fresh VPN evaluation after reconnect");
-    Assert(std::count(host.ExecutedCommands.begin(), host.ExecutedCommands.end(),
-        "onlykick 2 \"VPN Protection\"") == 1,
-        "Expected only the reconnect evaluation to execute a command");
-
-    RemoveTestConfig(configPath);
-}
-
-void Runtime_ConnectionIdCorrelatesEventsAndVpnAndFailsOpenAcrossLevelChange()
-{
-    const auto configPath = WriteVpnProtectionConfig("connection-correlation");
-    FakeHost host;
-    ConfigureVpnProtectionPlayer(host);
+    ConfigureTestPlayer(host);
     host.Responses["POST https://example.test/ingest/events/player-disconnected"] = {202, ""};
-    host.Responses["POST https://example.test/ingest/vpn-protection/evaluate"] = {200, "{\"matched\":false}"};
+    host.Responses["POST https://example.test/ingest/rules/evaluate"] = {200, "{\"matched\":false}"};
     portal_cod4x::PluginRuntime runtime(configPath.string());
     runtime.Initialize(host, "0.2.0");
     runtime.HandlePlayerConnect(host, 2, "198.51.100.10");
@@ -2833,9 +2602,9 @@ void Runtime_ConnectionIdCorrelatesEventsAndVpnAndFailsOpenAcrossLevelChange()
         return request.Url == "https://example.test/ingest/events/player-connected";
     });
     const auto evaluation = std::find_if(host.Requests.begin(), host.Requests.end(), [](const auto& request) {
-        return request.Url == "https://example.test/ingest/vpn-protection/evaluate";
+        return request.Url == "https://example.test/ingest/rules/evaluate";
     });
-    Assert(connect != host.Requests.end() && evaluation != host.Requests.end(), "Expected connect and VPN requests");
+    Assert(connect != host.Requests.end() && evaluation != host.Requests.end(), "Expected connect and rules requests");
     const auto connectionId = getConnectionId(connect->Body);
     Assert(connectionId.size() == 36 && getConnectionId(evaluation->Body) == connectionId,
         "Connect and evaluation must share a UUID");
@@ -2851,7 +2620,7 @@ void Runtime_ConnectionIdCorrelatesEventsAndVpnAndFailsOpenAcrossLevelChange()
         disconnect->Body.find("\"connectionId\":null") != std::string::npos,
         "Unproven map continuity must not assert the previous connection ID");
     Assert(std::find(host.Logs.begin(), host.Logs.end(),
-        "Player connection continuity is unknown after level change; Siege checks must fail open") != host.Logs.end(),
+        "Player connection continuity is unknown after level change; targeted rules effects are unavailable") != host.Logs.end(),
         "Unproven map continuity must be logged");
 
     runtime.HandlePlayerConnect(host, 2, "198.51.100.10");
@@ -2867,10 +2636,10 @@ void Runtime_ConnectionIdCorrelatesEventsAndVpnAndFailsOpenAcrossLevelChange()
 
 void Runtime_ConnectCallbackAfterLevelExitStartsNewConnection()
 {
-    const auto configPath = WriteVpnProtectionConfig("connection-after-exit");
+    const auto configPath = WriteRuntimeConfig("connection-after-exit");
     FakeHost host;
-    ConfigureVpnProtectionPlayer(host);
-    host.Responses["POST https://example.test/ingest/vpn-protection/evaluate"] = {200, "{\"matched\":false}"};
+    ConfigureTestPlayer(host);
+    host.Responses["POST https://example.test/ingest/rules/evaluate"] = {200, "{\"matched\":false}"};
     portal_cod4x::PluginRuntime runtime(configPath.string());
     runtime.Initialize(host, "0.2.0");
     runtime.HandlePlayerConnect(host, 2, "198.51.100.10");
@@ -2904,11 +2673,11 @@ void Runtime_ReconnectAfterLevelExitRetiresPriorState()
 {
     for (int scenario = 0; scenario < 2; ++scenario)
     {
-        const auto configPath = WriteVpnProtectionConfig("reconnect-level-" + std::to_string(scenario));
+        const auto configPath = WriteRuntimeConfig("reconnect-level-" + std::to_string(scenario));
         FakeHost host;
-        ConfigureVpnProtectionPlayer(host);
+        ConfigureTestPlayer(host);
         host.Responses["POST https://example.test/ingest/events/server-status"] = {202, ""};
-        host.Responses["POST https://example.test/ingest/vpn-protection/evaluate"] = {200, "{\"matched\":false}"};
+        host.Responses["POST https://example.test/ingest/rules/evaluate"] = {200, "{\"matched\":false}"};
         portal_cod4x::PluginRuntime runtime(configPath.string());
         runtime.Initialize(host, "0.2.0");
         runtime.HandlePlayerConnect(host, 2, "198.51.100.10");
@@ -2944,9 +2713,9 @@ void Runtime_ReconnectAfterLevelExitRetiresPriorState()
 
 void Runtime_DisconnectAfterLevelExitDoesNotReuseAnotherPlayersIdentity()
 {
-    const auto configPath = WriteVpnProtectionConfig("disconnect-replaced-level");
+    const auto configPath = WriteRuntimeConfig("disconnect-replaced-level");
     FakeHost host;
-    ConfigureVpnProtectionPlayer(host);
+    ConfigureTestPlayer(host);
     host.Responses["POST https://example.test/ingest/events/player-disconnected"] = {202, ""};
     portal_cod4x::PluginRuntime runtime(configPath.string());
     runtime.Initialize(host, "0.2.0");
@@ -2970,9 +2739,9 @@ void Runtime_DisconnectAfterLevelExitDoesNotReuseAnotherPlayersIdentity()
 
 void Runtime_UnobservedConnectionIsNotAssignedAnAdmissionId()
 {
-    const auto configPath = WriteVpnProtectionConfig("connection-unobserved");
+    const auto configPath = WriteRuntimeConfig("connection-unobserved");
     FakeHost host;
-    ConfigureVpnProtectionPlayer(host);
+    ConfigureTestPlayer(host);
     portal_cod4x::PluginRuntime runtime(configPath.string());
     runtime.Initialize(host, "0.2.0");
     runtime.HandlePlayerConnected(host, 2);
@@ -2983,365 +2752,912 @@ void Runtime_UnobservedConnectionIsNotAssignedAnAdmissionId()
     Assert(connect != host.Requests.end() && connect->Body.find("\"connectionId\":null") != std::string::npos,
         "A player already present when the plugin starts must not receive an admission ID");
     Assert(std::find(host.Logs.begin(), host.Logs.end(),
-        "Player connection was not observed; Siege checks must fail open") != host.Logs.end(),
+        "Player connection was not observed; targeted rules effects are unavailable") != host.Logs.end(),
         "Unobserved connections must be logged");
     RemoveTestConfig(configPath);
 }
 
-std::string SiegeResponse(std::string_view expiry, bool vpnUnavailable = false)
-{
-    return std::string("{\"matched\":false,\"vpnUnavailable\":") + (vpnUnavailable ? "true" : "false") +
-        ",\"siege\":{\"sessionId\":\"11111111-2222-3333-4444-555555555555\","
-        "\"actionId\":\"aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee\","
-        "\"connectionId\":\"$connectionId\",\"mode\":\"Enforce\",\"expiresAtUtc\":\"" + std::string(expiry) +
-        "\",\"reason\":\"Siege admission\"}}";
 }
 
-void Runtime_SiegeGuidOnlyDecisionDispatchesOnceAndRetriesOutcome()
+namespace
 {
-    const auto configPath = WriteVpnProtectionConfig("siege-guid");
+using portal_cod4x::RulesJson;
+using portal_cod4x::RulesJsonReader;
+
+std::string RulesReply(std::string commands = {}, std::string executionIds = {}, bool retryTrigger = false)
+{
+    return "{\"protocolVersion\":1,\"commands\":[" + commands + "],\"executionIds\":[" + executionIds +
+        "],\"retryTrigger\":" + (retryTrigger ? "true" : "false") + "}";
+}
+
+RulesJson CommandForTrigger(const RulesJson& trigger, std::string_view type = "DropPlayer",
+    std::string_view executionId = "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee")
+{
+    const auto quote = RulesJson::Quote;
+    const auto correlation = "{\"triggerId\":" + quote(*trigger.String("triggerId")) +
+        ",\"triggerOccurrenceId\":" + quote(*trigger.String("triggerOccurrenceId")) +
+        ",\"connectionId\":" + trigger.Find("connectionId")->Dump() +
+        ",\"featureId\":\"vpn-protection\",\"ruleId\":\"high-risk\"" +
+        ",\"ruleSetRevision\":\"1\",\"actionId\":\"drop-player\"}";
+    return *RulesJsonReader::Parse("{\"protocolVersion\":1,\"executionId\":" + quote(executionId) +
+        ",\"actionId\":\"drop-player\",\"logicalEffectId\":" + quote(executionId) +
+        ",\"correlation\":" + correlation +
+        ",\"gameServerId\":" + trigger.Find("gameServerId")->Dump() +
+        ",\"slotId\":" + trigger.Find("slotId")->Dump() +
+        ",\"playerGuid\":" + trigger.Find("playerGuid")->Dump() +
+        ",\"connectionId\":" + trigger.Find("connectionId")->Dump() +
+        ",\"connectionGeneration\":" + trigger.Find("connectionGeneration")->Dump() +
+        ",\"runtime\":" + trigger.Find("runtime")->Dump() +
+        ",\"expiresAtUtc\":\"1970-01-01T01:30:00Z\",\"mode\":\"Enforce\",\"effect\":{\"type\":" +
+        quote(type) + ",\"reason\":\"Rules kick\",\"message\":\"Rules message\"}}");
+}
+
+void TickFrames(portal_cod4x::PluginRuntime& runtime, FakeHost& host, int frames = 8)
+{
+    for (int i = 0; i < frames; ++i) runtime.Tick(host);
+}
+
+void Runtime_RulesTriggerCapabilitiesAndNativeEffects()
+{
+    const auto config = WriteRuntimeConfig("rules-native");
     FakeHost host;
-    ConfigureVpnProtectionPlayer(host);
-    host.InjectEvaluationConnectionId = true;
-    host.Responses["POST https://example.test/ingest/vpn-protection/evaluate"] = {
-        200, SiegeResponse("1970-01-01T01:30:00.1234567+00:00", true)};
-    host.Responses["POST https://example.test/ingest/siege-mode/outcome"] = {503, ""};
-    portal_cod4x::PluginRuntime runtime(configPath.string());
-    runtime.Initialize(host, "0.2.0");
-    runtime.HandlePlayerConnect(host, 2, "");
-    runtime.HandlePlayerConnected(host, 2);
-    runtime.Tick(host);
-    runtime.Tick(host);
-    runtime.Tick(host);
-    Assert(host.ExecutedCommands.empty() && host.DroppedPlayers.size() == 1 &&
-        host.DroppedPlayers[0].Slot == 2 &&
-        host.DroppedPlayers[0].Reason == "Player kicked:\nReason for this kick:\nSiege admission",
-        "Confirmed Siege match must dispatch a reasoned drop despite unavailable VPN");
-    const auto evaluation = std::find_if(host.Requests.begin(), host.Requests.end(), [](const auto& request) {
-        return request.Url == "https://example.test/ingest/vpn-protection/evaluate";
-    });
-    Assert(evaluation != host.Requests.end() && evaluation->Body.find("\"ipAddress\":\"\"") != std::string::npos &&
-        evaluation->Body.find("\"siegeEvaluation\":true") != std::string::npos,
-        "GUID-only checks must carry unknown IP and opt in to Siege evaluation");
-    const auto firstOutcome = std::find_if(host.Requests.begin(), host.Requests.end(), [](const auto& request) {
-        return request.Url == "https://example.test/ingest/siege-mode/outcome";
-    });
-    Assert(firstOutcome != host.Requests.end() && firstOutcome->Body.find("\"outcome\":\"Dispatched\"") != std::string::npos,
-        "A direct drop must not be reported as applied");
-    const std::string firstBody = firstOutcome->Body;
-
-    host.Responses["POST https://example.test/ingest/siege-mode/outcome"] = {204, ""};
-    host.CurrentTime += 5;
+    ConfigureTestPlayer(host);
+    host.ResponseFactory = [](const auto& request) -> portal_cod4x::HttpResponse {
+        if (request.Url.ends_with("/evaluate"))
+        {
+            const auto trigger = *RulesJsonReader::Parse(request.Body);
+            return {200, RulesReply(
+                CommandForTrigger(trigger, "PublicMessage").Dump() + "," +
+                CommandForTrigger(trigger, "PrivateMessage", "aaaaaaaa-bbbb-cccc-dddd-000000000001").Dump() + "," +
+                CommandForTrigger(trigger, "DropPlayer", "aaaaaaaa-bbbb-cccc-dddd-000000000002").Dump())};
+        }
+        return {200, RulesReply()};
+    };
+    portal_cod4x::PluginRuntime runtime(config.string());
+    runtime.Initialize(host, "0.3.123");
     runtime.HandlePlayerConnect(host, 2, "198.51.100.10");
-    for (int i = 0; i < 4; ++i) runtime.Tick(host);
-    std::vector<std::string> outcomeBodies;
-    for (const auto& request : host.Requests)
-    {
-        if (request.Url == "https://example.test/ingest/siege-mode/outcome") outcomeBodies.push_back(request.Body);
-    }
-    Assert(outcomeBodies.size() == 2 && outcomeBodies[1] == firstBody, "Unacknowledged outcome must retry identically");
-    Assert(host.DroppedPlayers.size() == 1, "Repeated action ID must not dispatch a second drop");
-    RemoveTestConfig(configPath);
+    runtime.HandlePlayerConnected(host, 2);
+    TickFrames(runtime, host, 12);
+    Assert(host.DroppedPlayers.size() == 1 && host.DroppedPlayers[0].Slot == 2 &&
+        host.DroppedPlayers[0].Reason == "Rules kick", "Typed drop must use direct native API");
+    Assert(host.BroadcastMessages.back() == "Rules message" &&
+        host.PrivateMessages.size() == 1 && host.PrivateMessages[0].Slot == 2,
+        "Public and private messages must use typed native chat APIs");
+    Assert(host.ExecutedCommands.empty(), "Rules effects must never enqueue server command text");
+    const auto evaluate = std::find_if(host.Requests.begin(), host.Requests.end(), [](const auto& request) {
+        return request.Url.ends_with("/rules/evaluate");
+    });
+    const auto trigger = *RulesJsonReader::Parse(evaluate->Body);
+    Assert(trigger.Integer("protocolVersion") == 1 && trigger.String("triggerId") == "player.connected" &&
+        trigger.String("gameType") == "CallOfDuty4x" &&
+        trigger.String("observationId") == trigger.String("triggerOccurrenceId") &&
+        trigger.Find("runtime")->String("version") == "0.3.123" &&
+        trigger.Find("runtime")->String("identityModel") == "PluginRuntimeGeneration" &&
+        trigger.Find("runtime")->Find("capabilities")->Items.size() == 3,
+        "Trigger must report actual version, stable correlation and only real native capabilities");
+    const auto connect = std::find_if(host.Requests.begin(), host.Requests.end(), [](const auto& request) {
+        return request.Url.ends_with("/events/player-connected");
+    });
+    Assert(connect != host.Requests.end() &&
+        connect->Body.find(*trigger.String("observationId")) != std::string::npos &&
+        connect->Body.find("\"rulesEvaluatedByPlugin\":true") != std::string::npos,
+        "Mirrored connect event and trigger must share observation identity and ownership metadata");
+    Assert(std::count_if(host.Requests.begin(), host.Requests.end(), [&](const auto& request) {
+        return request.Url.ends_with("/rules/outcomes") &&
+            request.Body.find("\"outcome\":\"Dispatched\"") != std::string::npos &&
+            request.Body.find("\"gameServerId\":" + trigger.Find("gameServerId")->Dump()) != std::string::npos &&
+            request.Body.find("\"correlation\":") != std::string::npos;
+    }) == 3, "Each native action must report a correlated unconfirmed dispatch outcome");
+    RemoveTestConfig(config);
 }
 
-void Runtime_SiegeStaleAndFailedDecisionsAreReported()
+void Runtime_RulesRejectUnsafeOrStaleCommandsIndependently()
 {
-    for (int scenario = 0; scenario < 6; ++scenario)
+    for (int scenario = 0; scenario < 26; ++scenario)
     {
-        const auto configPath = WriteVpnProtectionConfig("siege-outcome-" + std::to_string(scenario));
+        const auto config = WriteRuntimeConfig("rules-invalid-" + std::to_string(scenario));
         FakeHost host;
-        ConfigureVpnProtectionPlayer(host);
-        host.InjectEvaluationConnectionId = true;
-        std::string response = SiegeResponse(scenario == 2 ? "1970-01-01T01:00:00Z" : "1970-01-01T01:30:00Z");
-        if (scenario == 3) response.replace(response.find("Siege admission"), 15, "");
-        if (scenario == 4) response.replace(response.find("$connectionId"), 13, "00000000-0000-0000-0000-000000000001");
-        if (scenario == 5) response.replace(response.find("1970-01-01T01:30:00Z"), 20, "1970-02-31T01:30:00Z");
-        host.Responses["POST https://example.test/ingest/vpn-protection/evaluate"] = {
-            200, response};
-        host.Responses["POST https://example.test/ingest/siege-mode/outcome"] = {204, ""};
-        portal_cod4x::PluginRuntime runtime(configPath.string());
-        runtime.Initialize(host, "0.2.0");
+        ConfigureTestPlayer(host);
+        host.ResponseFactory = [scenario](const auto& request) -> portal_cod4x::HttpResponse {
+            if (!request.Url.ends_with("/evaluate")) return {200, RulesReply()};
+            const auto trigger = *RulesJsonReader::Parse(request.Body);
+            auto command = CommandForTrigger(trigger);
+            auto set = [&](std::string key, std::string value) {
+                command.Fields[std::move(key)] = *RulesJsonReader::Parse(value);
+            };
+            if (scenario == 0) set("mode", "\"DryRun\"");
+            if (scenario == 1) set("mode", "\"enforce\"");
+            if (scenario == 2) command.Fields.erase("mode");
+            if (scenario == 3) set("gameServerId", "\"00000000-2222-3333-4444-555555555555\"");
+            if (scenario == 4) set("slotId", "3");
+            if (scenario == 5) set("playerGuid", "\"76561198000000002\"");
+            if (scenario == 6) set("connectionGeneration", "2");
+            if (scenario == 7) set("connectionId", "\"00000000-2222-3333-4444-555555555555\"");
+            if (scenario == 8) set("expiresAtUtc", "\"1970-01-01T01:00:00Z\"");
+            if (scenario == 9) set("expiresAtUtc", "\"2026-02-31T12:00:00Z\"");
+            if (scenario == 10) set("protocolVersion", "2");
+            if (scenario == 11)
+                command.Fields["effect"].Fields["reason"] = *RulesJsonReader::Parse("\"bad\\u0000reason\"");
+            if (scenario == 12)
+                command.Fields["effect"].Fields["type"] = *RulesJsonReader::Parse("\"NativeTempBan\"");
+            if (scenario == 13) set("connectionGeneration", "18446744073709551616");
+            if (scenario == 14)
+                command.Fields["runtime"].Fields["id"] = *RulesJsonReader::Parse("\"rcon-agent\"");
+            if (scenario == 15)
+                command.Fields["runtime"].Fields["instanceId"] =
+                    *RulesJsonReader::Parse("\"00000000-2222-3333-4444-555555555555\"");
+            if (scenario == 16) set("runtime", "\"cod4x-plugin\"");
+            if (scenario == 17)
+                command.Fields["correlation"].Fields["featureId"] = *RulesJsonReader::Parse("1");
+            if (scenario == 18)
+                command.Fields["correlation"].Fields["ruleId"] = *RulesJsonReader::Parse("\"\"");
+            if (scenario == 19)
+                command.Fields["correlation"].Fields["triggerOccurrenceId"] = *RulesJsonReader::Parse("\"invalid\"");
+            if (scenario == 20)
+                command.Fields["correlation"].Fields["siegeSessionId"] = *RulesJsonReader::Parse("\"invalid\"");
+            if (scenario == 21)
+                command.Fields["runtime"].Fields["identityModel"] =
+                    *RulesJsonReader::Parse("\"AgentObservedConnection\"");
+            if (scenario == 22)
+                command.Fields["correlation"].Fields["triggerId"] = *RulesJsonReader::Parse("\"player.ip-resolved\"");
+            if (scenario == 23)
+                command.Fields["correlation"].Fields["triggerOccurrenceId"] =
+                    *RulesJsonReader::Parse("\"00000000-2222-3333-4444-555555555555\"");
+            if (scenario == 24) set("connectionGeneration", "null");
+            if (scenario == 25) command.Fields.erase("runtime");
+            // An unsupported or invalid action must not prevent an independent supported action.
+            return {200, RulesReply(command.Dump() + "," +
+                CommandForTrigger(trigger, "PrivateMessage", "aaaaaaaa-bbbb-cccc-dddd-000000000001").Dump())};
+        };
+        portal_cod4x::PluginRuntime runtime(config.string());
+        runtime.Initialize(host, "0.3.0");
+        host.CurrentSubsecondTicks = 42;
         runtime.HandlePlayerConnect(host, 2, "198.51.100.10");
         runtime.HandlePlayerConnected(host, 2);
-        runtime.Tick(host);
-        if (scenario == 0) runtime.HandlePlayerDisconnected(host, 2);
-        if (scenario == 1) host.PlayerIds[2] = 76561198000000002ULL;
-        runtime.Tick(host);
-        runtime.Tick(host);
-        const auto report = std::find_if(host.Requests.begin(), host.Requests.end(), [](const auto& request) {
-            return request.Url == "https://example.test/ingest/siege-mode/outcome";
-        });
-        const std::string expected = scenario == 3 || scenario == 5 ? "\"outcome\":\"Failed\"" : "\"outcome\":\"Stale\"";
-        Assert(report != host.Requests.end() && report->Body.find(expected) != std::string::npos,
-            "Disconnected, replaced, expired, and failed actions must report their actual disposition");
-        Assert(host.ExecutedCommands.empty() && host.DroppedPlayers.empty(),
-            "Stale or invalid actions must not dispatch a drop");
-        RemoveTestConfig(configPath);
+        TickFrames(runtime, host, 10);
+        Assert(host.DroppedPlayers.empty() && host.ExecutedCommands.empty(),
+            "Dry run, invalid, expired, unsupported and stale commands must never drop players");
+        Assert(host.PrivateMessages.size() == 1, "Invalid command must not suppress independent supported work");
+        if (scenario == 0 || scenario == 12)
+        {
+            const auto expected = scenario == 0 ? "\"outcome\":\"WouldExecute\"" :
+                "\"outcome\":\"SkippedUnsupported\"";
+            Assert(std::any_of(host.Requests.begin(), host.Requests.end(), [&](const auto& request) {
+                return request.Url.ends_with("/outcomes") && request.Body.find(expected) != std::string::npos &&
+                    request.Body.find("\"occurredAtUtc\":\"1970-01-01T01:23:20.0000042Z\"") != std::string::npos;
+            }), "Dry run and unsupported effects must report explicit outcomes");
+        }
+        RemoveTestConfig(config);
     }
 }
 
-void Runtime_SiegeDryRunAndUnrecognizedModeNeverDispatch()
-{
-    for (int scenario = 0; scenario < 4; ++scenario)
-    {
-        const auto configPath = WriteVpnProtectionConfig("siege-mode-" + std::to_string(scenario));
-        FakeHost host;
-        ConfigureVpnProtectionPlayer(host);
-        host.InjectEvaluationConnectionId = true;
-        std::string response = SiegeResponse("1970-01-01T01:30:00Z");
-        if (scenario == 0) response = "{\"matched\":true,\"action\":\"Kick\",\"reason\":\"VPN\",\"siege\":null}";
-        if (scenario == 1) response.replace(response.find("\"mode\":\"Enforce\","), 17, "");
-        if (scenario == 2) response.replace(response.find("Enforce"), 7, "DryRun");
-        if (scenario == 3)
-        {
-            response.replace(response.find("Enforce"), 7, "DryRun");
-            response.replace(response.find("\"matched\":false"), 15, "\"matched\":true,\"action\":\"Kick\",\"reason\":\"VPN\"");
-        }
-        host.Responses["POST https://example.test/ingest/vpn-protection/evaluate"] = {200, response};
-        portal_cod4x::PluginRuntime runtime(configPath.string());
-        runtime.Initialize(host, "0.2.0");
-        runtime.HandlePlayerConnect(host, 2, "198.51.100.10");
-        runtime.HandlePlayerConnected(host, 2);
-        for (int i = 0; i < 4; ++i) runtime.Tick(host);
-        Assert(host.DroppedPlayers.empty(), "Dry-run or unrecognized mode must never dispatch a Siege drop");
-        Assert(std::none_of(host.Requests.begin(), host.Requests.end(), [](const auto& request) {
-            return request.Url == "https://example.test/ingest/siege-mode/outcome";
-        }), "Dry-run or unrecognized mode must not report a Siege dispatch");
-        if (scenario == 0 || scenario == 3)
-        {
-            Assert(std::find(host.ExecutedCommands.begin(), host.ExecutedCommands.end(), "onlykick 2 \"VPN\"") !=
-                host.ExecutedCommands.end(), "Independent VPN enforcement must continue in dry-run");
-        }
-        else
-        {
-            Assert(host.ExecutedCommands.empty(), "Non-enforce Siege mode must not execute a command");
-        }
-        RemoveTestConfig(configPath);
-    }
-}
-
-void Runtime_SiegeRejectsNestedAndMalformedDecisionFields()
+void Runtime_RulesRechecksConnectionAndSupportsReentrantDisconnect()
 {
     for (int scenario = 0; scenario < 5; ++scenario)
     {
-        const auto configPath = WriteVpnProtectionConfig("siege-invalid-fields-" + std::to_string(scenario));
+        const auto config = WriteRuntimeConfig("rules-reentrant-" + std::to_string(scenario));
         FakeHost host;
-        ConfigureVpnProtectionPlayer(host);
-        host.InjectEvaluationConnectionId = true;
-        std::string response = SiegeResponse("1970-01-01T01:30:00Z");
-        const auto mode = response.find("\"mode\":\"Enforce\"");
-        if (scenario == 0) response.replace(mode, 16, "\"metadata\":{\"mode\":\"Enforce\"}");
-        if (scenario == 1) response.replace(mode, 16, "\"mode\":\"Enforce\",\"mode\":\"DryRun\"");
-        if (scenario == 2) response.replace(mode, 16, "\"mode\":null,\"metadata\":{\"mode\":\"Enforce\"}");
-        if (scenario == 3) response.replace(mode, 16, "\"mode\":\"Enforce\" \"extra\":\"value\"");
-        if (scenario == 4) response.replace(mode, 16, "\"metadata\":\"\\\"mode\\\":\\\"Enforce\\\"\"");
-        host.Responses["POST https://example.test/ingest/vpn-protection/evaluate"] = {200, response};
-        portal_cod4x::PluginRuntime runtime(configPath.string());
-        runtime.Initialize(host, "0.2.0");
+        ConfigureTestPlayer(host);
+        host.ResponseFactory = [](const auto& request) -> portal_cod4x::HttpResponse {
+            if (!request.Url.ends_with("/evaluate")) return {200, RulesReply()};
+            const auto trigger = *RulesJsonReader::Parse(request.Body);
+            return {200, RulesReply(CommandForTrigger(trigger).Dump() + "," +
+                CommandForTrigger(trigger, "PrivateMessage", "aaaaaaaa-bbbb-cccc-dddd-000000000001").Dump())};
+        };
+        portal_cod4x::PluginRuntime runtime(config.string());
+        runtime.Initialize(host, "0.3.0");
         runtime.HandlePlayerConnect(host, 2, "198.51.100.10");
         runtime.HandlePlayerConnected(host, 2);
-        for (int i = 0; i < 4; ++i) runtime.Tick(host);
-        Assert(host.DroppedPlayers.empty() && host.ExecutedCommands.empty(),
-            "Nested, duplicate, or malformed decision fields must never dispatch a Siege drop");
-        Assert(std::none_of(host.Requests.begin(), host.Requests.end(), [](const auto& request) {
-            return request.Url == "https://example.test/ingest/siege-mode/outcome";
-        }), "Invalid Siege decisions must not report a dispatched action");
-        RemoveTestConfig(configPath);
+        runtime.Tick(host);
+        if (scenario == 0) host.PlayerIds[2] = 76561198000000002ULL;
+        if (scenario == 1)
+        {
+            runtime.HandlePlayerDisconnected(host, 2);
+            runtime.HandlePlayerConnect(host, 2, "198.51.100.10");
+            runtime.HandlePlayerConnected(host, 2);
+        }
+        if (scenario == 2) runtime.HandleServerExited(host);
+        if (scenario == 3) runtime.HandlePlayerConnect(host, 2, "198.51.100.11");
+        if (scenario == 4) host.OnDrop = [&](int slot) { runtime.HandlePlayerDisconnected(host, slot); };
+        runtime.Tick(host);
+        Assert(host.DroppedPlayers.size() == (scenario == 4 ? 1U : 0U),
+            "In-flight responses must recheck GUID, generation, map continuity and IP revision");
+        Assert(host.PrivateMessages.empty(), "Synchronous disconnect must invalidate subsequent native targets safely");
+        RemoveTestConfig(config);
     }
 }
 
-void Runtime_SiegeDropCanSynchronouslyInvokeDisconnect()
+void Runtime_RulesOutcomesRetryAndCloudContinuationPolls()
 {
-    const auto configPath = WriteVpnProtectionConfig("siege-reentrant-disconnect");
+    const auto config = WriteRuntimeConfig("rules-continuation");
     FakeHost host;
-    ConfigureVpnProtectionPlayer(host);
-    host.InjectEvaluationConnectionId = true;
-    host.Responses["POST https://example.test/ingest/vpn-protection/evaluate"] = {
-        200, SiegeResponse("1970-01-01T01:30:00Z")};
-    host.Responses["POST https://example.test/ingest/siege-mode/outcome"] = {204, ""};
-    portal_cod4x::PluginRuntime runtime(configPath.string());
-    runtime.Initialize(host, "0.2.0");
-    host.OnDrop = [&](int slot) { runtime.HandlePlayerDisconnected(host, slot); };
+    ConfigureTestPlayer(host);
+    RulesJson trigger;
+    int outcomes = 0;
+    int polls = 0;
+    host.ResponseFactory = [&](const auto& request) -> portal_cod4x::HttpResponse {
+        if (request.Url.ends_with("/evaluate"))
+        {
+            trigger = *RulesJsonReader::Parse(request.Body);
+            return {200, RulesReply(CommandForTrigger(trigger, "PrivateMessage").Dump(),
+                "\"bbbbbbbb-bbbb-cccc-dddd-eeeeeeeeeeee\"")};
+        }
+        if (request.Url.ends_with("/outcomes"))
+        {
+            ++outcomes;
+            if (outcomes == 1) return {503, ""};
+            return {200, RulesReply({}, "\"bbbbbbbb-bbbb-cccc-dddd-eeeeeeeeeeee\"")};
+        }
+        ++polls;
+        Assert(request.Body.find("\"connectionGeneration\":1") != std::string::npos &&
+            request.Body.find("\"executionIds\":[\"bbbbbbbb-bbbb-cccc-dddd-eeeeeeeeeeee\"]") != std::string::npos,
+            "Continuation poll must retain execution identity and complete target snapshot");
+        return {200, RulesReply(CommandForTrigger(trigger, "PrivateMessage").Dump() + "," +
+            CommandForTrigger(trigger, "PublicMessage", "aaaaaaaa-bbbb-cccc-dddd-000000000001").Dump())};
+    };
+    portal_cod4x::PluginRuntime runtime(config.string());
+    runtime.Initialize(host, "0.3.0");
     runtime.HandlePlayerConnect(host, 2, "198.51.100.10");
     runtime.HandlePlayerConnected(host, 2);
-    for (int i = 0; i < 4; ++i) runtime.Tick(host);
-    Assert(host.DroppedPlayers.size() == 1, "The synchronous drop must be invoked once");
-    Assert(std::any_of(host.Requests.begin(), host.Requests.end(), [](const auto& request) {
-        return request.Url == "https://example.test/ingest/siege-mode/outcome" &&
-            request.Body.find("\"outcome\":\"Dispatched\"") != std::string::npos;
-    }), "A reentrant disconnect must not discard the action outcome");
-    RemoveTestConfig(configPath);
+    TickFrames(runtime, host);
+    Assert(host.PrivateMessages.size() == 1 && outcomes == 1, "First native effect executes before outcome retry");
+    host.CurrentTime += 5;
+    TickFrames(runtime, host, 16);
+    Assert(outcomes >= 2 && polls >= 1, "Outcome failure must retry while cloud continuation is polled");
+    Assert(host.PrivateMessages.size() == 1 && host.BroadcastMessages.size() == 2,
+        "Repeated remote command must not repeat native effect; next typed action must execute");
+    RemoveTestConfig(config);
 }
 
-void Runtime_IpChangeInvalidatesInFlightDecisions()
+void RulesJson_RejectsAmbiguousExecutablePayloads()
+{
+    for (const std::string json : {
+        "{\"commands\":[],\"commands\":[]}", "{\"commands\":[{\"mode\":\"Enforce\",\"mode\":\"DryRun\"}]}",
+        "{\"n\":1.}", "{\"n\":01}", "{\"n\":1e}", "{\"a\":\"\\x00\"}", "{\"a\":\"\\ud800\"}",
+        "{\"a\":\"\\udc00\"}", "[1,]", "{\"x\":true} trailing"})
+        Assert(!RulesJsonReader::Parse(json), "Ambiguous or malformed JSON must be rejected before native dispatch");
+    const auto unicode = RulesJsonReader::Parse("{\"a\":\"\\ud83d\\ude00\",\"b\":18446744073709551615}");
+    Assert(unicode && unicode->String("a") == "\xf0\x9f\x98\x80" &&
+        unicode->Unsigned("b") == UINT64_MAX, "Valid Unicode and uint64 generation must round-trip without truncation");
+    const auto fraction = RulesJsonReader::Parse("{\"slotId\":1.0,\"connectionGeneration\":1e3}");
+    Assert(fraction && !fraction->Integer("slotId") && !fraction->Unsigned("connectionGeneration"),
+        "Numeric target fields must reject floating-point coercion even in syntactically valid JSON");
+    for (const std::string bytes : {"\x80", "\xff", "\xc0\xaf", "\xc2", "\xe0\x80\x80", "\xed\xa0\x80",
+        "\xf0\x80\x80\x80", "\xf4\x90\x80\x80", "\xf5\x80\x80\x80", "\xe2\x28\xa1"})
+        Assert(!RulesJsonReader::Parse("{\"text\":\"" + bytes + "\"}"),
+            "Malformed raw UTF-8 must not reach native APIs through JSON strings");
+    Assert(RulesJsonReader::Parse("{\"text\":\"\xc2\xa3\xe2\x82\xac\xf0\x9f\x98\x80\"}").has_value(),
+        "Valid two-, three- and four-byte raw UTF-8 must remain accepted");
+}
+
+void Runtime_RulesOutcomeResponseContinuesAndMalformedAckRetries()
+{
+    for (int malformed = 0; malformed < 4; ++malformed)
+    {
+        const auto config = WriteRuntimeConfig("rules-outcome-response");
+        FakeHost host;
+        ConfigureTestPlayer(host);
+        RulesJson trigger;
+        int acknowledgements = 0;
+        host.ResponseFactory = [&](const auto& request) -> portal_cod4x::HttpResponse {
+            if (request.Url.ends_with("/evaluate"))
+            {
+                trigger = *RulesJsonReader::Parse(request.Body);
+                return {200, RulesReply(CommandForTrigger(trigger, "PrivateMessage").Dump())};
+            }
+            ++acknowledgements;
+            if (acknowledgements == 1 && malformed == 3)
+                return {200, R"({"protocolVersion":1,"commands":[],"executionIds":[],"retryTrigger":"true"})"};
+            if (acknowledgements == 1)
+                return {200,
+                        malformed == 0 ? "{\"commands\":[]}" : RulesReply({}, malformed == 1 ? "null" : "\"invalid\"")};
+            if (acknowledgements == 2)
+                return {
+                    200,
+                    RulesReply(
+                        CommandForTrigger(trigger, "PublicMessage", "aaaaaaaa-bbbb-cccc-dddd-000000000001").Dump())};
+            return {200, RulesReply()};
+        };
+        portal_cod4x::PluginRuntime runtime(config.string());
+        runtime.Initialize(host, "0.3.0");
+        runtime.HandlePlayerConnect(host, 2, "198.51.100.10");
+        runtime.HandlePlayerConnected(host, 2);
+        TickFrames(runtime, host);
+        Assert(host.PrivateMessages.size() == 1 && host.BroadcastMessages.size() == 1,
+               "Malformed successful HTTP response must not acknowledge outcome or invoke a next action");
+        host.CurrentTime += 5;
+        TickFrames(runtime, host);
+        Assert(acknowledgements >= 3 && host.PrivateMessages.size() == 1 && host.BroadcastMessages.size() == 2,
+               "Retried outcome must advance next native action without repeating the prior effect");
+        runtime.HandlePlayerConnect(host, 2, "198.51.100.11");
+        runtime.Tick(host);
+        Assert(host.OpenRequests > 0, "Test must leave real asynchronous requests in flight");
+        runtime.Shutdown(host);
+        Assert(host.OpenRequests == 0, "Unloading must release all in-flight HTTP handles before module removal");
+        RemoveTestConfig(config);
+    }
+}
+
+void Runtime_RulesCallbackOrderingPreservesConnectedObservation()
+{
+    for (int scenario = 0; scenario < 4; ++scenario)
+    {
+        const auto config = WriteRuntimeConfig("rules-callback-order-" + std::to_string(scenario));
+        FakeHost host;
+        ConfigureTestPlayer(host);
+        host.ResponseFactory = [](const auto& request) -> portal_cod4x::HttpResponse {
+            if (!request.Url.ends_with("/evaluate")) return {200, RulesReply()};
+            const auto trigger = *RulesJsonReader::Parse(request.Body);
+            return {200, RulesReply(trigger.String("triggerId") == "player.connected" ?
+                CommandForTrigger(trigger, "PrivateMessage").Dump() : "")};
+        };
+        portal_cod4x::PluginRuntime runtime(config.string());
+        runtime.Initialize(host, "0.3.0");
+        runtime.HandlePlayerConnect(host, 2, scenario == 1 ? "" : "198.51.100.10");
+        if (scenario == 0 || scenario == 3)
+        {
+            runtime.HandleClientAuthorized(host);
+            runtime.Tick(host);
+        }
+        if (scenario == 3) runtime.HandlePlayerConnect(host, 2, "198.51.100.11");
+        runtime.HandlePlayerConnected(host, 2);
+        if (scenario == 1 || scenario == 2) runtime.HandlePlayerConnect(host, 2, "198.51.100.11");
+        TickFrames(runtime, host, 16);
+        std::string connectedObservation;
+        std::string ipObservation;
+        for (const auto& request : host.Requests)
+        {
+            if (!request.Url.ends_with("/evaluate")) continue;
+            const auto trigger = *RulesJsonReader::Parse(request.Body);
+            if (trigger.String("triggerId") == "player.connected")
+            {
+                connectedObservation = *trigger.String("observationId");
+                if (scenario == 1 || scenario == 2)
+                    Assert(trigger.String("playerIpAddress") == "198.51.100.11",
+                        "A queued connected observation must be enriched rather than discarded on IP change");
+            }
+            else ipObservation = *trigger.String("observationId");
+        }
+        const auto connect = std::find_if(host.Requests.begin(), host.Requests.end(), [](const auto& request) {
+            return request.Url.ends_with("/events/player-connected");
+        });
+        Assert(!connectedObservation.empty() && connect != host.Requests.end() &&
+            connect->Body.find(connectedObservation) != std::string::npos,
+            "Authorization and enter-world paths must share one stable connected observation");
+        Assert(scenario == 0 || (!ipObservation.empty() && ipObservation != connectedObservation),
+            "IP resolution and connected subscriptions require distinct observation identities");
+        Assert(host.PrivateMessages.size() == (scenario == 3 ? 0U : 1U),
+            "Queued connected work must run, but an in-flight pre-IP-change command must stay stale");
+        RemoveTestConfig(config);
+    }
+}
+
+void Runtime_RulesRejectPreviousObservationAfterIpChange()
+{
+    const auto config = WriteRuntimeConfig("rules-old-observation");
+    FakeHost host;
+    ConfigureTestPlayer(host);
+    RulesJson oldCommand;
+    int evaluations = 0;
+    host.ResponseFactory = [&](const auto& request) -> portal_cod4x::HttpResponse {
+        if (!request.Url.ends_with("/evaluate")) return {200, RulesReply()};
+        const auto trigger = *RulesJsonReader::Parse(request.Body);
+        if (++evaluations == 1)
+        {
+            oldCommand = CommandForTrigger(trigger);
+            return {200, RulesReply()};
+        }
+        return {200, RulesReply(oldCommand.Dump() + "," +
+            CommandForTrigger(trigger, "PrivateMessage", "aaaaaaaa-bbbb-cccc-dddd-000000000001").Dump())};
+    };
+    portal_cod4x::PluginRuntime runtime(config.string());
+    runtime.Initialize(host, "0.3.0");
+    runtime.HandlePlayerConnect(host, 2, "198.51.100.10");
+    runtime.HandlePlayerConnected(host, 2);
+    TickFrames(runtime, host);
+    runtime.HandlePlayerConnect(host, 2, "198.51.100.11");
+    TickFrames(runtime, host, 12);
+    Assert(evaluations == 2 && host.DroppedPlayers.empty() && host.PrivateMessages.size() == 1,
+        "An old correlated decision must not execute through a fresh IP observation");
+    RemoveTestConfig(config);
+}
+
+void Runtime_RulesRedeliveryRetainsDispatchedAfterDisconnect()
+{
+    const auto config = WriteRuntimeConfig("rules-redelivered-drop");
+    FakeHost host;
+    ConfigureTestPlayer(host);
+    RulesJson trigger;
+    int outcomes = 0;
+    host.ResponseFactory = [&](const auto& request) -> portal_cod4x::HttpResponse {
+        if (request.Url.ends_with("/evaluate"))
+        {
+            trigger = *RulesJsonReader::Parse(request.Body);
+            return {200, RulesReply(CommandForTrigger(trigger).Dump())};
+        }
+        if (request.Url.ends_with("/outcomes"))
+        {
+            ++outcomes;
+            const auto result = *RulesJsonReader::Parse(request.Body);
+            Assert(result.String("outcome") == "Dispatched",
+                "Redelivery must preserve the original native outcome after synchronous disconnect");
+            Assert(result.String("occurredAtUtc") == "1970-01-01T01:23:20.1234567Z",
+                "The actual subsecond dispatch timestamp must survive later redelivery");
+            return {200, RulesReply({}, outcomes == 1 ? "\"aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee\"" : "")};
+        }
+        return {200, RulesReply(CommandForTrigger(trigger).Dump())};
+    };
+    portal_cod4x::PluginRuntime runtime(config.string());
+    runtime.Initialize(host, "0.3.0");
+    host.CurrentSubsecondTicks = 1234000;
+    host.OnDrop = [&](int slot) {
+        host.CurrentSubsecondTicks = 1234567;
+        runtime.HandlePlayerDisconnected(host, slot);
+    };
+    runtime.HandlePlayerConnect(host, 2, "198.51.100.10");
+    runtime.HandlePlayerConnected(host, 2);
+    TickFrames(runtime, host);
+    host.CurrentTime += 3;
+    TickFrames(runtime, host);
+    Assert(outcomes == 2 && host.DroppedPlayers.size() == 1,
+        "An acknowledged drop may be reported again but must never execute twice");
+    RemoveTestConfig(config);
+}
+
+void Runtime_RulesPartialStartsRetryOriginalTriggerWithoutReplayingEffects()
+{
+    const auto config = WriteRuntimeConfig("rules-partial-start");
+    FakeHost host;
+    ConfigureTestPlayer(host);
+    std::string originalBody;
+    int evaluations = 0;
+    int polls = 0;
+    host.ResponseFactory = [&](const auto& request) -> portal_cod4x::HttpResponse {
+        if (request.Url.ends_with("/evaluate"))
+        {
+            ++evaluations;
+            if (originalBody.empty()) originalBody = request.Body;
+            Assert(request.Body == originalBody, "Partial-start retries must preserve the exact original trigger");
+            if (evaluations == 2) return {503, ""};
+            const auto trigger = *RulesJsonReader::Parse(request.Body);
+            return {200, RulesReply(CommandForTrigger(trigger, "PrivateMessage").Dump() +
+                (evaluations == 3 ? "," + CommandForTrigger(trigger, "PublicMessage",
+                    "aaaaaaaa-bbbb-cccc-dddd-000000000001").Dump() : ""),
+                evaluations < 3 ? "\"aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee\"" : "", evaluations < 3)};
+        }
+        if (request.Url.ends_with("/poll"))
+        {
+            ++polls;
+            return {200, RulesReply({}, evaluations < 3 ? "\"aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee\"" : "")};
+        }
+        return {200, RulesReply({}, evaluations < 3 ? "\"aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee\"" : "")};
+    };
+    portal_cod4x::PluginRuntime runtime(config.string());
+    runtime.Initialize(host, "0.3.0");
+    runtime.HandlePlayerConnect(host, 2, "198.51.100.10");
+    runtime.HandlePlayerConnected(host, 2);
+    TickFrames(runtime, host, 12);
+    Assert(evaluations == 1 && host.PrivateMessages.size() == 1,
+        "A missing provider start must not suppress healthy native work");
+    host.CurrentTime += 4;
+    TickFrames(runtime, host, 12);
+    Assert(evaluations == 1 && polls > 0, "Healthy continuation must proceed during the trigger retry backoff");
+    host.CurrentTime += 1;
+    TickFrames(runtime, host, 12);
+    Assert(evaluations == 2 && host.PrivateMessages.size() == 1,
+        "Trigger retry must use five-second backoff and survive a transient retry failure");
+    host.CurrentTime += 5;
+    TickFrames(runtime, host, 20);
+    Assert(evaluations == 3 && host.PrivateMessages.size() == 1 && host.BroadcastMessages.size() == 2,
+        "Recovered missing work must execute without replaying the healthy effect");
+    host.CurrentTime += 5;
+    TickFrames(runtime, host, 12);
+    Assert(evaluations == 3, "retryTrigger=false on evaluate must stop trigger retries");
+    RemoveTestConfig(config);
+}
+
+void Runtime_RulesTriggerRetriesExpireAndRejectChangedConnections()
+{
+    for (int scenario = 0; scenario < 4; ++scenario)
+    {
+        const auto config = WriteRuntimeConfig("rules-retry-expiry-" + std::to_string(scenario));
+        FakeHost host;
+        ConfigureTestPlayer(host);
+        std::string originalBody;
+        int originalAttempts = 0;
+        host.ResponseFactory = [&](const auto& request) -> portal_cod4x::HttpResponse {
+            if (!request.Url.ends_with("/evaluate")) return {200, RulesReply()};
+            if (originalBody.empty()) originalBody = request.Body;
+            if (request.Body != originalBody) return {200, RulesReply()};
+            ++originalAttempts;
+            return {200, RulesReply({}, {}, true)};
+        };
+        portal_cod4x::PluginRuntime runtime(config.string());
+        runtime.Initialize(host, "0.3.0");
+        runtime.HandlePlayerConnect(host, 2, "198.51.100.10");
+        runtime.HandlePlayerConnected(host, 2);
+        TickFrames(runtime, host);
+        if (scenario == 1)
+        {
+            host.CurrentTime += 115;
+            TickFrames(runtime, host);
+        }
+        if (scenario == 2) runtime.HandlePlayerConnect(host, 2, "198.51.100.11");
+        if (scenario == 3)
+        {
+            runtime.HandlePlayerDisconnected(host, 2);
+            runtime.HandlePlayerConnect(host, 2, "198.51.100.10");
+            runtime.HandlePlayerConnected(host, 2);
+        }
+        host.CurrentTime += scenario == 0 ? 120 : 5;
+        TickFrames(runtime, host, 12);
+        Assert(originalAttempts == (scenario == 1 ? 2 : 1),
+            "Retry lifetime must not reset, and stale connection/IP snapshots must never be resubmitted");
+        const auto expected = scenario < 2 ? "Rules trigger retry expired" : "Rules trigger retry invalidated";
+        Assert(std::any_of(host.Logs.begin(), host.Logs.end(), [&](const auto& log) {
+            return log.find(expected) != std::string::npos;
+        }), "Abandoned trigger recovery must emit an explicit expiry or invalidation diagnostic");
+        RemoveTestConfig(config);
+    }
+}
+
+void Runtime_RulesShutdownDiagnosesAbandonedTriggerRecovery()
+{
+    for (int frames : {1, 8})
+    {
+        const auto config = WriteRuntimeConfig("rules-shutdown-trigger-" + std::to_string(frames));
+        FakeHost host;
+        ConfigureTestPlayer(host);
+        host.ResponseFactory = [](const auto&) -> portal_cod4x::HttpResponse {
+            return {200, RulesReply({}, {}, true)};
+        };
+        portal_cod4x::PluginRuntime runtime(config.string());
+        runtime.Initialize(host, "0.3.0");
+        runtime.HandlePlayerConnect(host, 2, "198.51.100.10");
+        runtime.HandlePlayerConnected(host, 2);
+        TickFrames(runtime, host, frames);
+        runtime.Shutdown(host);
+        Assert(host.OpenRequests == 0 && std::any_of(host.Logs.begin(), host.Logs.end(), [](const auto& log) {
+            return log.find("unresolved rules triggers/outcomes/continuations") != std::string::npos;
+        }), "Shutdown must close requests and diagnose both in-flight and retained trigger recovery");
+        RemoveTestConfig(config);
+    }
+}
+
+void Runtime_RulesIndependentFeatureContinuationsAreNotLost()
+{
+    const auto config = WriteRuntimeConfig("rules-feature-continuations");
+    FakeHost host;
+    ConfigureTestPlayer(host);
+    int polls = 0;
+    host.ResponseFactory = [&](const auto& request) -> portal_cod4x::HttpResponse {
+        if (request.Url.ends_with("/evaluate"))
+        {
+            const auto trigger = *RulesJsonReader::Parse(request.Body);
+            return {200, RulesReply(CommandForTrigger(trigger, "PrivateMessage").Dump() + "," +
+                CommandForTrigger(trigger, "PublicMessage", "bbbbbbbb-bbbb-cccc-dddd-eeeeeeeeeeee").Dump(),
+                "\"aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee\",\"bbbbbbbb-bbbb-cccc-dddd-eeeeeeeeeeee\"")};
+        }
+        if (request.Url.ends_with("/outcomes"))
+        {
+            const auto result = *RulesJsonReader::Parse(request.Body);
+            return {200, RulesReply({}, RulesJson::Quote(*result.String("executionId")))};
+        }
+        ++polls;
+        const auto poll = *RulesJsonReader::Parse(request.Body);
+        Assert(poll.Find("executionIds")->Items.size() == 2,
+            "One feature outcome must not erase the other feature's pending cloud cursor");
+        return {200, RulesReply()};
+    };
+    portal_cod4x::PluginRuntime runtime(config.string());
+    runtime.Initialize(host, "0.3.0");
+    runtime.HandlePlayerConnect(host, 2, "198.51.100.10");
+    runtime.HandlePlayerConnected(host, 2);
+    TickFrames(runtime, host);
+    host.CurrentTime += 3;
+    TickFrames(runtime, host);
+    Assert(polls == 1, "Unfinished independent features must be resumed together without inventing local ordering");
+    RemoveTestConfig(config);
+}
+
+void Runtime_RulesSnapshotsRetainRuntimeAndExactDisconnectIdentity()
+{
+    const auto config = WriteRuntimeConfig("rules-snapshot-binding");
+    FakeHost host;
+    ConfigureTestPlayer(host);
+    host.Responses["POST https://example.test/ingest/events/server-status"] = {202, ""};
+    host.Responses["POST https://example.test/ingest/events/player-disconnected"] = {202, ""};
+    host.ResponseFactory = [](const auto&) -> portal_cod4x::HttpResponse { return {200, RulesReply()}; };
+    portal_cod4x::PluginRuntime runtime(config.string());
+    runtime.Initialize(host, "0.3.0");
+    runtime.HandlePlayerConnect(host, 2, "198.51.100.10");
+    runtime.HandlePlayerConnected(host, 2);
+    TickFrames(runtime, host);
+    host.CurrentTime += 61;
+    TickFrames(runtime, host);
+    const auto request = std::find_if(host.Requests.begin(), host.Requests.end(), [](const auto& entry) {
+        return entry.Url.ends_with("/events/server-status");
+    });
+    Assert(request != host.Requests.end(), "Observed connection must be included in periodic status");
+    const auto status = *RulesJsonReader::Parse(request->Body);
+    const auto& snapshot = status.Items[0];
+    const auto& player = snapshot.Find("players")->Items[0];
+    Assert(snapshot.String("snapshotId") == snapshot.String("messageId") &&
+        snapshot.Integer("sequence") == snapshot.Integer("sequenceId") &&
+        snapshot.String("observedAtUtc").has_value() &&
+        snapshot.Find("runtime")->String("instanceId").has_value() &&
+        snapshot.Find("runtime")->String("startedAtUtc") == "1970-01-01T01:23:20Z" &&
+        player.String("state") == "Connected" && player.Unsigned("connectionGeneration") == 1,
+        "Authoritative binding metadata must reuse observed UUID, runtime start and existing sequence");
+    const auto connectionId = player.String("connectionId");
+    const auto instanceId = snapshot.Find("runtime")->String("instanceId");
+    const auto previousSequence = snapshot.Integer("sequence");
+    runtime.HandlePlayerDisconnected(host, 2);
+    TickFrames(runtime, host);
+    const auto disconnect = std::find_if(host.Requests.begin(), host.Requests.end(), [](const auto& entry) {
+        return entry.Url.ends_with("/events/player-disconnected");
+    });
+    Assert(disconnect != host.Requests.end(), "Observed disconnect must be delivered");
+    const auto tombstone = RulesJsonReader::Parse(disconnect->Body)->Items[0];
+    Assert(tombstone.String("connectionId") == connectionId &&
+        tombstone.Unsigned("connectionGeneration") == 1 &&
+        tombstone.Find("runtime")->String("instanceId") == instanceId &&
+        tombstone.Integer("sequence") > previousSequence,
+        "Only explicit disconnect carries the exact runtime/connection/generation tombstone");
+    // Hot-loaded roster identities are partial observations, never fresh admissions.
+    runtime.HandlePlayerConnected(host, 2);
+    host.CurrentTime += 61;
+    TickFrames(runtime, host);
+    const auto unknown = std::find_if(host.Requests.rbegin(), host.Requests.rend(), [](const auto& entry) {
+        return entry.Url.ends_with("/events/server-status");
+    });
+    const auto unknownStatus = RulesJsonReader::Parse(unknown->Body)->Items[0];
+    Assert(unknownStatus.Find("players")->Items[0].String("state") == "Unknown" &&
+        unknownStatus.Find("players")->Items[0].Find("connectionId")->Type == RulesJson::Kind::Null,
+        "Unknown continuity must never become an adoptable connection binding");
+    Assert(std::count_if(host.Requests.begin(), host.Requests.end(), [](const auto& entry) {
+        return entry.Url.ends_with("/rules/evaluate");
+    }) == 1, "Unknown continuity must not send an invalid nonnullable normalized trigger");
+    RemoveTestConfig(config);
+}
+
+void Runtime_PortalTempBansExpireOfflineWithoutAffectingPermanentBans()
+{
+    const auto config = WriteRuntimeConfig("portal-temp-expiry");
+    FakeHost host;
+    ConfigureTestPlayer(host);
+    const std::string url = "GET https://example.test/ingest/active-bans?gameType=CallOfDuty4x&skipEntries=0&takeEntries=200";
+    host.Responses[url] = {200, "{\"data\":{\"items\":["
+        "{\"type\":\"TempBan\",\"expires\":\"1970-01-01T01:23:30.0000000\",\"player\":{\"guid\":\"76561198000000001\"}},"
+        "{\"Type\":\"Ban\",\"Expires\":null,\"Player\":{\"Guid\":\"76561198000000002\"}}]}}"};
+    portal_cod4x::PluginRuntime runtime(config.string(), [&] { return host.CurrentTime; });
+    runtime.Initialize(host, "0.3.0");
+    TickFrames(runtime, host);
+    std::string reason;
+    Assert(runtime.TryGetPlayerBanMessage(76561198000000001ULL, reason) &&
+        runtime.TryGetAuthenticatedPlayerBanMessage(76561198000000001ULL, reason),
+        "Unexpired portal temporary ban must enforce in both admission hooks");
+    Assert(host.DroppedPlayers.size() == 1, "Fresh active temporary ban proactively drops existing player");
+    host.Responses[url] = {503, ""};
+    host.CurrentTime = 5010;
+    Assert(!runtime.TryGetPlayerBanMessage(76561198000000001ULL, reason) &&
+        !runtime.TryGetAuthenticatedPlayerBanMessage(76561198000000001ULL, reason),
+        "Temporary ban must stop enforcing at exact UTC expiry without any successful refresh or tick");
+    Assert(runtime.TryGetPlayerBanMessage(76561198000000002ULL, reason),
+        "Null expiry remains permanent during an outage");
+    Assert(runtime.RenderPortalBanListDump().find("76561198000000001") == std::string::npos,
+        "Expired cached portal bans must not appear as actively enforced bans");
+    host.CurrentTime += 121;
+    TickFrames(runtime, host);
+    Assert(host.DroppedPlayers.size() == 1 && runtime.TryGetPlayerBanMessage(76561198000000002ULL, reason),
+        "Offline refresh must preserve valid permanent bans without re-enforcing expired temporary bans");
+    RemoveTestConfig(config);
+}
+
+void Runtime_FractionalPortalExpiryHonorsExactUtcInstant()
 {
     for (int scenario = 0; scenario < 2; ++scenario)
     {
-        const auto configPath = WriteVpnProtectionConfig("ip-change-stale-" + std::to_string(scenario));
+        const auto config = WriteRuntimeConfig("portal-fractional-expiry-" + std::to_string(scenario));
         FakeHost host;
-        ConfigureVpnProtectionPlayer(host);
-        host.InjectEvaluationConnectionId = true;
-        host.Responses["POST https://example.test/ingest/vpn-protection/evaluate"] = {
-            200, scenario == 0 ? "{\"matched\":true,\"action\":\"Ban\",\"reason\":\"VPN\"}" :
-                SiegeResponse("1970-01-01T01:30:00Z")};
-        host.Responses["POST https://example.test/ingest/siege-mode/outcome"] = {204, ""};
-        portal_cod4x::PluginRuntime runtime(configPath.string());
-        runtime.Initialize(host, "0.2.0");
-        runtime.HandlePlayerConnect(host, 2, "198.51.100.10");
-        runtime.HandlePlayerConnected(host, 2);
-        runtime.Tick(host);
-        runtime.HandlePlayerConnect(host, 2, "198.51.100.11");
-        host.Responses["POST https://example.test/ingest/vpn-protection/evaluate"] = {200, "{\"matched\":false}"};
-        for (int i = 0; i < 6; ++i) runtime.Tick(host);
-        Assert(host.ExecutedCommands.empty() && host.DroppedPlayers.empty(),
-            "A decision for an old IP must never enforce against the new observation");
-        if (scenario == 1)
-        {
-            Assert(std::any_of(host.Requests.begin(), host.Requests.end(), [](const auto& request) {
-                return request.Url == "https://example.test/ingest/siege-mode/outcome" &&
-                    request.Body.find("\"outcome\":\"Stale\"") != std::string::npos;
-            }), "A stale Siege claim must be reported");
-        }
-        RemoveTestConfig(configPath);
-    }
-}
-
-void Runtime_SiegeAndVpnConflictsNeverDoubleEnforce()
-{
-    const auto configPath = WriteVpnProtectionConfig("siege-vpn-conflict");
-    FakeHost host;
-    ConfigureVpnProtectionPlayer(host);
-    host.InjectEvaluationConnectionId = true;
-    std::string response = SiegeResponse("1970-01-01T01:30:00Z");
-    response.replace(response.find("\"matched\":false"), 15, "\"matched\":true,\"action\":\"Ban\",\"reason\":\"VPN\"");
-    host.Responses["POST https://example.test/ingest/vpn-protection/evaluate"] = {200, response};
-    host.Responses["POST https://example.test/ingest/siege-mode/outcome"] = {204, ""};
-    portal_cod4x::PluginRuntime runtime(configPath.string());
-    runtime.Initialize(host, "0.2.0");
-    runtime.HandlePlayerConnect(host, 2, "198.51.100.10");
-    runtime.HandlePlayerConnected(host, 2);
-    for (int i = 0; i < 4; ++i) runtime.Tick(host);
-    Assert(host.DroppedPlayers.empty() &&
-        std::find(host.ExecutedCommands.begin(), host.ExecutedCommands.end(), "banClient 2 \"VPN\"") !=
-            host.ExecutedCommands.end(), "A normal VPN ban must take precedence over a conflicting Siege action");
-    Assert(std::any_of(host.Requests.begin(), host.Requests.end(), [](const auto& request) {
-        return request.Url == "https://example.test/ingest/siege-mode/outcome" &&
-            request.Body.find("\"outcome\":\"Stale\"") != std::string::npos;
-    }), "The conflicting Siege action must be reported stale");
-    RemoveTestConfig(configPath);
-}
-
-void Runtime_SiegeStillEnforcesWhenVpnCannotDispatch()
-{
-    for (int scenario = 0; scenario < 3; ++scenario)
-    {
-        const auto configPath = WriteVpnProtectionConfig("siege-vpn-failure-" + std::to_string(scenario));
-        FakeHost host;
-        ConfigureVpnProtectionPlayer(host);
-        host.InjectEvaluationConnectionId = true;
-        host.ExecuteServerCommandSucceeds = scenario != 2;
-        std::string response = SiegeResponse("1970-01-01T01:30:00Z");
-        const std::string vpn = scenario == 0 ? "\"matched\":true,\"action\":\"Unknown\",\"reason\":\"VPN\"" :
-            scenario == 1 ? "\"matched\":true,\"action\":\"Kick\",\"reason\":\"\"" :
-            "\"matched\":true,\"action\":\"Kick\",\"reason\":\"VPN\"";
-        response.replace(response.find("\"matched\":false"), 15, vpn);
-        host.Responses["POST https://example.test/ingest/vpn-protection/evaluate"] = {200, response};
-        host.Responses["POST https://example.test/ingest/siege-mode/outcome"] = {204, ""};
-        portal_cod4x::PluginRuntime runtime(configPath.string());
-        runtime.Initialize(host, "0.2.0");
-        runtime.HandlePlayerConnect(host, 2, "198.51.100.10");
-        runtime.HandlePlayerConnected(host, 2);
-        for (int i = 0; i < 4; ++i) runtime.Tick(host);
-        Assert(host.DroppedPlayers.size() == 1, "A failed VPN dispatch must not suppress a valid Siege decision");
-        Assert(std::any_of(host.Requests.begin(), host.Requests.end(), [](const auto& request) {
-            return request.Url == "https://example.test/ingest/siege-mode/outcome" &&
-                request.Body.find("\"outcome\":\"Dispatched\"") != std::string::npos;
-        }), "The independent Siege dispatch must be reported");
-        RemoveTestConfig(configPath);
-    }
-}
-
-void Runtime_SiegeTrackingCapacityKeepsEnforcing()
-{
-    for (int scenario = 0; scenario < 3; ++scenario)
-    {
-        const auto configPath = WriteVpnProtectionConfig("siege-capacity-" + std::to_string(scenario));
-        FakeHost host;
-        ConfigureVpnProtectionPlayer(host);
-        host.InjectEvaluationConnectionId = true;
-        host.HoldSiegeOutcome = scenario == 2;
-        host.Responses["POST https://example.test/ingest/siege-mode/outcome"] = {scenario == 1 ? 503 : 204, ""};
-        portal_cod4x::PluginRuntime runtime(configPath.string());
-        runtime.Initialize(host, "0.2.0");
-        for (int i = 0; i < 1001; ++i)
-        {
-            std::string response = SiegeResponse("1970-01-01T01:30:00Z");
-            const std::string suffix = std::to_string(i);
-            response.replace(response.find("eeeeeeeeeeee"), 12, std::string(12 - suffix.size(), '0') + suffix);
-            host.Responses["POST https://example.test/ingest/vpn-protection/evaluate"] = {200, response};
-            runtime.HandlePlayerConnect(host, 2, "198.51." + std::to_string(i / 254) + "." + std::to_string(i % 254 + 1));
-            if (i == 0) runtime.HandlePlayerConnected(host, 2);
-            runtime.Tick(host);
-            runtime.Tick(host);
-        }
-        Assert(host.DroppedPlayers.size() == 1001, "Siege enforcement must continue beyond tracking capacity");
-        Assert(std::none_of(host.Requests.begin(), host.Requests.end(), [](const auto& request) {
-            return request.Url == "https://example.test/ingest/vpn-protection/evaluate" &&
-                request.Body.find("\"siegeEvaluation\":false") != std::string::npos;
-        }), "Tracking capacity must not disable Siege evaluation");
-
-        const auto lostReport = std::find_if(host.Logs.begin(), host.Logs.end(), [](const auto& line) {
-            return line.find("Siege outcome retry buffer full") != std::string::npos;
-        });
+        ConfigureTestPlayer(host);
+        host.CurrentSubsecondTicks = scenario == 0 ? 4999999 : 5000000;
+        const std::string url = "GET https://example.test/ingest/active-bans?gameType=CallOfDuty4x&skipEntries=0&takeEntries=200";
+        host.Responses[url] = {200, "{\"data\":{\"items\":["
+            "{\"type\":\"TempBan\",\"expires\":\"1970-01-01T01:23:20.4000000Z\",\"player\":{\"guid\":\"76561198000000001\"}},"
+            "{\"type\":\"TempBan\",\"expires\":\"1970-01-01T01:23:20.5000000\",\"player\":{\"guid\":\"76561198000000001\"}}]}}"};
+        portal_cod4x::PluginRuntime runtime(config.string(), [&] { return host.CurrentTime; },
+            [&] { return host.GetUnixTime100Nanoseconds(); });
+        runtime.Initialize(host, "0.3.0");
+        TickFrames(runtime, host);
+        std::string reason;
+        Assert((host.DroppedPlayers.size() == 1) == (scenario == 0),
+            "Refresh must proactively enforce an unexpired fractional ban but not one at expiry");
+        Assert(runtime.TryGetPlayerBanMessage(76561198000000001ULL, reason) == (scenario == 0),
+            "Refresh must retain the latest fractional expiry within the same second");
         if (scenario == 0)
         {
-            Assert(lostReport == host.Logs.end(), "Acknowledged actions can be evicted without losing outcomes");
+            host.Responses[url] = {503, ""};
+            Assert(runtime.TryGetAuthenticatedPlayerBanMessage(76561198000000001ULL, reason),
+                "The admission hook must enforce the fractional ban one tick before expiry");
+            host.CurrentSubsecondTicks = 5000000;
+            Assert(!runtime.TryGetPlayerBanMessage(76561198000000001ULL, reason) &&
+                !runtime.TryGetAuthenticatedPlayerBanMessage(76561198000000001ULL, reason) &&
+                runtime.RenderPortalBanListDump().find("76561198000000001") == std::string::npos,
+                "The exact expiry instant must stop offline admission and active-list enforcement");
         }
-        else
-        {
-            Assert(lostReport != host.Logs.end() &&
-                lostReport->find(scenario == 1
-                    ? "actionId=aaaaaaaa-bbbb-cccc-dddd-000000000000"
-                    : "actionId=aaaaaaaa-bbbb-cccc-dddd-000000000001") != std::string::npos &&
-                lostReport->find("outcome=Dispatched") != std::string::npos,
-                "A lost retry must identify its action and actual outcome for reconciliation");
-        }
-        runtime.HandlePlayerConnect(host, 2, "203.0.113.2");
-        runtime.Tick(host);
-        runtime.Tick(host);
-        Assert(host.DroppedPlayers.size() == 1001, "A retained duplicate action must not dispatch again");
-        host.HoldSiegeOutcome = false;
-        host.CurrentTime += 5;
-        for (int i = 0; i < 3; ++i) runtime.Tick(host);
-        if (scenario == 2)
-        {
-            Assert(std::any_of(host.Requests.begin(), host.Requests.end(), [](const auto& request) {
-                return request.Url == "https://example.test/ingest/siege-mode/outcome" &&
-                    request.Body.find("aaaaaaaa-bbbb-cccc-dddd-000000000002") != std::string::npos;
-            }), "An in-flight outcome must remain intact when another pending retry is evicted");
-        }
-
-        std::string guidResponse = SiegeResponse("1970-01-01T01:30:00Z");
-        guidResponse.replace(guidResponse.find("eeeeeeeeeeee"), 12, "ffffffffffff");
-        host.Responses["POST https://example.test/ingest/vpn-protection/evaluate"] = {200, guidResponse};
-        runtime.HandlePlayerDisconnected(host, 2);
-        runtime.HandlePlayerConnect(host, 2, "");
-        runtime.HandlePlayerConnected(host, 2);
-        for (int i = 0; i < 3; ++i) runtime.Tick(host);
-        Assert(host.DroppedPlayers.size() == 1002 && std::any_of(host.Requests.begin(), host.Requests.end(), [](const auto& request) {
-            return request.Url == "https://example.test/ingest/vpn-protection/evaluate" &&
-                request.Body.find("\"ipAddress\":\"\"") != std::string::npos &&
-                request.Body.find("\"siegeEvaluation\":true") != std::string::npos;
-        }), "GUID-only Siege admission must continue at tracking capacity");
-
-        host.Responses["POST https://example.test/ingest/vpn-protection/evaluate"] = {
-            200, "{\"matched\":true,\"action\":\"Kick\",\"reason\":\"VPN\"}"};
-        runtime.HandlePlayerConnect(host, 2, "203.0.113.1");
-        for (int i = 0; i < 3; ++i) runtime.Tick(host);
-        Assert(std::find(host.ExecutedCommands.begin(), host.ExecutedCommands.end(), "onlykick 2 \"VPN\"") !=
-            host.ExecutedCommands.end(), "VPN enforcement must continue independently at Siege capacity");
-        RemoveTestConfig(configPath);
+        RemoveTestConfig(config);
     }
+}
+
+void Runtime_FractionalCommandExpiryHonorsExactUtcInstant()
+{
+    for (int scenario = 0; scenario < 3; ++scenario)
+    {
+        const auto config = WriteRuntimeConfig("rules-fractional-expiry-" + std::to_string(scenario));
+        FakeHost host;
+        ConfigureTestPlayer(host);
+        host.CurrentSubsecondTicks = scenario == 1 ? 5000000 : 4999999;
+        host.ResponseFactory = [scenario](const auto& request) -> portal_cod4x::HttpResponse {
+            if (!request.Url.ends_with("/evaluate")) return {200, RulesReply()};
+            const auto trigger = *RulesJsonReader::Parse(request.Body);
+            auto command = CommandForTrigger(trigger);
+            command.Fields["expiresAtUtc"] = *RulesJsonReader::Parse(scenario == 2 ?
+                "\"1970-01-01T01:23:20.50000001Z\"" : "\"1970-01-01T01:23:20.5000000Z\"");
+            return {200, RulesReply(command.Dump())};
+        };
+        portal_cod4x::PluginRuntime runtime(config.string());
+        runtime.Initialize(host, "0.3.0");
+        runtime.HandlePlayerConnect(host, 2, "198.51.100.10");
+        runtime.HandlePlayerConnected(host, 2);
+        TickFrames(runtime, host, 12);
+        Assert(host.DroppedPlayers.size() == (scenario == 0 ? 1U : 0U),
+            "A native effect may dispatch one tick before expiry, never at expiry or for unrepresentable precision");
+        const auto expected = scenario == 0 ? "\"outcome\":\"Dispatched\"" :
+            scenario == 1 ? "\"outcome\":\"Stale\"" : "\"outcome\":\"Failed\"";
+        Assert(std::any_of(host.Requests.begin(), host.Requests.end(), [&](const auto& request) {
+            return request.Url.ends_with("/outcomes") && request.Body.find(expected) != std::string::npos;
+        }), "Fractional command boundary must return the correct explicit outcome");
+        RemoveTestConfig(config);
+    }
+}
+
+void Runtime_PortalBanRefreshRejectsMalformedExpiryWithoutClearingValidCache()
+{
+    const std::vector<std::string> invalidExpires{
+        "", ",\"expires\":null", ",\"expires\":42", ",\"expires\":\"invalid\"",
+        ",\"expires\":\"2026-02-31T12:00:00Z\"", ",\"expires\":\"1970-01-01T01:30:00+02:00\"",
+        ",\"expires\":\"1970-01-01T01:30:00.00000001Z\"",
+        ",\"expires\":\"1970-01-01T01:30:00Z\",\"Expires\":null"};
+    for (std::size_t scenario = 0; scenario < invalidExpires.size(); ++scenario)
+    {
+        const auto config = WriteRuntimeConfig("portal-invalid-expiry-" + std::to_string(scenario));
+        FakeHost host;
+        host.CurrentTime = 5000;
+        const std::string url = "GET https://example.test/ingest/active-bans?gameType=CallOfDuty4x&skipEntries=0&takeEntries=200";
+        host.Responses[url] = {200, "{\"data\":{\"items\":["
+            "{\"type\":\"Ban\",\"player\":{\"guid\":\"76561198000000001\"}}]}}"};
+        portal_cod4x::PluginRuntime runtime(config.string(), [&] { return host.CurrentTime; });
+        runtime.Initialize(host, "0.3.0");
+        TickFrames(runtime, host);
+        host.Responses[url] = {200, "{\"data\":{\"items\":[{\"type\":\"TempBan\"" +
+            invalidExpires[scenario] + ",\"player\":{\"guid\":\"76561198000000002\"}}]}}"};
+        host.CurrentTime += 121;
+        TickFrames(runtime, host);
+        std::string reason;
+        Assert(runtime.TryGetPlayerBanMessage(76561198000000001ULL, reason) &&
+            !runtime.TryGetPlayerBanMessage(76561198000000002ULL, reason),
+            "Malformed temporary expiry must preserve previous cache, never fabricate a permanent ban");
+        Assert(std::any_of(host.Logs.begin(), host.Logs.end(), [](const auto& log) {
+            return log.find("Invalid active-ban page or expiry") != std::string::npos;
+        }), "Malformed authoritative expiry must have an explicit refresh diagnostic");
+        RemoveTestConfig(config);
+    }
+}
+
+void Runtime_PortalBanOverlapAcrossPagesAndElapsedRefresh()
+{
+    for (int permanent = 0; permanent < 2; ++permanent)
+    {
+        const auto config = WriteRuntimeConfig("portal-overlap-" + std::to_string(permanent));
+        FakeHost host;
+        host.CurrentTime = 5000;
+        std::string items;
+        for (int i = 0; i < 200; ++i)
+        {
+            if (i) items += ',';
+            items += "{\"type\":3,\"expires\":\"1970-01-01T01:23:30Z\",\"player\":{\"guid\":\"76561198000000001\"}}";
+        }
+        host.Responses["GET https://example.test/ingest/active-bans?gameType=CallOfDuty4x&skipEntries=0&takeEntries=200"] = {
+            200, "{\"data\":{\"items\":[" + items + "]}}"};
+        host.Responses["GET https://example.test/ingest/active-bans?gameType=CallOfDuty4x&skipEntries=200&takeEntries=200"] = {
+            200, "{\"data\":{\"items\":[" + std::string(permanent
+                ? "{\"type\":4,\"expires\":null"
+                : "{\"type\":3,\"expires\":\"1970-01-01T01:23:40+00:00\"") +
+            ",\"player\":{\"guid\":\"76561198000000001\"}}]}}"};
+        portal_cod4x::PluginRuntime runtime(config.string(), [&] { return host.CurrentTime; });
+        runtime.Initialize(host, "0.3.0");
+        TickFrames(runtime, host);
+        host.CurrentTime = 5011;
+        std::string reason;
+        Assert(runtime.TryGetPlayerBanMessage(76561198000000001ULL, reason),
+            "Overlapping records must retain permanent ban or latest temporary expiry across pages");
+        host.CurrentTime = 5020;
+        Assert(runtime.TryGetPlayerBanMessage(76561198000000001ULL, reason) == (permanent != 0),
+            "Latest temporary expiry must elapse, but overlapping permanent ban must remain");
+        RemoveTestConfig(config);
+    }
+
+    const auto config = WriteRuntimeConfig("portal-already-expired");
+    FakeHost host;
+    ConfigureTestPlayer(host);
+    host.Responses["GET https://example.test/ingest/active-bans?gameType=CallOfDuty4x&skipEntries=0&takeEntries=200"] = {
+        200, "{\"data\":{\"items\":[{\"type\":\"TempBan\",\"expires\":\"1970-01-01T01:23:19Z\","
+        "\"player\":{\"guid\":\"76561198000000001\"}}]}}"};
+    portal_cod4x::PluginRuntime runtime(config.string(), [&] { return host.CurrentTime; });
+    runtime.Initialize(host, "0.3.0");
+    TickFrames(runtime, host);
+    std::string reason;
+    Assert(host.DroppedPlayers.empty() && !runtime.TryGetPlayerBanMessage(76561198000000001ULL, reason),
+        "Already elapsed temporary bans in a refresh must never enter enforcement or proactively drop");
+    RemoveTestConfig(config);
+}
+
+void NativeExecutor_PreventsDuplicateAndCapacityReplay()
+{
+    FakeHost host;
+    host.PlayerIds[2] = 76561198000000001ULL;
+    host.CurrentTime = 5000;
+    portal_cod4x::NativeActionTarget target{"76561198000000001",
+        "11111111-2222-3333-4444-555555555555", 2, 1};
+    portal_cod4x::NativeAction action{"effect-0", target, portal_cod4x::NativeEffect::Drop, "Reason", 5400LL * 10000000, true};
+    portal_cod4x::NativeActionExecutor executor;
+    host.OnDrop = [&](int) {
+        Assert(executor.Execute(host, action, target).Outcome == "Dispatched",
+            "Reentrant duplicate must return reserved result without repeating host effect");
+    };
+    Assert(executor.Execute(host, action, target).Outcome == "Dispatched" && host.DroppedPlayers.size() == 1,
+        "Native identity must be reserved before invoking reentrant host APIs");
+    host.OnDrop = {};
+    for (int i = 1; i < 1000; ++i)
+    {
+        action.ExecutionId = "effect-" + std::to_string(i);
+        Assert(executor.Execute(host, action, target).Outcome == "Dispatched", "Native capacity permits distinct effects");
+    }
+    action.ExecutionId = "effect-1000";
+    Assert(executor.Execute(host, action, target).Outcome == "Failed", "Never evict live dedup identity at capacity");
+    action.ExecutionId = "effect-0";
+    executor.Execute(host, action, target);
+    Assert(host.DroppedPlayers.size() == 1000, "Original effect remains protected after capacity exhaustion");
+    action.Text = "Changed";
+    Assert(executor.Execute(host, action, target).Outcome == "Failed", "Logical identity cannot be reused with changed effect");
+
+    portal_cod4x::NativeActionExecutor independent;
+    action.Effect = portal_cod4x::NativeEffect::Unsupported;
+    for (int i = 0; i < 1001; ++i)
+    {
+        action.ExecutionId = "unsupported-" + std::to_string(i);
+        Assert(independent.Execute(host, action, target).Outcome == "SkippedUnsupported",
+            "Unsupported effects must not exhaust supported native effect capacity");
+    }
+    action.Effect = portal_cod4x::NativeEffect::PrivateMessage;
+    action.Text = std::string(256, 'x');
+    action.ExecutionId = "text-256";
+    Assert(independent.Execute(host, action, target).Outcome == "Dispatched",
+        "Exactly 256 UTF-8 bytes must be accepted");
+    action.ExecutionId = "text-257";
+    action.Text += 'x';
+    Assert(independent.Execute(host, action, target).Outcome == "Failed",
+        "257 UTF-8 bytes must be rejected before native invocation");
+    action.ExecutionId = "unicode-256";
+    action.Text.clear();
+    for (int i = 0; i < 128; ++i) action.Text += "\xc3\xa9";
+    Assert(independent.Execute(host, action, target).Outcome == "Dispatched",
+        "Text limit counts UTF-8 bytes, not codepoints");
+    action.ExecutionId = "unicode-258";
+    action.Text += "\xc3\xa9";
+    Assert(independent.Execute(host, action, target).Outcome == "Failed",
+        "Multibyte text above the byte bound must not reach native APIs");
 }
 }
 
@@ -3373,29 +3689,32 @@ int main()
     Runtime_HandleClientCommand_IgnoresPortalOwnedCommands();
     Runtime_HandleChatMessage_DoesNotInterceptPortalOwnedCommands();
     Runtime_HandleChatMessage_StripsLeadingControlByteFromPayload();
-    Runtime_VpnProtectionBan_ExecutesVerifiedCommand();
-    Runtime_VpnProtectionKick_ExecutesOnlyKick();
-    Runtime_VpnProtectionCommandFailure_LogsErrorWithoutSuccess();
-    Runtime_VpnProtectionNoMatch_DoesNotExecuteCommand();
-    Runtime_VpnProtectionTransportFailure_FailsOpen();
-    Runtime_VpnProtectionSlotReuse_IgnoresDecision();
-    Runtime_VpnProtectionLateIpAndDuplicateCallbacks_QueueSeparateChecks();
     Runtime_IpObservationsHaveStableRetryIdsAndDistinctChangeIds();
-    Runtime_VpnProtectionSamePlayerReconnect_CancelsStaleRequest();
-    Runtime_ConnectionIdCorrelatesEventsAndVpnAndFailsOpenAcrossLevelChange();
+    Runtime_ConnectionIdCorrelatesEventsAndRulesAndFailsOpenAcrossLevelChange();
     Runtime_ConnectCallbackAfterLevelExitStartsNewConnection();
     Runtime_ReconnectAfterLevelExitRetiresPriorState();
     Runtime_DisconnectAfterLevelExitDoesNotReuseAnotherPlayersIdentity();
     Runtime_UnobservedConnectionIsNotAssignedAnAdmissionId();
-    Runtime_SiegeGuidOnlyDecisionDispatchesOnceAndRetriesOutcome();
-    Runtime_SiegeStaleAndFailedDecisionsAreReported();
-    Runtime_SiegeDryRunAndUnrecognizedModeNeverDispatch();
-    Runtime_SiegeRejectsNestedAndMalformedDecisionFields();
-    Runtime_SiegeDropCanSynchronouslyInvokeDisconnect();
-    Runtime_IpChangeInvalidatesInFlightDecisions();
-    Runtime_SiegeAndVpnConflictsNeverDoubleEnforce();
-    Runtime_SiegeStillEnforcesWhenVpnCannotDispatch();
-    Runtime_SiegeTrackingCapacityKeepsEnforcing();
+    Runtime_RulesTriggerCapabilitiesAndNativeEffects();
+    Runtime_RulesRejectUnsafeOrStaleCommandsIndependently();
+    Runtime_RulesRechecksConnectionAndSupportsReentrantDisconnect();
+    Runtime_RulesOutcomesRetryAndCloudContinuationPolls();
+    Runtime_RulesOutcomeResponseContinuesAndMalformedAckRetries();
+    Runtime_RulesCallbackOrderingPreservesConnectedObservation();
+    Runtime_RulesRejectPreviousObservationAfterIpChange();
+    Runtime_RulesRedeliveryRetainsDispatchedAfterDisconnect();
+    Runtime_RulesPartialStartsRetryOriginalTriggerWithoutReplayingEffects();
+    Runtime_RulesTriggerRetriesExpireAndRejectChangedConnections();
+    Runtime_RulesShutdownDiagnosesAbandonedTriggerRecovery();
+    Runtime_RulesIndependentFeatureContinuationsAreNotLost();
+    Runtime_RulesSnapshotsRetainRuntimeAndExactDisconnectIdentity();
+    Runtime_PortalTempBansExpireOfflineWithoutAffectingPermanentBans();
+    Runtime_FractionalPortalExpiryHonorsExactUtcInstant();
+    Runtime_FractionalCommandExpiryHonorsExactUtcInstant();
+    Runtime_PortalBanRefreshRejectsMalformedExpiryWithoutClearingValidCache();
+    Runtime_PortalBanOverlapAcrossPagesAndElapsedRefresh();
+    RulesJson_RejectsAmbiguousExecutablePayloads();
+    NativeExecutor_PreventsDuplicateAndCapacityReplay();
     Runtime_HandleClientCommand_DoesNotPrefixMatchLongerToken();
     Runtime_HandleClientCommand_DedupesCrossCallbackPath();
     Runtime_HandleClientCommand_PortalPluginHealth_UsesConsoleAndTellFlow();

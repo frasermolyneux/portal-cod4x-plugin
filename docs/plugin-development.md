@@ -17,6 +17,8 @@ Startup broadcast details:
 - Broadcast target slot: `-1` (all players)
 
 Runtime logic is isolated in `plugin_runtime` and `plugin_exports` modules with unit-test coverage for runtime behavior and callback bridging.
+`rules_adapter` handles the versioned cloud protocol and non-blocking continuation transport;
+`native_action_executor` only dispatches connection-safe drop/chat effects. Neither evaluates rules.
 
 Player connect, disconnect, map change and status callbacks publish separate playtime observations to
 `/ingest/events/playtime-observation` as well as the existing legacy events. The playtime payload contains

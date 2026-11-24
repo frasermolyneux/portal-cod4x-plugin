@@ -7,6 +7,7 @@
 #include <ctime>
 #include <algorithm>
 #include <array>
+#include <chrono>
 #include <optional>
 #include <string>
 #include <string_view>
@@ -337,6 +338,12 @@ public:
     {
         return static_cast<std::int64_t>(std::time(nullptr));
     }
+
+    std::int64_t GetUnixTime100Nanoseconds() const override
+    {
+        using Ticks = std::chrono::duration<std::int64_t, std::ratio<1, 10000000>>;
+        return std::chrono::duration_cast<Ticks>(std::chrono::system_clock::now().time_since_epoch()).count();
+    }
 };
 
 void PrintCommandOutput(std::string_view output)
@@ -604,6 +611,8 @@ PCL void COD4X_CALL OnPlayerRemoveBan(baninfo_t* baninfo)
 
 PCL void COD4X_CALL OnTerminate()
 {
+    Cod4xHostAdapter host;
+    portal_cod4x::ShutdownPlugin(host);
     Plugin_Printf("portal-cod4x-plugin terminated\n");
 }
 
