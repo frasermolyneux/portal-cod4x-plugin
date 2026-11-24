@@ -191,7 +191,12 @@ Use the existing agent installer and unchanged artifact names/paths. Record the 
 artifact semantic version, source commit, platform/architecture and SHA-256 of the extracted
 DLL/SO. Ensure the old module is actually unloaded, replace the binary, then load it; a file
 copy, release upload or successful best-effort unload alone is not installation evidence.
-Deploy/restart the server agent through its normal lifecycle when its integration changes.
+Verify the existing server-agent `IsCod4xPluginSourceEnabled` setting selects the intended
+exclusive producer for connect/IP/status events. Loading the plugin does not itself switch
+the agent source mode; an incorrect or unsynchronized transition can publish distinct
+connection IDs from both producers. Refresh/restart the agent through its normal lifecycle
+after changing its existing source-mode configuration, then verify the selected source before
+re-enabling features.
 Do not restart a game server or run production kicks/bans as validation without authorization.
 
 Verify the actual loaded module with the existing plugin info mechanism and invoke
