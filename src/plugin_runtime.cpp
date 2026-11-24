@@ -761,9 +761,10 @@ void PluginRuntime::Tick(ICod4xHost& host)
 
 void PluginRuntime::Shutdown(ICod4xHost& host)
 {
-    if (rulesOutcomeRequest || !pendingRulesOutcomes.empty() || !pendingRulesPolls.empty())
+    if (rulesEvaluationRequest || rulesOutcomeRequest || !pendingRulesEvaluations.empty() ||
+        !pendingRulesOutcomes.empty() || !pendingRulesPolls.empty())
     {
-        LogError(host, "Plugin unloading with unresolved rules outcomes/continuations; cloud reconciliation is required");
+        LogError(host, "Plugin unloading with unresolved rules triggers/outcomes/continuations; cloud reconciliation is required");
     }
     ResetRulesEvaluation(host);
     for (auto* request : {rulesOutcomeRequest, ingestRequest, banSyncRequest})

@@ -3287,6 +3287,29 @@ void Runtime_RulesTriggerRetriesExpireAndRejectChangedConnections()
     }
 }
 
+void Runtime_RulesShutdownDiagnosesAbandonedTriggerRecovery()
+{
+    for (int frames : {1, 8})
+    {
+        const auto config = WriteRuntimeConfig("rules-shutdown-trigger-" + std::to_string(frames));
+        FakeHost host;
+        ConfigureTestPlayer(host);
+        host.ResponseFactory = [](const auto&) -> portal_cod4x::HttpResponse {
+            return {200, RulesReply({}, {}, true)};
+        };
+        portal_cod4x::PluginRuntime runtime(config.string());
+        runtime.Initialize(host, "0.3.0");
+        runtime.HandlePlayerConnect(host, 2, "198.51.100.10");
+        runtime.HandlePlayerConnected(host, 2);
+        TickFrames(runtime, host, frames);
+        runtime.Shutdown(host);
+        Assert(host.OpenRequests == 0 && std::any_of(host.Logs.begin(), host.Logs.end(), [](const auto& log) {
+            return log.find("unresolved rules triggers/outcomes/continuations") != std::string::npos;
+        }), "Shutdown must close requests and diagnose both in-flight and retained trigger recovery");
+        RemoveTestConfig(config);
+    }
+}
+
 void Runtime_RulesIndependentFeatureContinuationsAreNotLost()
 {
     const auto config = WriteRuntimeConfig("rules-feature-continuations");
@@ -3599,6 +3622,7 @@ int main()
     Runtime_RulesRedeliveryRetainsDispatchedAfterDisconnect();
     Runtime_RulesPartialStartsRetryOriginalTriggerWithoutReplayingEffects();
     Runtime_RulesTriggerRetriesExpireAndRejectChangedConnections();
+    Runtime_RulesShutdownDiagnosesAbandonedTriggerRecovery();
     Runtime_RulesIndependentFeatureContinuationsAreNotLost();
     Runtime_RulesSnapshotsRetainRuntimeAndExactDisconnectIdentity();
     Runtime_PortalTempBansExpireOfflineWithoutAffectingPermanentBans();
