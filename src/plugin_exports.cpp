@@ -604,6 +604,8 @@ PCL void COD4X_CALL OnPlayerRemoveBan(baninfo_t* baninfo)
 
 PCL void COD4X_CALL OnTerminate()
 {
+    Cod4xHostAdapter host;
+    portal_cod4x::ShutdownPlugin(host);
     Plugin_Printf("portal-cod4x-plugin terminated\n");
 }
 

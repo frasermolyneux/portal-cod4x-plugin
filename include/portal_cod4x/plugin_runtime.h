@@ -1,8 +1,11 @@
 #pragma once
 
+#include "portal_cod4x/native_action_executor.h"
+
 #include <cstdint>
 #include <atomic>
 #include <deque>
+#include <functional>
 #include <mutex>
 #include <optional>
 #include <string>
@@ -95,9 +98,11 @@ public:
         Error = 3
     };
 
-    explicit PluginRuntime(std::string configPath = std::string(kDefaultConfigFilePath));
+    explicit PluginRuntime(std::string configPath = std::string(kDefaultConfigFilePath),
+        std::function<std::int64_t()> utcClock = {});
 
     int Initialize(ICod4xHost& host, std::string_view version, std::string_view prefix = kDefaultBotPrefix);
+    void Shutdown(ICod4xHost& host);
     void Tick(ICod4xHost& host);
     void HandlePlayerConnect(ICod4xHost& host, int slot, std::string_view ipAddress);
     void HandlePlayerConnected(ICod4xHost& host, int slot);
@@ -143,12 +148,6 @@ private:
         FetchingActiveBans
     };
 
-    enum class VpnEvaluationStage
-    {
-        Idle,
-        Evaluating
-    };
-
     struct BufferedEvent
     {
         std::string QueueName;
@@ -172,7 +171,7 @@ private:
         std::uint64_t IpRevision = 0;
         std::int64_t ConnectedAtUnixSeconds = 0;
         bool GuidOnlyEvaluationQueued = false;
-        std::string LastVpnEvaluationIp;
+        std::string LastRulesEvaluationIp;
     };
 
     struct PlaytimePlayerState
@@ -191,7 +190,28 @@ private:
         std::int64_t ExpireUnixSeconds = -1; // -1 => permanent (Never)
     };
 
-    struct PendingVpnEvaluation
+    struct PortalBan
+    {
+        std::string Message;
+        std::optional<std::int64_t> ExpiresUnixSeconds;
+
+        void Merge(const PortalBan& other)
+        {
+            if (ExpiresUnixSeconds &&
+                (!other.ExpiresUnixSeconds || *other.ExpiresUnixSeconds > *ExpiresUnixSeconds))
+            {
+                *this = other;
+            }
+        }
+    };
+
+    struct ActiveBanPage
+    {
+        std::unordered_map<std::string, PortalBan> Bans;
+        std::size_t ItemCount = 0;
+    };
+
+    struct PendingRulesEvaluation
     {
         std::string PlayerGuid;
         std::string ConnectionId;
@@ -200,24 +220,22 @@ private:
         int SlotId = -1;
         std::uint64_t ConnectionGeneration = 0;
         std::uint64_t IpRevision = 0;
+        std::string TriggerId;
+        std::string ObservationId;
+        std::int64_t OccurredUnixSeconds = 0;
+        std::vector<std::string> ExecutionIds;
+        std::int64_t NextPollUnixSeconds = 0;
     };
 
-    struct SiegeOutcome
+    struct RulesOutcome
     {
-        std::string SessionId;
-        std::string ActionId;
-        std::string ConnectionId;
-        std::string Outcome;
-        std::string Detail;
-    };
-
-    struct HandledSiegeAction
-    {
-        std::int64_t RetainUntilUnixSeconds = 0;
-        bool OutcomePending = true;
+        std::string CorrelationKey;
+        std::string PayloadJson;
+        PendingRulesEvaluation Target;
     };
 
     std::string configPath;
+    std::function<std::int64_t()> utcClock;
     std::string pluginVersion = "0.0.0-unknown";
     std::string chatPrefix = std::string(kDefaultBotPrefix);
     std::string lastHandledCommandToken;
@@ -256,16 +274,17 @@ private:
     // per-slot map); reset only on genuine disconnect and pruned on level exit.
     std::unordered_set<std::string> connectEmittedGuids;
 
-    VpnEvaluationStage vpnEvaluationStage = VpnEvaluationStage::Idle;
-    HttpRequestHandle vpnEvaluationRequest = nullptr;
-    std::int64_t vpnEvaluationRequestStartedUnixSeconds = 0;
-    std::deque<PendingVpnEvaluation> pendingVpnEvaluations;
-    std::optional<PendingVpnEvaluation> activeVpnEvaluation;
-    std::unordered_map<std::string, HandledSiegeAction> handledSiegeActions;
-    std::deque<SiegeOutcome> pendingSiegeOutcomes;
-    HttpRequestHandle siegeOutcomeRequest = nullptr;
-    std::int64_t siegeOutcomeRequestStartedUnixSeconds = 0;
-    std::int64_t nextSiegeOutcomeAttemptUnixSeconds = 0;
+    HttpRequestHandle rulesEvaluationRequest = nullptr;
+    std::int64_t rulesEvaluationRequestStartedUnixSeconds = 0;
+    std::deque<PendingRulesEvaluation> pendingRulesEvaluations;
+    std::optional<PendingRulesEvaluation> activeRulesEvaluation;
+    bool preferRulesPoll = false;
+    NativeActionExecutor nativeActionExecutor;
+    std::deque<PendingRulesEvaluation> pendingRulesPolls;
+    std::deque<RulesOutcome> pendingRulesOutcomes;
+    HttpRequestHandle rulesOutcomeRequest = nullptr;
+    std::int64_t rulesOutcomeRequestStartedUnixSeconds = 0;
+    std::int64_t nextRulesOutcomeAttemptUnixSeconds = 0;
 
     BanSyncStage banSyncStage = BanSyncStage::Idle;
     HttpRequestHandle banSyncRequest = nullptr;
@@ -275,8 +294,8 @@ private:
     LogLevel logLevel = LogLevel::Info;
     int activeBanFetchSkipEntries = 0;
     bool repositoryConfigWarningLogged = false;
-    std::unordered_map<std::string, std::string> pendingActiveBanMessagesByPlayerGuid;
-    std::unordered_map<std::string, std::string> activeBanMessagesByPlayerGuid;
+    std::unordered_map<std::string, PortalBan> pendingActiveBanMessagesByPlayerGuid;
+    std::unordered_map<std::string, PortalBan> activeBanMessagesByPlayerGuid;
     // Bans created directly on the server (native permban/tempban, observed via OnPlayerAddBan).
     // Held durably here — separate from the portal-synced cache, which is replaced wholesale on
     // each sync — so they survive until the agent imports them into the portal (confirmed when the
@@ -300,14 +319,20 @@ private:
     void AbortIngest(ICod4xHost& host, std::int64_t nowUnixSeconds, std::string_view reason);
     void FlushServerStatusSnapshot(ICod4xHost& host, std::int64_t nowUnixSeconds);
 
-    void QueueVpnEvaluation(ICod4xHost& host, ConnectedPlayerState& playerState);
-    void AdvanceVpnEvaluation(ICod4xHost& host, std::int64_t nowUnixSeconds);
-    bool StartVpnEvaluationRequest(ICod4xHost& host, std::int64_t nowUnixSeconds);
-    void CompleteVpnEvaluation(ICod4xHost& host, const HttpResponse& response);
-    void CompleteSiegeEvaluation(ICod4xHost& host, const std::string& siegeJson, bool vpnMatched);
-    void AdvanceSiegeOutcomes(ICod4xHost& host, std::int64_t nowUnixSeconds);
-    void ResetVpnEvaluation(ICod4xHost& host);
-    std::string BuildVpnEvaluationPayload(const PendingVpnEvaluation& evaluation) const;
+    void QueueRulesEvaluation(ICod4xHost& host, ConnectedPlayerState& playerState,
+        std::string_view observationId = {});
+    void AdvanceRulesEvaluation(ICod4xHost& host, std::int64_t nowUnixSeconds);
+    bool StartRulesEvaluationRequest(ICod4xHost& host, std::int64_t nowUnixSeconds);
+    bool CompleteRulesEvaluation(ICod4xHost& host, const HttpResponse& response,
+        const PendingRulesEvaluation& target);
+    void AdvanceRulesOutcomes(ICod4xHost& host, std::int64_t nowUnixSeconds);
+    void ResetRulesEvaluation(ICod4xHost& host);
+    std::string BuildRulesEvaluationPayload(const PendingRulesEvaluation& evaluation) const;
+    bool IsCurrentRulesTarget(ICod4xHost& host, const PendingRulesEvaluation& target) const;
+    std::string BuildRulesRuntimeCapabilities() const;
+    void RetainRulesPoll(ICod4xHost& host, PendingRulesEvaluation poll);
+    std::string BuildRulesSnapshotMetadata(std::int64_t nowUnixSeconds,
+        const std::string& messageId, long long sequenceId) const;
 
     bool IsRepositoryConfigured() const;
     void AdvanceBanSync(ICod4xHost& host, std::int64_t nowUnixSeconds);
@@ -319,8 +344,8 @@ private:
     // (OnPlayerAddBan/RemoveBan) can deliver the legacy short id, whereas the portal and the agent
     // reconcile use the canonical PUID; resolve via the connected roster so the two agree.
     [[nodiscard]] std::string ResolveBanPlayerGuid(std::uint64_t playerId) const;
-    std::size_t CountActiveBanItems(const std::string& responseBody) const;
-    std::unordered_map<std::string, std::string> ParseActiveBanMessagesByPlayerGuid(const std::string& responseBody) const;
+    std::optional<ActiveBanPage> ParseActiveBans(const std::string& responseBody) const;
+    static std::optional<std::int64_t> ParseUtcTimestamp(const std::string& value, bool allowUnspecifiedUtc = false);
 
     std::string BuildPlayerConnectedPayload(
         std::int64_t nowUnixSeconds,
@@ -337,7 +362,8 @@ private:
         const std::string& playerGuid,
         const std::string& connectionId,
         const std::string& username,
-        int slotId);
+        int slotId,
+        std::uint64_t connectionGeneration);
     std::string BuildPlayerIpResolvedPayload(
         std::int64_t nowUnixSeconds,
         const std::string& messageId,
@@ -394,6 +420,7 @@ private:
 std::string BuildOnlineBroadcastMessage(std::string_view prefix, std::string_view version);
 int InitializePlugin(ICod4xHost& host, std::string_view version, std::string_view prefix = kDefaultBotPrefix);
 void TickPlugin(ICod4xHost& host);
+void ShutdownPlugin(ICod4xHost& host);
 void NotifyPlayerConnect(ICod4xHost& host, int slot, std::string_view ipAddress);
 void NotifyPlayerConnected(ICod4xHost& host, int slot);
 void NotifyClientAuthorized(ICod4xHost& host);
