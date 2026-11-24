@@ -343,7 +343,7 @@ class RulesJsonReader
                     {
                         return std::nullopt;
                     }
-                    *code = 0x10000 + ((*code - 0xd800) << 10) + *low - 0xdc00;
+                    code = 0x10000 + ((*code - 0xd800) << 10) + *low - 0xdc00;
                 }
                 else if (*code >= 0xdc00 && *code <= 0xdfff)
                 {
