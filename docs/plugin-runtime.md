@@ -60,6 +60,41 @@ The plugin registers two RCON ban-list commands at default power 30:
 
 `dumpportalbanlist` renders one line per cached ban with its CoD4x player identifier and enforcement reason, followed by an `Active portal bans` count. Portal bans remain excluded from `dumpbanlist` so the agent cannot re-import portal-owned records as new server bans.
 
+## Connection correlation
+
+Observed player connections receive a UUID shared by their connect event and VPN evaluation.
+Disconnect events include that UUID when the connection is known. A player already present
+when the plugin loads, or carried across a map change without provable continuity, has a
+null connection ID; the plugin logs the uncertainty and such a player must not be treated as
+a fresh Siege admission. An observed new connection receives a new UUID.
+
+If a real IP arrives or changes after the connect event, the plugin emits a
+`player-ip-resolved` event with a unique observation ID, the player GUID, slot and nullable connection ID.
+Both event types mark plugin-owned protection evaluation so consumers do not duplicate it.
+
+## Siege evaluation
+
+Observed connections are evaluated with `siegeEvaluation` enabled, first with a GUID only if
+the IP is unavailable and again when a real IP arrives. The existing VPN decision remains
+independent. Unknown connection continuity is passed as a null connection ID and is not
+eligible for a Siege kick.
+
+A Siege decision must explicitly specify `mode: "Enforce"` and match the live GUID, slot,
+connection ID and generation, with an unexpired decision. The plugin invokes CoD4x's
+`Plugin_DropClient` directly with the kick reason and reports `Dispatched`, which does not
+confirm that the player was dropped. Stale or invalid decisions are reported as `Stale` or
+`Failed`. Retained outcome reports are retried while the plugin runs.
+The service's one-shot claim prevents redispatch after a repeated evaluation, including a lost
+response. The plugin also keeps a bounded defensive cache of up to 1,000 action IDs, evicting
+acknowledged IDs as needed without stopping Siege. If all 1,000 outcomes are unacknowledged,
+the oldest retry (excluding an in-flight request) is evicted and its correlation and outcome
+are logged. Its service-side claim remains pending/unknown for reconciliation; the lost callback
+is not retried. A restart can likewise lose any unacknowledged in-memory outcomes.
+
+Dry-run matches are recorded by the service and return no dispatchable Siege decision.
+Unknown or missing decision modes also fail open. VPN Protection can still enforce its own
+independent decision during a Siege dry run.
+
 ## Version source
 
 Version is sourced from `version.json` and injected by CMake into compile definitions:

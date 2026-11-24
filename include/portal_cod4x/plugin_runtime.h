@@ -162,14 +162,17 @@ private:
     struct ConnectedPlayerState
     {
         std::string PlayerGuid;
+        std::string ConnectionId;
         std::string Username;
         std::string IpAddress;
         int SlotId = -1;
         int Score = 0;
         std::uint64_t SteamId = 0;
         std::uint64_t ConnectionGeneration = 0;
+        std::uint64_t IpRevision = 0;
         std::int64_t ConnectedAtUnixSeconds = 0;
-        bool VpnEvaluationQueued = false;
+        bool GuidOnlyEvaluationQueued = false;
+        std::string LastVpnEvaluationIp;
     };
 
     struct PlaytimePlayerState
@@ -191,10 +194,27 @@ private:
     struct PendingVpnEvaluation
     {
         std::string PlayerGuid;
+        std::string ConnectionId;
         std::string Username;
         std::string IpAddress;
         int SlotId = -1;
         std::uint64_t ConnectionGeneration = 0;
+        std::uint64_t IpRevision = 0;
+    };
+
+    struct SiegeOutcome
+    {
+        std::string SessionId;
+        std::string ActionId;
+        std::string ConnectionId;
+        std::string Outcome;
+        std::string Detail;
+    };
+
+    struct HandledSiegeAction
+    {
+        std::int64_t RetainUntilUnixSeconds = 0;
+        bool OutcomePending = true;
     };
 
     std::string configPath;
@@ -222,6 +242,7 @@ private:
     std::vector<std::string> ingestBatchMessageIds;
     std::deque<BufferedEvent> bufferedEvents;
     std::unordered_map<int, ConnectedPlayerState> connectedPlayers;
+    std::unordered_map<int, ConnectedPlayerState> playersAtLevelExit;
     std::uint64_t nextConnectionGeneration = 0;
     std::string producerEpoch;
     std::int64_t producerStartedUnixSeconds = 0;
@@ -240,6 +261,11 @@ private:
     std::int64_t vpnEvaluationRequestStartedUnixSeconds = 0;
     std::deque<PendingVpnEvaluation> pendingVpnEvaluations;
     std::optional<PendingVpnEvaluation> activeVpnEvaluation;
+    std::unordered_map<std::string, HandledSiegeAction> handledSiegeActions;
+    std::deque<SiegeOutcome> pendingSiegeOutcomes;
+    HttpRequestHandle siegeOutcomeRequest = nullptr;
+    std::int64_t siegeOutcomeRequestStartedUnixSeconds = 0;
+    std::int64_t nextSiegeOutcomeAttemptUnixSeconds = 0;
 
     BanSyncStage banSyncStage = BanSyncStage::Idle;
     HttpRequestHandle banSyncRequest = nullptr;
@@ -274,10 +300,12 @@ private:
     void AbortIngest(ICod4xHost& host, std::int64_t nowUnixSeconds, std::string_view reason);
     void FlushServerStatusSnapshot(ICod4xHost& host, std::int64_t nowUnixSeconds);
 
-    void QueueVpnEvaluation(ConnectedPlayerState& playerState);
+    void QueueVpnEvaluation(ICod4xHost& host, ConnectedPlayerState& playerState);
     void AdvanceVpnEvaluation(ICod4xHost& host, std::int64_t nowUnixSeconds);
     bool StartVpnEvaluationRequest(ICod4xHost& host, std::int64_t nowUnixSeconds);
     void CompleteVpnEvaluation(ICod4xHost& host, const HttpResponse& response);
+    void CompleteSiegeEvaluation(ICod4xHost& host, const std::string& siegeJson, bool vpnMatched);
+    void AdvanceSiegeOutcomes(ICod4xHost& host, std::int64_t nowUnixSeconds);
     void ResetVpnEvaluation(ICod4xHost& host);
     std::string BuildVpnEvaluationPayload(const PendingVpnEvaluation& evaluation) const;
 
@@ -298,6 +326,7 @@ private:
         std::int64_t nowUnixSeconds,
         const std::string& messageId,
         const std::string& playerGuid,
+        const std::string& connectionId,
         std::uint64_t steamId,
         const std::string& username,
         const std::string& ipAddress,
@@ -306,8 +335,13 @@ private:
         std::int64_t nowUnixSeconds,
         const std::string& messageId,
         const std::string& playerGuid,
+        const std::string& connectionId,
         const std::string& username,
         int slotId);
+    std::string BuildPlayerIpResolvedPayload(
+        std::int64_t nowUnixSeconds,
+        const std::string& messageId,
+        const ConnectedPlayerState& playerState);
     std::string BuildChatMessagePayload(
         std::int64_t nowUnixSeconds,
         const std::string& messageId,
