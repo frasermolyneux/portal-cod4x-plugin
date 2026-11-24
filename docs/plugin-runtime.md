@@ -120,7 +120,8 @@ Triggers use `player.connected` and `player.ip-resolved`, `protocolVersion: 1`,
 `playerGuid`, nullable `playerIpAddress`, optional `username` and the connection target.
 Normalized game type is the actual host's `CallOfDuty4x`; legacy event/config strings remain
 unchanged. Unknown connection continuity never sends a normalized evaluation with a null ID.
-The runtime ID is `cod4x-plugin`; its capabilities are exactly:
+The runtime ID is `cod4x-plugin`, with `identityModel: PluginRuntimeGeneration` and a new
+instance UUID per startup; its capabilities are exactly:
 
 - `cod4x.player.drop` (`effect.type: DropPlayer`, `reason`)
 - `cod4x.chat.public` (`effect.type: PublicMessage`, `message`)
@@ -138,13 +139,15 @@ complete `correlation`, server/slot/GUID/connection ID/generation, UTC expiry, e
 after non-blocking HTTP completes. Every action rechecks the current target, live host GUID
 and originating request IP revision. A synchronous native disconnect invalidates subsequent
 targeted commands safely. No arbitrary server-command text is accepted.
+When a command includes a runtime descriptor, its executor ID and any supplied instance ID
+and identity model must match this plugin. Agent-observed connections cannot execute here.
 
 Only explicit Enforce dispatches native effects. DryRun reports `WouldExecute` with no drop
 or chat; missing/unknown modes fail closed for native effects. Text must be nonempty,
 at most 256 UTF-8 bytes and contain no C0/DEL controls. Unsupported effects report
 `SkippedUnsupported` without preventing other supported commands.
 
-Results echo execution/action/logical-effect identity and the complete correlation, with a
+Results echo `gameServerId`, execution/action/logical-effect identity and the complete correlation, with a
 timestamp and detail. `Dispatched` means the native API was invoked, **not** confirmed Applied.
 Expired/replaced connections report Stale, malformed commands report Failed when safely
 correlatable, and malformed envelopes/identities are logged without dispatch.

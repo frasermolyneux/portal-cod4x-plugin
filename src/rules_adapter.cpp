@@ -259,12 +259,22 @@ bool PluginRuntime::CompleteRulesEvaluation(ICod4xHost& host, const HttpResponse
         const auto expiryText = command.String("expiresAtUtc");
         const auto* correlation = command.Find("correlation");
         const auto* effect = command.Find("effect");
+        const auto* runtime = command.Find("runtime");
+        const auto runtimeInstance = runtime ? runtime->String("instanceId") : std::nullopt;
+        const auto triggerId = correlation ? correlation->String("triggerId") : std::nullopt;
+        const auto occurrenceId = correlation ? correlation->String("triggerOccurrenceId") : std::nullopt;
+        const auto featureId = correlation ? correlation->String("featureId") : std::nullopt;
+        const auto ruleId = correlation ? correlation->String("ruleId") : std::nullopt;
+        const auto revision = correlation ? correlation->String("ruleSetRevision") : std::nullopt;
+        const auto* siegeSession = correlation ? correlation->Find("siegeSessionId") : nullptr;
         if (command.Integer("protocolVersion") != 1 || !executionId || !IsUuid(*executionId) || !actionId ||
             actionId->empty() || actionId->size() > 256 || !logicalEffectId || logicalEffectId->empty() ||
             logicalEffectId->size() > 256 || !serverId || !IsUuid(*serverId) || !correlation ||
-            correlation->Type != RulesJson::Kind::Object || correlation->String("actionId") != actionId ||
-            !correlation->String("triggerId") || !correlation->String("triggerOccurrenceId") ||
-            !correlation->Find("featureId") || !correlation->Find("ruleId") || !correlation->Find("ruleSetRevision") ||
+            correlation->Type != RulesJson::Kind::Object || correlation->String("actionId") != actionId || !triggerId ||
+            triggerId->empty() || !occurrenceId || !IsUuid(*occurrenceId) || !featureId || featureId->empty() ||
+            !ruleId || ruleId->empty() || !revision || revision->empty() ||
+            (siegeSession && siegeSession->Type != RulesJson::Kind::Null &&
+             (siegeSession->Type != RulesJson::Kind::String || !IsUuid(siegeSession->Scalar))) ||
             !effect || effect->Type != RulesJson::Kind::Object)
         {
             LogError(host, "Invalid rules command identity/protocol; command skipped");
@@ -310,6 +320,14 @@ bool PluginRuntime::CompleteRulesEvaluation(ICod4xHost& host, const HttpResponse
         if (!mode || (*mode != "Enforce" && *mode != "DryRun") || !expiry)
         {
             result = {"Failed", "Invalid mode or expiry"};
+        }
+        else if (runtime && runtime->Type != RulesJson::Kind::Null &&
+                 (runtime->Type != RulesJson::Kind::Object || runtime->String("id") != "cod4x-plugin" ||
+                  (runtime->Find("instanceId") &&
+                   (!runtimeInstance || CanonicalId(*runtimeInstance) != CanonicalId(producerEpoch))) ||
+                  (runtime->Find("identityModel") && runtime->String("identityModel") != "PluginRuntimeGeneration")))
+        {
+            result = {"Stale", "Command executor runtime no longer matches"};
         }
         else if (!serverId || CanonicalId(*serverId) != CanonicalId(serverContext.GameServerId) || !connectionId ||
                  correlation->String("connectionId") != connectionId || !IsUuid(*connectionId) ||
@@ -471,7 +489,8 @@ void PluginRuntime::ResetRulesEvaluation(ICod4xHost& host)
 std::string PluginRuntime::BuildRulesRuntimeCapabilities() const
 {
     return "{\"id\":\"cod4x-plugin\",\"version\":" + RulesJson::Quote(pluginVersion) +
-           ",\"protocolVersion\":1,\"instanceId\":" + RulesJson::Quote(producerEpoch) +
+           ",\"protocolVersion\":1,\"identityModel\":\"PluginRuntimeGeneration\",\"instanceId\":" +
+           RulesJson::Quote(producerEpoch) +
            ",\"startedAtUtc\":" + RulesJson::Quote(ToIso8601Utc(producerStartedUnixSeconds)) +
            ",\"capabilities\":[\"cod4x.player.drop\",\"cod4x.chat.public\",\"cod4x.chat.private\"]}";
 }

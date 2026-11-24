@@ -2780,6 +2780,7 @@ RulesJson CommandForTrigger(const RulesJson& trigger, std::string_view type = "D
         ",\"playerGuid\":" + trigger.Find("playerGuid")->Dump() +
         ",\"connectionId\":" + trigger.Find("connectionId")->Dump() +
         ",\"connectionGeneration\":" + trigger.Find("connectionGeneration")->Dump() +
+        ",\"runtime\":" + trigger.Find("runtime")->Dump() +
         ",\"expiresAtUtc\":\"1970-01-01T01:30:00Z\",\"mode\":\"Enforce\",\"effect\":{\"type\":" +
         quote(type) + ",\"reason\":\"Rules kick\",\"message\":\"Rules message\"}}");
 }
@@ -2824,6 +2825,7 @@ void Runtime_RulesTriggerCapabilitiesAndNativeEffects()
         trigger.String("gameType") == "CallOfDuty4x" &&
         trigger.String("observationId") == trigger.String("triggerOccurrenceId") &&
         trigger.Find("runtime")->String("version") == "0.3.123" &&
+        trigger.Find("runtime")->String("identityModel") == "PluginRuntimeGeneration" &&
         trigger.Find("runtime")->Find("capabilities")->Items.size() == 3,
         "Trigger must report actual version, stable correlation and only real native capabilities");
     const auto connect = std::find_if(host.Requests.begin(), host.Requests.end(), [](const auto& request) {
@@ -2843,7 +2845,7 @@ void Runtime_RulesTriggerCapabilitiesAndNativeEffects()
 
 void Runtime_RulesRejectUnsafeOrStaleCommandsIndependently()
 {
-    for (int scenario = 0; scenario < 14; ++scenario)
+    for (int scenario = 0; scenario < 22; ++scenario)
     {
         const auto config = WriteRuntimeConfig("rules-invalid-" + std::to_string(scenario));
         FakeHost host;
@@ -2871,6 +2873,23 @@ void Runtime_RulesRejectUnsafeOrStaleCommandsIndependently()
             if (scenario == 12)
                 command.Fields["effect"].Fields["type"] = *RulesJsonReader::Parse("\"NativeTempBan\"");
             if (scenario == 13) set("connectionGeneration", "18446744073709551616");
+            if (scenario == 14)
+                command.Fields["runtime"].Fields["id"] = *RulesJsonReader::Parse("\"rcon-agent\"");
+            if (scenario == 15)
+                command.Fields["runtime"].Fields["instanceId"] =
+                    *RulesJsonReader::Parse("\"00000000-2222-3333-4444-555555555555\"");
+            if (scenario == 16) set("runtime", "\"cod4x-plugin\"");
+            if (scenario == 17)
+                command.Fields["correlation"].Fields["featureId"] = *RulesJsonReader::Parse("1");
+            if (scenario == 18)
+                command.Fields["correlation"].Fields["ruleId"] = *RulesJsonReader::Parse("\"\"");
+            if (scenario == 19)
+                command.Fields["correlation"].Fields["triggerOccurrenceId"] = *RulesJsonReader::Parse("\"invalid\"");
+            if (scenario == 20)
+                command.Fields["correlation"].Fields["siegeSessionId"] = *RulesJsonReader::Parse("\"invalid\"");
+            if (scenario == 21)
+                command.Fields["runtime"].Fields["identityModel"] =
+                    *RulesJsonReader::Parse("\"AgentObservedConnection\"");
             // An unsupported or invalid action must not prevent an independent supported action.
             return {200, RulesReply(command.Dump() + "," +
                 CommandForTrigger(trigger, "PrivateMessage", "aaaaaaaa-bbbb-cccc-dddd-000000000001").Dump())};
