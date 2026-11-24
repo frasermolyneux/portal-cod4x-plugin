@@ -6,6 +6,20 @@
 
 namespace portal_cod4x
 {
+std::optional<NativeActionResult> NativeActionExecutor::PreviousResult(const NativeAction& action) const
+{
+    const auto existing = handledActions.find(action.ExecutionId);
+    if (existing == handledActions.end())
+    {
+        return std::nullopt;
+    }
+    if (existing->second.Action != action)
+    {
+        return NativeActionResult{"Failed", "Execution identity reused with different command"};
+    }
+    return existing->second.Result;
+}
+
 NativeActionResult NativeActionExecutor::Execute(ICod4xHost& host, const NativeAction& action,
                                                  const NativeActionTarget& liveTarget)
 {
@@ -15,14 +29,9 @@ NativeActionResult NativeActionExecutor::Execute(ICod4xHost& host, const NativeA
         return {"Failed", "Missing execution identity"};
     }
 
-    const auto existing = handledActions.find(action.ExecutionId);
-    if (existing != handledActions.end())
+    if (const auto previous = PreviousResult(action))
     {
-        if (existing->second.Action != action)
-        {
-            return {"Failed", "Execution identity reused with different command"};
-        }
-        return existing->second.Result;
+        return *previous;
     }
 
     if (action.ExpiresUnixSeconds <= now)

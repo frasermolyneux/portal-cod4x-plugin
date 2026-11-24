@@ -2835,9 +2835,10 @@ void Runtime_RulesTriggerCapabilitiesAndNativeEffects()
         connect->Body.find(*trigger.String("observationId")) != std::string::npos &&
         connect->Body.find("\"rulesEvaluatedByPlugin\":true") != std::string::npos,
         "Mirrored connect event and trigger must share observation identity and ownership metadata");
-    Assert(std::count_if(host.Requests.begin(), host.Requests.end(), [](const auto& request) {
+    Assert(std::count_if(host.Requests.begin(), host.Requests.end(), [&](const auto& request) {
         return request.Url.ends_with("/rules/outcomes") &&
             request.Body.find("\"outcome\":\"Dispatched\"") != std::string::npos &&
+            request.Body.find("\"gameServerId\":" + trigger.Find("gameServerId")->Dump()) != std::string::npos &&
             request.Body.find("\"correlation\":") != std::string::npos;
     }) == 3, "Each native action must report a correlated unconfirmed dispatch outcome");
     RemoveTestConfig(config);
@@ -2845,7 +2846,7 @@ void Runtime_RulesTriggerCapabilitiesAndNativeEffects()
 
 void Runtime_RulesRejectUnsafeOrStaleCommandsIndependently()
 {
-    for (int scenario = 0; scenario < 22; ++scenario)
+    for (int scenario = 0; scenario < 26; ++scenario)
     {
         const auto config = WriteRuntimeConfig("rules-invalid-" + std::to_string(scenario));
         FakeHost host;
@@ -2890,6 +2891,13 @@ void Runtime_RulesRejectUnsafeOrStaleCommandsIndependently()
             if (scenario == 21)
                 command.Fields["runtime"].Fields["identityModel"] =
                     *RulesJsonReader::Parse("\"AgentObservedConnection\"");
+            if (scenario == 22)
+                command.Fields["correlation"].Fields["triggerId"] = *RulesJsonReader::Parse("\"player.ip-resolved\"");
+            if (scenario == 23)
+                command.Fields["correlation"].Fields["triggerOccurrenceId"] =
+                    *RulesJsonReader::Parse("\"00000000-2222-3333-4444-555555555555\"");
+            if (scenario == 24) set("connectionGeneration", "null");
+            if (scenario == 25) command.Fields.erase("runtime");
             // An unsupported or invalid action must not prevent an independent supported action.
             return {200, RulesReply(command.Dump() + "," +
                 CommandForTrigger(trigger, "PrivateMessage", "aaaaaaaa-bbbb-cccc-dddd-000000000001").Dump())};
@@ -3005,44 +3013,177 @@ void RulesJson_RejectsAmbiguousExecutablePayloads()
     const auto fraction = RulesJsonReader::Parse("{\"slotId\":1.0,\"connectionGeneration\":1e3}");
     Assert(fraction && !fraction->Integer("slotId") && !fraction->Unsigned("connectionGeneration"),
         "Numeric target fields must reject floating-point coercion even in syntactically valid JSON");
+    for (const std::string bytes : {"\x80", "\xff", "\xc0\xaf", "\xc2", "\xe0\x80\x80", "\xed\xa0\x80",
+        "\xf0\x80\x80\x80", "\xf4\x90\x80\x80", "\xf5\x80\x80\x80", "\xe2\x28\xa1"})
+        Assert(!RulesJsonReader::Parse("{\"text\":\"" + bytes + "\"}"),
+            "Malformed raw UTF-8 must not reach native APIs through JSON strings");
+    Assert(RulesJsonReader::Parse("{\"text\":\"\xc2\xa3\xe2\x82\xac\xf0\x9f\x98\x80\"}").has_value(),
+        "Valid two-, three- and four-byte raw UTF-8 must remain accepted");
 }
 
 void Runtime_RulesOutcomeResponseContinuesAndMalformedAckRetries()
 {
-    const auto config = WriteRuntimeConfig("rules-outcome-response");
+    for (int malformed = 0; malformed < 3; ++malformed)
+    {
+        const auto config = WriteRuntimeConfig("rules-outcome-response");
+        FakeHost host;
+        ConfigureTestPlayer(host);
+        RulesJson trigger;
+        int acknowledgements = 0;
+        host.ResponseFactory = [&](const auto& request) -> portal_cod4x::HttpResponse {
+            if (request.Url.ends_with("/evaluate"))
+            {
+                trigger = *RulesJsonReader::Parse(request.Body);
+                return {200, RulesReply(CommandForTrigger(trigger, "PrivateMessage").Dump())};
+            }
+            ++acknowledgements;
+            if (acknowledgements == 1)
+                return {200,
+                        malformed == 0 ? "{\"commands\":[]}" : RulesReply({}, malformed == 1 ? "null" : "\"invalid\"")};
+            if (acknowledgements == 2)
+                return {
+                    200,
+                    RulesReply(
+                        CommandForTrigger(trigger, "PublicMessage", "aaaaaaaa-bbbb-cccc-dddd-000000000001").Dump())};
+            return {200, RulesReply()};
+        };
+        portal_cod4x::PluginRuntime runtime(config.string());
+        runtime.Initialize(host, "0.3.0");
+        runtime.HandlePlayerConnect(host, 2, "198.51.100.10");
+        runtime.HandlePlayerConnected(host, 2);
+        TickFrames(runtime, host);
+        Assert(host.PrivateMessages.size() == 1 && host.BroadcastMessages.size() == 1,
+               "Malformed successful HTTP response must not acknowledge outcome or invoke a next action");
+        host.CurrentTime += 5;
+        TickFrames(runtime, host);
+        Assert(acknowledgements >= 3 && host.PrivateMessages.size() == 1 && host.BroadcastMessages.size() == 2,
+               "Retried outcome must advance next native action without repeating the prior effect");
+        runtime.HandlePlayerConnect(host, 2, "198.51.100.11");
+        runtime.Tick(host);
+        Assert(host.OpenRequests > 0, "Test must leave real asynchronous requests in flight");
+        runtime.Shutdown(host);
+        Assert(host.OpenRequests == 0, "Unloading must release all in-flight HTTP handles before module removal");
+        RemoveTestConfig(config);
+    }
+}
+
+void Runtime_RulesCallbackOrderingPreservesConnectedObservation()
+{
+    for (int scenario = 0; scenario < 4; ++scenario)
+    {
+        const auto config = WriteRuntimeConfig("rules-callback-order-" + std::to_string(scenario));
+        FakeHost host;
+        ConfigureTestPlayer(host);
+        host.ResponseFactory = [](const auto& request) -> portal_cod4x::HttpResponse {
+            if (!request.Url.ends_with("/evaluate")) return {200, RulesReply()};
+            const auto trigger = *RulesJsonReader::Parse(request.Body);
+            return {200, RulesReply(trigger.String("triggerId") == "player.connected" ?
+                CommandForTrigger(trigger, "PrivateMessage").Dump() : "")};
+        };
+        portal_cod4x::PluginRuntime runtime(config.string());
+        runtime.Initialize(host, "0.3.0");
+        runtime.HandlePlayerConnect(host, 2, scenario == 1 ? "" : "198.51.100.10");
+        if (scenario == 0 || scenario == 3)
+        {
+            runtime.HandleClientAuthorized(host);
+            runtime.Tick(host);
+        }
+        if (scenario == 3) runtime.HandlePlayerConnect(host, 2, "198.51.100.11");
+        runtime.HandlePlayerConnected(host, 2);
+        if (scenario == 1 || scenario == 2) runtime.HandlePlayerConnect(host, 2, "198.51.100.11");
+        TickFrames(runtime, host, 16);
+        std::string connectedObservation;
+        std::string ipObservation;
+        for (const auto& request : host.Requests)
+        {
+            if (!request.Url.ends_with("/evaluate")) continue;
+            const auto trigger = *RulesJsonReader::Parse(request.Body);
+            if (trigger.String("triggerId") == "player.connected")
+            {
+                connectedObservation = *trigger.String("observationId");
+                if (scenario == 1 || scenario == 2)
+                    Assert(trigger.String("playerIpAddress") == "198.51.100.11",
+                        "A queued connected observation must be enriched rather than discarded on IP change");
+            }
+            else ipObservation = *trigger.String("observationId");
+        }
+        const auto connect = std::find_if(host.Requests.begin(), host.Requests.end(), [](const auto& request) {
+            return request.Url.ends_with("/events/player-connected");
+        });
+        Assert(!connectedObservation.empty() && connect != host.Requests.end() &&
+            connect->Body.find(connectedObservation) != std::string::npos,
+            "Authorization and enter-world paths must share one stable connected observation");
+        Assert(scenario == 0 || (!ipObservation.empty() && ipObservation != connectedObservation),
+            "IP resolution and connected subscriptions require distinct observation identities");
+        Assert(host.PrivateMessages.size() == (scenario == 3 ? 0U : 1U),
+            "Queued connected work must run, but an in-flight pre-IP-change command must stay stale");
+        RemoveTestConfig(config);
+    }
+}
+
+void Runtime_RulesRejectPreviousObservationAfterIpChange()
+{
+    const auto config = WriteRuntimeConfig("rules-old-observation");
     FakeHost host;
     ConfigureTestPlayer(host);
-    RulesJson trigger;
-    int acknowledgements = 0;
+    RulesJson oldCommand;
+    int evaluations = 0;
     host.ResponseFactory = [&](const auto& request) -> portal_cod4x::HttpResponse {
-        if (request.Url.ends_with("/evaluate"))
+        if (!request.Url.ends_with("/evaluate")) return {200, RulesReply()};
+        const auto trigger = *RulesJsonReader::Parse(request.Body);
+        if (++evaluations == 1)
         {
-            trigger = *RulesJsonReader::Parse(request.Body);
-            return {200, RulesReply(CommandForTrigger(trigger, "PrivateMessage").Dump())};
+            oldCommand = CommandForTrigger(trigger);
+            return {200, RulesReply()};
         }
-        ++acknowledgements;
-        if (acknowledgements == 1) return {200, "{\"commands\":[]}"};
-        if (acknowledgements == 2)
-            return {200, RulesReply(CommandForTrigger(trigger, "PublicMessage",
-                "aaaaaaaa-bbbb-cccc-dddd-000000000001").Dump())};
-        return {200, RulesReply()};
+        return {200, RulesReply(oldCommand.Dump() + "," +
+            CommandForTrigger(trigger, "PrivateMessage", "aaaaaaaa-bbbb-cccc-dddd-000000000001").Dump())};
     };
     portal_cod4x::PluginRuntime runtime(config.string());
     runtime.Initialize(host, "0.3.0");
     runtime.HandlePlayerConnect(host, 2, "198.51.100.10");
     runtime.HandlePlayerConnected(host, 2);
     TickFrames(runtime, host);
-    Assert(host.PrivateMessages.size() == 1 && host.BroadcastMessages.size() == 1,
-        "Malformed successful HTTP response must not acknowledge outcome or invoke a next action");
-    host.CurrentTime += 5;
-    TickFrames(runtime, host);
-    Assert(acknowledgements >= 3 && host.PrivateMessages.size() == 1 && host.BroadcastMessages.size() == 2,
-        "Retried outcome must advance next native action without repeating the prior effect");
     runtime.HandlePlayerConnect(host, 2, "198.51.100.11");
-    runtime.Tick(host);
-    Assert(host.OpenRequests > 0, "Test must leave real asynchronous requests in flight");
-    runtime.Shutdown(host);
-    Assert(host.OpenRequests == 0, "Unloading must release all in-flight HTTP handles before module removal");
+    TickFrames(runtime, host, 12);
+    Assert(evaluations == 2 && host.DroppedPlayers.empty() && host.PrivateMessages.size() == 1,
+        "An old correlated decision must not execute through a fresh IP observation");
+    RemoveTestConfig(config);
+}
+
+void Runtime_RulesRedeliveryRetainsDispatchedAfterDisconnect()
+{
+    const auto config = WriteRuntimeConfig("rules-redelivered-drop");
+    FakeHost host;
+    ConfigureTestPlayer(host);
+    RulesJson trigger;
+    int outcomes = 0;
+    host.ResponseFactory = [&](const auto& request) -> portal_cod4x::HttpResponse {
+        if (request.Url.ends_with("/evaluate"))
+        {
+            trigger = *RulesJsonReader::Parse(request.Body);
+            return {200, RulesReply(CommandForTrigger(trigger).Dump())};
+        }
+        if (request.Url.ends_with("/outcomes"))
+        {
+            ++outcomes;
+            const auto result = *RulesJsonReader::Parse(request.Body);
+            Assert(result.String("outcome") == "Dispatched",
+                "Redelivery must preserve the original native outcome after synchronous disconnect");
+            return {200, RulesReply({}, outcomes == 1 ? "\"aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee\"" : "")};
+        }
+        return {200, RulesReply(CommandForTrigger(trigger).Dump())};
+    };
+    portal_cod4x::PluginRuntime runtime(config.string());
+    runtime.Initialize(host, "0.3.0");
+    host.OnDrop = [&](int slot) { runtime.HandlePlayerDisconnected(host, slot); };
+    runtime.HandlePlayerConnect(host, 2, "198.51.100.10");
+    runtime.HandlePlayerConnected(host, 2);
+    TickFrames(runtime, host);
+    host.CurrentTime += 3;
+    TickFrames(runtime, host);
+    Assert(outcomes == 2 && host.DroppedPlayers.size() == 1,
+        "An acknowledged drop may be reported again but must never execute twice");
     RemoveTestConfig(config);
 }
 
@@ -3353,6 +3494,9 @@ int main()
     Runtime_RulesRechecksConnectionAndSupportsReentrantDisconnect();
     Runtime_RulesOutcomesRetryAndCloudContinuationPolls();
     Runtime_RulesOutcomeResponseContinuesAndMalformedAckRetries();
+    Runtime_RulesCallbackOrderingPreservesConnectedObservation();
+    Runtime_RulesRejectPreviousObservationAfterIpChange();
+    Runtime_RulesRedeliveryRetainsDispatchedAfterDisconnect();
     Runtime_RulesIndependentFeatureContinuationsAreNotLost();
     Runtime_RulesSnapshotsRetainRuntimeAndExactDisconnectIdentity();
     Runtime_PortalTempBansExpireOfflineWithoutAffectingPermanentBans();

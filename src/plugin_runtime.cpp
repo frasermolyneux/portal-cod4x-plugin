@@ -877,6 +877,7 @@ void PluginRuntime::HandlePlayerConnected(ICod4xHost& host, int slot)
         prior->second.PlayerGuid == currentGuid)
     {
         prior->second.ConnectionId.clear();
+        prior->second.ConnectedObservationId.clear();
         prior->second.ConnectionGeneration = ++nextConnectionGeneration;
         prior->second.IpAddress.clear();
         prior->second.GuidOnlyEvaluationQueued = false;
@@ -951,7 +952,11 @@ void PluginRuntime::HandlePlayerConnected(ICod4xHost& host, int slot)
         return;
     }
 
-    const std::string messageId = GenerateMessageId();
+    if (playerState.ConnectedObservationId.empty())
+    {
+        playerState.ConnectedObservationId = GenerateMessageId();
+    }
+    const std::string messageId = playerState.ConnectedObservationId;
     BufferEvent(
         std::string(kQueuePlayerConnected),
         BuildPlayerConnectedPayload(
@@ -971,7 +976,7 @@ void PluginRuntime::HandlePlayerConnected(ICod4xHost& host, int slot)
     {
         BufferPlaytimeObservation(nowUnixSeconds, 1, playtimeFields);
     }
-    QueueRulesEvaluation(host, playerState, messageId);
+    QueueRulesEvaluation(host, playerState, playerState.GuidOnlyEvaluationQueued ? std::string_view{} : messageId);
 }
 
 void PluginRuntime::HandleClientAuthorized(ICod4xHost& host)

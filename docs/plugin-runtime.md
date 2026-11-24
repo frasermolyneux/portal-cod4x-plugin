@@ -139,8 +139,10 @@ complete `correlation`, server/slot/GUID/connection ID/generation, UTC expiry, e
 after non-blocking HTTP completes. Every action rechecks the current target, live host GUID
 and originating request IP revision. A synchronous native disconnect invalidates subsequent
 targeted commands safely. No arbitrary server-command text is accepted.
-When a command includes a runtime descriptor, its executor ID and any supplied instance ID
-and identity model must match this plugin. Agent-observed connections cannot execute here.
+The command runtime descriptor must match this plugin's executor ID, version, protocol,
+instance ID, start time and identity model. Agent-observed connections cannot execute here;
+plugin targets require a non-null generation. Trigger correlation must match the retained
+observation before a new native effect is dispatched.
 
 Only explicit Enforce dispatches native effects. DryRun reports `WouldExecute` with no drop
 or chat; missing/unknown modes fail closed for native effects. Text must be nonempty,

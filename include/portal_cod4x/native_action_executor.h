@@ -2,6 +2,7 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <optional>
 #include <string>
 #include <unordered_map>
 
@@ -48,6 +49,7 @@ struct NativeActionResult
 class NativeActionExecutor
 {
   public:
+    std::optional<NativeActionResult> PreviousResult(const NativeAction& action) const;
     NativeActionResult Execute(ICod4xHost& host, const NativeAction& action, const NativeActionTarget& liveTarget);
 
   private:

@@ -162,6 +162,7 @@ private:
     {
         std::string PlayerGuid;
         std::string ConnectionId;
+        std::string ConnectedObservationId;
         std::string Username;
         std::string IpAddress;
         int SlotId = -1;

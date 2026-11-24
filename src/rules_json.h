@@ -267,6 +267,32 @@ class RulesJsonReader
             if (c != '\\')
             {
                 result += static_cast<char>(c);
+                if (c >= 0x80)
+                {
+                    const unsigned length = c >= 0xc2 && c <= 0xdf   ? 2
+                                            : c >= 0xe0 && c <= 0xef ? 3
+                                            : c >= 0xf0 && c <= 0xf4 ? 4
+                                                                     : 0;
+                    if (length == 0 || input.size() - position < length - 1)
+                    {
+                        return std::nullopt;
+                    }
+                    const unsigned char next = input[position];
+                    if ((c == 0xe0 && next < 0xa0) || (c == 0xed && next >= 0xa0) || (c == 0xf0 && next < 0x90) ||
+                        (c == 0xf4 && next > 0x8f))
+                    {
+                        return std::nullopt;
+                    }
+                    for (unsigned i = 1; i < length; ++i)
+                    {
+                        const unsigned char continuation = input[position++];
+                        if ((continuation & 0xc0) != 0x80)
+                        {
+                            return std::nullopt;
+                        }
+                        result += static_cast<char>(continuation);
+                    }
+                }
                 continue;
             }
             if (position == input.size())

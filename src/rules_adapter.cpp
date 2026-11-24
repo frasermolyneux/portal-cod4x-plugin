@@ -129,7 +129,13 @@ void PluginRuntime::QueueRulesEvaluation(ICod4xHost& host, ConnectedPlayerState&
     trigger.IpRevision = player.IpRevision;
     trigger.TriggerId = player.GuidOnlyEvaluationQueued || !player.LastRulesEvaluationIp.empty() ? "player.ip-resolved"
                                                                                                  : "player.connected";
-    trigger.ObservationId = observationId.empty() ? GenerateMessageId() : std::string(observationId);
+    if (trigger.TriggerId == "player.connected" && player.ConnectedObservationId.empty())
+    {
+        player.ConnectedObservationId = observationId.empty() ? GenerateMessageId() : std::string(observationId);
+    }
+    trigger.ObservationId = trigger.TriggerId == "player.connected" ? player.ConnectedObservationId
+                            : observationId.empty()                 ? GenerateMessageId()
+                                                                    : std::string(observationId);
     trigger.OccurredUnixSeconds = host.GetUnixTimeSeconds();
     pendingRulesEvaluations.push_back(std::move(trigger));
     if (hasIp)
@@ -200,6 +206,12 @@ bool PluginRuntime::StartRulesEvaluationRequest(ICod4xHost& host, std::int64_t n
         {
             auto target = std::move(pendingRulesEvaluations.front());
             pendingRulesEvaluations.pop_front();
+            const auto player = connectedPlayers.find(target.SlotId);
+            if (target.TriggerId == "player.connected" && player != connectedPlayers.end())
+            {
+                target.IpAddress = player->second.IpAddress;
+                target.IpRevision = player->second.IpRevision;
+            }
             if (!IsCurrentRulesTarget(host, target))
             {
                 continue;
@@ -243,6 +255,14 @@ bool PluginRuntime::CompleteRulesEvaluation(ICod4xHost& host, const HttpResponse
     {
         LogError(host, "Invalid rules response; no native effects dispatched");
         return false;
+    }
+    for (const auto& execution : continuations->Items)
+    {
+        if (execution.Type != RulesJson::Kind::String || !IsUuid(execution.Scalar))
+        {
+            LogError(host, "Invalid rules continuation identity; response rejected");
+            return false;
+        }
     }
 
     for (const auto& command : commands->Items)
@@ -321,16 +341,24 @@ bool PluginRuntime::CompleteRulesEvaluation(ICod4xHost& host, const HttpResponse
         {
             result = {"Failed", "Invalid mode or expiry"};
         }
-        else if (runtime && runtime->Type != RulesJson::Kind::Null &&
-                 (runtime->Type != RulesJson::Kind::Object || runtime->String("id") != "cod4x-plugin" ||
-                  (runtime->Find("instanceId") &&
-                   (!runtimeInstance || CanonicalId(*runtimeInstance) != CanonicalId(producerEpoch))) ||
-                  (runtime->Find("identityModel") && runtime->String("identityModel") != "PluginRuntimeGeneration")))
+        else if (!runtime || runtime->Type != RulesJson::Kind::Object || runtime->String("id") != "cod4x-plugin" ||
+                 runtime->String("version") != pluginVersion || runtime->Integer("protocolVersion") != 1 ||
+                 !runtimeInstance || CanonicalId(*runtimeInstance) != CanonicalId(producerEpoch) ||
+                 runtime->String("identityModel") != "PluginRuntimeGeneration" ||
+                 ParseUtcTimestamp(runtime->String("startedAtUtc").value_or("")) != producerStartedUnixSeconds)
         {
             result = {"Stale", "Command executor runtime no longer matches"};
         }
-        else if (!serverId || CanonicalId(*serverId) != CanonicalId(serverContext.GameServerId) || !connectionId ||
-                 correlation->String("connectionId") != connectionId || !IsUuid(*connectionId) ||
+        else if (CanonicalId(*serverId) != CanonicalId(serverContext.GameServerId))
+        {
+            result = {"Stale", "Command server no longer matches"};
+        }
+        else if (const auto previous = nativeActionExecutor.PreviousResult(action))
+        {
+            result = *previous;
+        }
+        else if (!connectionId || correlation->String("connectionId") != connectionId || !IsUuid(*connectionId) ||
+                 *triggerId != target.TriggerId || CanonicalId(*occurrenceId) != CanonicalId(target.ObservationId) ||
                  action.Target.PlayerGuid != target.PlayerGuid || action.Target.SlotId != target.SlotId ||
                  action.Target.Generation != target.ConnectionGeneration ||
                  action.Target.ConnectionId != CanonicalId(target.ConnectionId) || !IsCurrentRulesTarget(host, target))
@@ -380,11 +408,6 @@ bool PluginRuntime::CompleteRulesEvaluation(ICod4xHost& host, const HttpResponse
     }
     for (const auto& execution : continuations->Items)
     {
-        if (execution.Type != RulesJson::Kind::String || !IsUuid(execution.Scalar))
-        {
-            LogError(host, "Invalid rules continuation identity");
-            continue;
-        }
         if (std::find(poll.ExecutionIds.begin(), poll.ExecutionIds.end(), execution.Scalar) == poll.ExecutionIds.end())
         {
             poll.ExecutionIds.push_back(execution.Scalar);
