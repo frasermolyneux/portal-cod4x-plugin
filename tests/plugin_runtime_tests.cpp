@@ -2758,9 +2758,10 @@ namespace
 using portal_cod4x::RulesJson;
 using portal_cod4x::RulesJsonReader;
 
-std::string RulesReply(std::string commands = {}, std::string executionIds = {})
+std::string RulesReply(std::string commands = {}, std::string executionIds = {}, bool retryTrigger = false)
 {
-    return "{\"protocolVersion\":1,\"commands\":[" + commands + "],\"executionIds\":[" + executionIds + "]}";
+    return "{\"protocolVersion\":1,\"commands\":[" + commands + "],\"executionIds\":[" + executionIds +
+        "],\"retryTrigger\":" + (retryTrigger ? "true" : "false") + "}";
 }
 
 RulesJson CommandForTrigger(const RulesJson& trigger, std::string_view type = "DropPlayer",
@@ -3023,7 +3024,7 @@ void RulesJson_RejectsAmbiguousExecutablePayloads()
 
 void Runtime_RulesOutcomeResponseContinuesAndMalformedAckRetries()
 {
-    for (int malformed = 0; malformed < 3; ++malformed)
+    for (int malformed = 0; malformed < 4; ++malformed)
     {
         const auto config = WriteRuntimeConfig("rules-outcome-response");
         FakeHost host;
@@ -3037,6 +3038,8 @@ void Runtime_RulesOutcomeResponseContinuesAndMalformedAckRetries()
                 return {200, RulesReply(CommandForTrigger(trigger, "PrivateMessage").Dump())};
             }
             ++acknowledgements;
+            if (acknowledgements == 1 && malformed == 3)
+                return {200, R"({"protocolVersion":1,"commands":[],"executionIds":[],"retryTrigger":"true"})"};
             if (acknowledgements == 1)
                 return {200,
                         malformed == 0 ? "{\"commands\":[]}" : RulesReply({}, malformed == 1 ? "null" : "\"invalid\"")};
@@ -3185,6 +3188,103 @@ void Runtime_RulesRedeliveryRetainsDispatchedAfterDisconnect()
     Assert(outcomes == 2 && host.DroppedPlayers.size() == 1,
         "An acknowledged drop may be reported again but must never execute twice");
     RemoveTestConfig(config);
+}
+
+void Runtime_RulesPartialStartsRetryOriginalTriggerWithoutReplayingEffects()
+{
+    const auto config = WriteRuntimeConfig("rules-partial-start");
+    FakeHost host;
+    ConfigureTestPlayer(host);
+    std::string originalBody;
+    int evaluations = 0;
+    int polls = 0;
+    host.ResponseFactory = [&](const auto& request) -> portal_cod4x::HttpResponse {
+        if (request.Url.ends_with("/evaluate"))
+        {
+            ++evaluations;
+            if (originalBody.empty()) originalBody = request.Body;
+            Assert(request.Body == originalBody, "Partial-start retries must preserve the exact original trigger");
+            if (evaluations == 2) return {503, ""};
+            const auto trigger = *RulesJsonReader::Parse(request.Body);
+            return {200, RulesReply(CommandForTrigger(trigger, "PrivateMessage").Dump() +
+                (evaluations == 3 ? "," + CommandForTrigger(trigger, "PublicMessage",
+                    "aaaaaaaa-bbbb-cccc-dddd-000000000001").Dump() : ""),
+                evaluations < 3 ? "\"aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee\"" : "", evaluations < 3)};
+        }
+        if (request.Url.ends_with("/poll"))
+        {
+            ++polls;
+            return {200, RulesReply({}, evaluations < 3 ? "\"aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee\"" : "")};
+        }
+        return {200, RulesReply({}, evaluations < 3 ? "\"aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee\"" : "")};
+    };
+    portal_cod4x::PluginRuntime runtime(config.string());
+    runtime.Initialize(host, "0.3.0");
+    runtime.HandlePlayerConnect(host, 2, "198.51.100.10");
+    runtime.HandlePlayerConnected(host, 2);
+    TickFrames(runtime, host, 12);
+    Assert(evaluations == 1 && host.PrivateMessages.size() == 1,
+        "A missing provider start must not suppress healthy native work");
+    host.CurrentTime += 4;
+    TickFrames(runtime, host, 12);
+    Assert(evaluations == 1 && polls > 0, "Healthy continuation must proceed during the trigger retry backoff");
+    host.CurrentTime += 1;
+    TickFrames(runtime, host, 12);
+    Assert(evaluations == 2 && host.PrivateMessages.size() == 1,
+        "Trigger retry must use five-second backoff and survive a transient retry failure");
+    host.CurrentTime += 5;
+    TickFrames(runtime, host, 20);
+    Assert(evaluations == 3 && host.PrivateMessages.size() == 1 && host.BroadcastMessages.size() == 2,
+        "Recovered missing work must execute without replaying the healthy effect");
+    host.CurrentTime += 5;
+    TickFrames(runtime, host, 12);
+    Assert(evaluations == 3, "retryTrigger=false on evaluate must stop trigger retries");
+    RemoveTestConfig(config);
+}
+
+void Runtime_RulesTriggerRetriesExpireAndRejectChangedConnections()
+{
+    for (int scenario = 0; scenario < 4; ++scenario)
+    {
+        const auto config = WriteRuntimeConfig("rules-retry-expiry-" + std::to_string(scenario));
+        FakeHost host;
+        ConfigureTestPlayer(host);
+        std::string originalBody;
+        int originalAttempts = 0;
+        host.ResponseFactory = [&](const auto& request) -> portal_cod4x::HttpResponse {
+            if (!request.Url.ends_with("/evaluate")) return {200, RulesReply()};
+            if (originalBody.empty()) originalBody = request.Body;
+            if (request.Body != originalBody) return {200, RulesReply()};
+            ++originalAttempts;
+            return {200, RulesReply({}, {}, true)};
+        };
+        portal_cod4x::PluginRuntime runtime(config.string());
+        runtime.Initialize(host, "0.3.0");
+        runtime.HandlePlayerConnect(host, 2, "198.51.100.10");
+        runtime.HandlePlayerConnected(host, 2);
+        TickFrames(runtime, host);
+        if (scenario == 1)
+        {
+            host.CurrentTime += 115;
+            TickFrames(runtime, host);
+        }
+        if (scenario == 2) runtime.HandlePlayerConnect(host, 2, "198.51.100.11");
+        if (scenario == 3)
+        {
+            runtime.HandlePlayerDisconnected(host, 2);
+            runtime.HandlePlayerConnect(host, 2, "198.51.100.10");
+            runtime.HandlePlayerConnected(host, 2);
+        }
+        host.CurrentTime += scenario == 0 ? 120 : 5;
+        TickFrames(runtime, host, 12);
+        Assert(originalAttempts == (scenario == 1 ? 2 : 1),
+            "Retry lifetime must not reset, and stale connection/IP snapshots must never be resubmitted");
+        const auto expected = scenario < 2 ? "Rules trigger retry expired" : "Rules trigger retry invalidated";
+        Assert(std::any_of(host.Logs.begin(), host.Logs.end(), [&](const auto& log) {
+            return log.find(expected) != std::string::npos;
+        }), "Abandoned trigger recovery must emit an explicit expiry or invalidation diagnostic");
+        RemoveTestConfig(config);
+    }
 }
 
 void Runtime_RulesIndependentFeatureContinuationsAreNotLost()
@@ -3497,6 +3597,8 @@ int main()
     Runtime_RulesCallbackOrderingPreservesConnectedObservation();
     Runtime_RulesRejectPreviousObservationAfterIpChange();
     Runtime_RulesRedeliveryRetainsDispatchedAfterDisconnect();
+    Runtime_RulesPartialStartsRetryOriginalTriggerWithoutReplayingEffects();
+    Runtime_RulesTriggerRetriesExpireAndRejectChangedConnections();
     Runtime_RulesIndependentFeatureContinuationsAreNotLost();
     Runtime_RulesSnapshotsRetainRuntimeAndExactDisconnectIdentity();
     Runtime_PortalTempBansExpireOfflineWithoutAffectingPermanentBans();

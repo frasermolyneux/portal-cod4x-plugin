@@ -14,6 +14,7 @@ namespace portal_cod4x
 namespace
 {
 constexpr std::int64_t kRequestDeadlineSeconds = 10;
+constexpr std::int64_t kTriggerRetryLifetimeSeconds = 120;
 constexpr std::size_t kMaxPendingTriggers = 64;
 constexpr std::size_t kMaxPendingOutcomes = 1000;
 
@@ -179,11 +180,32 @@ void PluginRuntime::AdvanceRulesEvaluation(ICod4xHost& host, std::int64_t now)
             retry.NextPollUnixSeconds = now + 5;
             RetainRulesPoll(host, std::move(retry));
         }
+        else
+        {
+            RetainRulesTrigger(host, target);
+        }
     }
 }
 
 bool PluginRuntime::StartRulesEvaluationRequest(ICod4xHost& host, std::int64_t now)
 {
+    std::erase_if(pendingRulesEvaluations, [&](const auto& entry) {
+        if (entry.TriggerPayloadJson.empty())
+        {
+            return false;
+        }
+        if (now - entry.OccurredUnixSeconds >= kTriggerRetryLifetimeSeconds)
+        {
+            LogError(host, "Rules trigger retry expired after 120 seconds from original observation");
+            return true;
+        }
+        if (!IsCurrentRulesTarget(host, entry))
+        {
+            LogError(host, "Rules trigger retry invalidated; original connection or IP no longer matches");
+            return true;
+        }
+        return false;
+    });
     std::erase_if(pendingRulesPolls, [&](const auto& entry) {
         if (now - entry.OccurredUnixSeconds <= 15 * 60)
         {
@@ -194,7 +216,9 @@ bool PluginRuntime::StartRulesEvaluationRequest(ICod4xHost& host, std::int64_t n
     });
     auto readyPoll = std::find_if(pendingRulesPolls.begin(), pendingRulesPolls.end(),
                                   [now](const auto& poll) { return poll.NextPollUnixSeconds <= now; });
-    const bool poll = readyPoll != pendingRulesPolls.end() && (pendingRulesEvaluations.empty() || preferRulesPoll);
+    const bool hasReadyTrigger = std::any_of(pendingRulesEvaluations.begin(), pendingRulesEvaluations.end(),
+                                             [now](const auto& trigger) { return trigger.NextPollUnixSeconds <= now; });
+    const bool poll = readyPoll != pendingRulesPolls.end() && (!hasReadyTrigger || preferRulesPoll);
     if (poll)
     {
         activeRulesEvaluation = std::move(*readyPoll);
@@ -202,12 +226,18 @@ bool PluginRuntime::StartRulesEvaluationRequest(ICod4xHost& host, std::int64_t n
     }
     else
     {
-        while (!pendingRulesEvaluations.empty())
+        for (auto entry = pendingRulesEvaluations.begin(); entry != pendingRulesEvaluations.end();)
         {
-            auto target = std::move(pendingRulesEvaluations.front());
-            pendingRulesEvaluations.pop_front();
+            if (entry->NextPollUnixSeconds > now)
+            {
+                ++entry;
+                continue;
+            }
+            auto target = std::move(*entry);
+            entry = pendingRulesEvaluations.erase(entry);
             const auto player = connectedPlayers.find(target.SlotId);
-            if (target.TriggerId == "player.connected" && player != connectedPlayers.end())
+            if (target.TriggerPayloadJson.empty() && target.TriggerId == "player.connected" &&
+                player != connectedPlayers.end())
             {
                 target.IpAddress = player->second.IpAddress;
                 target.IpRevision = player->second.IpRevision;
@@ -224,9 +254,14 @@ bool PluginRuntime::StartRulesEvaluationRequest(ICod4xHost& host, std::int64_t n
     {
         return false;
     }
-    rulesEvaluationRequest =
-        host.BeginHttpRequest(loadedConfig->IngestBaseUrl + (poll ? "/rules/poll" : "/rules/evaluate"), "POST",
-                              BuildRulesEvaluationPayload(*activeRulesEvaluation), Headers(*loadedConfig));
+    if (!poll && activeRulesEvaluation->TriggerPayloadJson.empty())
+    {
+        activeRulesEvaluation->TriggerPayloadJson = BuildRulesEvaluationPayload(*activeRulesEvaluation);
+    }
+    rulesEvaluationRequest = host.BeginHttpRequest(
+        loadedConfig->IngestBaseUrl + (poll ? "/rules/poll" : "/rules/evaluate"), "POST",
+        poll ? BuildRulesEvaluationPayload(*activeRulesEvaluation) : activeRulesEvaluation->TriggerPayloadJson,
+        Headers(*loadedConfig));
     if (!rulesEvaluationRequest)
     {
         LogError(host, "Unable to start rules request");
@@ -234,6 +269,10 @@ bool PluginRuntime::StartRulesEvaluationRequest(ICod4xHost& host, std::int64_t n
         {
             activeRulesEvaluation->NextPollUnixSeconds = now + 5;
             RetainRulesPoll(host, *activeRulesEvaluation);
+        }
+        else
+        {
+            RetainRulesTrigger(host, *activeRulesEvaluation);
         }
         activeRulesEvaluation.reset();
         return false;
@@ -249,9 +288,12 @@ bool PluginRuntime::CompleteRulesEvaluation(ICod4xHost& host, const HttpResponse
     const auto document = RulesJsonReader::Parse(response.Body);
     const auto* commands = document ? document->Find("commands") : nullptr;
     const auto* continuations = document ? document->Find("executionIds") : nullptr;
+    const auto* retryTrigger = document ? document->Find("retryTrigger") : nullptr;
     if (!document || document->Integer("protocolVersion") != 1 || !commands ||
         commands->Type != RulesJson::Kind::Array || commands->Items.size() > 64 || !continuations ||
-        continuations->Type != RulesJson::Kind::Array || continuations->Items.size() > 64)
+        continuations->Type != RulesJson::Kind::Array || continuations->Items.size() > 64 ||
+        (retryTrigger && (retryTrigger->Type != RulesJson::Kind::Boolean ||
+                          (retryTrigger->Scalar == "true" && !target.ExecutionIds.empty()))))
     {
         LogError(host, "Invalid rules response; no native effects dispatched");
         return false;
@@ -419,7 +461,41 @@ bool PluginRuntime::CompleteRulesEvaluation(ICod4xHost& host, const HttpResponse
         poll.NextPollUnixSeconds = host.GetUnixTimeSeconds() + 2;
         RetainRulesPoll(host, std::move(poll));
     }
+    if (target.ExecutionIds.empty())
+    {
+        std::erase_if(pendingRulesEvaluations,
+                      [&](const auto& entry) { return entry.ObservationId == target.ObservationId; });
+        if (retryTrigger && retryTrigger->Scalar == "true")
+        {
+            RetainRulesTrigger(host, target);
+        }
+    }
     return true;
+}
+
+void PluginRuntime::RetainRulesTrigger(ICod4xHost& host, PendingRulesEvaluation trigger)
+{
+    const auto now = host.GetUnixTimeSeconds();
+    if (now - trigger.OccurredUnixSeconds >= kTriggerRetryLifetimeSeconds)
+    {
+        LogError(host, "Rules trigger retry expired after 120 seconds from original observation");
+        return;
+    }
+    if (!IsCurrentRulesTarget(host, trigger))
+    {
+        LogError(host, "Rules trigger retry invalidated; original connection or IP no longer matches");
+        return;
+    }
+    std::erase_if(pendingRulesEvaluations,
+                  [&](const auto& entry) { return entry.ObservationId == trigger.ObservationId; });
+    if (pendingRulesEvaluations.size() >= kMaxPendingTriggers)
+    {
+        pendingRulesEvaluations.pop_front();
+        LogError(host, "Rules trigger queue full; oldest evaluation skipped");
+    }
+    trigger.ExecutionIds.clear();
+    trigger.NextPollUnixSeconds = now + 5;
+    pendingRulesEvaluations.push_back(std::move(trigger));
 }
 
 void PluginRuntime::RetainRulesPoll(ICod4xHost& host, PendingRulesEvaluation poll)

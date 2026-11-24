@@ -223,6 +223,7 @@ private:
         std::uint64_t IpRevision = 0;
         std::string TriggerId;
         std::string ObservationId;
+        std::string TriggerPayloadJson;
         std::int64_t OccurredUnixSeconds = 0;
         std::vector<std::string> ExecutionIds;
         std::int64_t NextPollUnixSeconds = 0;
@@ -332,6 +333,7 @@ private:
     bool IsCurrentRulesTarget(ICod4xHost& host, const PendingRulesEvaluation& target) const;
     std::string BuildRulesRuntimeCapabilities() const;
     void RetainRulesPoll(ICod4xHost& host, PendingRulesEvaluation poll);
+    void RetainRulesTrigger(ICod4xHost& host, PendingRulesEvaluation trigger);
     std::string BuildRulesSnapshotMetadata(std::int64_t nowUnixSeconds,
         const std::string& messageId, long long sequenceId) const;
 

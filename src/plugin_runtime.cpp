@@ -1072,6 +1072,10 @@ void PluginRuntime::HandlePlayerDisconnected(ICod4xHost& host, int slot)
     {
         connectEmittedGuids.erase(state.PlayerGuid);
         std::erase_if(pendingRulesEvaluations, [&](const PendingRulesEvaluation& evaluation) {
+            if (evaluation.ConnectionGeneration == state.ConnectionGeneration && !evaluation.TriggerPayloadJson.empty())
+            {
+                LogError(host, "Rules trigger retry invalidated by connection replacement");
+            }
             return evaluation.ConnectionGeneration == state.ConnectionGeneration;
         });
         state = ConnectedPlayerState{};
@@ -1090,6 +1094,10 @@ void PluginRuntime::HandlePlayerDisconnected(ICod4xHost& host, int slot)
     {
         connectEmittedGuids.erase(state.PlayerGuid);
         std::erase_if(pendingRulesEvaluations, [&](const PendingRulesEvaluation& evaluation) {
+            if (evaluation.ConnectionGeneration == state.ConnectionGeneration && !evaluation.TriggerPayloadJson.empty())
+            {
+                LogError(host, "Rules trigger retry invalidated by disconnect");
+            }
             return evaluation.ConnectionGeneration == state.ConnectionGeneration;
         });
     }

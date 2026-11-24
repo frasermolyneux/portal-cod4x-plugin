@@ -169,6 +169,15 @@ ambiguous destructive effect. All buffers and the deduplication cache are memory
 unload/restart loses unacknowledged results, so exactly-once native execution is not promised.
 `OnTerminate` releases in-flight requests and logs unresolved outcomes/continuations.
 
+Evaluate replies may set `retryTrigger: true` (default false) when a provider failed before
+durably starting a feature. Healthy commands and execution IDs are consumed immediately.
+The plugin retries the identical original trigger after five seconds, retaining its occurrence,
+timestamp and connection/IP snapshot; outcomes/polls never request a trigger retry.
+Successful evaluate replies with false stop this recovery. Transport failures also retain
+the original evaluate payload. Recovery expires 120 seconds after the original observation,
+never extended by retries, or earlier on connection/IP invalidation, with an explicit diagnostic.
+This is bounded delivery recovery, not a local feature cursor or rules interpreter.
+
 ## Coordinated installation and loaded-version proof
 
 Source merges to main automatically build/tag release artifacts. Hold the breaking merge
