@@ -126,6 +126,8 @@ instance UUID per startup; its capabilities are exactly:
 - `cod4x.player.drop` (`effect.type: DropPlayer`, `reason`)
 - `cod4x.chat.public` (`effect.type: PublicMessage`, `message`)
 - `cod4x.chat.private` (`effect.type: PrivateMessage`, `message`)
+- `cod4x.chat.private.recipient` (message-only `recipientTarget`)
+- `cod4x.chat.fragments` (already-prepared, independently claimed message fragments)
 
 No native Ban/TempBan capability or native temporary-ban duration is advertised.
 Observation needs no native effect. KickOnly uses DropPlayer; KickWithRecord, Ban and TempBan
@@ -148,8 +150,60 @@ seven fractional digits is rejected rather than rounded or truncated.
 
 Only explicit Enforce dispatches native effects. DryRun reports `WouldExecute` with no drop
 or chat; missing/unknown modes fail closed for native effects. Text must be nonempty,
-at most 256 UTF-8 bytes and contain no C0/DEL controls. Unsupported effects report
+at most 149 UTF-8 bytes for chat (256 for a drop reason) and contain no C0/DEL controls.
+Chat also rejects malformed UTF-8 and double quotes, which cannot be represented safely
+inside the native `h "..."` command envelope. Unsupported effects report
 `SkippedUnsupported` without preventing other supported commands.
+
+### Prepared fragments and independent recipients
+
+The protocol remains version 1. Cloud producers must check the advertised capabilities
+before sending new fields; an older runtime must be reported unsupported, never used as
+a fallback recipient. A prepared fragment remains one `effect.message` with its own
+`logicalEffectId`; the plugin does not split, truncate, render tokens or retry the whole
+logical message. Optional `deliveryIdentity` carries a lowercase SHA-256 `parentLogicalEffectId`,
+`recipientConnectionId`, `messageIndex` and `fragmentIndex`. Cloud claims own ordering,
+pacing, expiry and partial/uncertain outcomes; commands in a response are invoked in order.
+
+Only `PrivateMessage` accepts `recipientTarget`, containing `gameServerId`, the full
+`runtime` descriptor, `playerGuid`, `slotId`, `connectionId` and a nonzero
+`connectionGeneration`. The recipient must belong to this same server/runtime. The
+top-level command target and correlation still describe the original triggering connection
+and must match the retained request. The recipient's current GUID, connection ID and
+generation are checked immediately before **each** native fragment. A disconnected or
+replaced recipient is Stale; recipient metadata on moderation/public effects fails closed.
+Ordinary private/public/drop commands still require the original trigger to be current,
+including its IP revision. Recipient alerts alone do not require the trigger to remain
+connected or bypass a protection kick.
+
+Existing execution-ID continuation contexts survive a trigger disconnect; polls now also
+carry the current `runtime` descriptor. Cloud validation must authorize independently
+addressed recipient children using that same server/runtime and the original correlation,
+not require the original trigger to remain online. A trigger not durably accepted before
+disconnect cannot be recovered by local trigger retries. Restart/unload still loses local
+continuation contexts, and their existing 15-minute retention is unchanged.
+
+Native chat uses a 149-byte UTF-8 payload budget, **including** prefixes and carried colour
+codes. Source evidence, without live gameplay/chat tests:
+[CoD4x server revision 0223d6f](https://github.com/callofduty4x/CoD4x_Server/tree/0223d6f330521abfd88690c46117fa9b7185b439):
+`src/plugin_exports.c:439` has a 256-byte `Plugin_ChatPrintf` buffer, but
+`tools/cod4_dasm/src/_cg_servercmds_mp.asm:298-303` indexes the client command jump table
+by the command byte; its `h` entry (104) at line 2457 selects the chat handler at line 1078.
+That handler calls `I_strncpyz` with `0x96` (150 including NUL) at lines 1092-1100.
+The client limit is therefore smaller than the native API buffer.
+The host adapter prepends the trusted `0x15` literal-text framing byte, disabling client
+localization before this copy. Without this framing, text matching a translation key can
+expand before truncation even when the input contains no controls. This framing is removed
+before the 149-byte display copy and uses one additional byte of the larger native buffer;
+it is never accepted from user text or included in persisted message fragments. See
+[`SEH_LocalizeTextMessage`](https://github.com/callofduty4x/CoD4x_Client_pub/blob/17182c7bf04b859dea5c0db4acdb0b83c28d6dd2/src/stringed_hooks.c#L175),
+which starts with localization enabled and interprets byte 21 as disabling it.
+
+Plugin-local announcements and command chat responses use the same byte budget in the
+host adapter. Preparation validates the complete ordered list before producing fragments,
+preserves whitespace and item order, prefers word boundaries, keeps UTF-8 scalars and
+`^0`-`^9` colour codes atomic, and carries the active colour within the next fragment's budget.
+Local native calls remain best-effort sequential dispatch, not durable delivery or receipt.
 
 Results echo `gameServerId`, execution/action/logical-effect identity and the complete correlation, with an
 actual UTC subsecond timestamp and detail. A cached dispatch retains its original timestamp on redelivery.
@@ -204,7 +258,7 @@ Verify the actual loaded module with the existing plugin info mechanism and invo
 `pluginVersion`, `loadedConfig=true`, the correct `gameServerId`, and:
 
 ```text
-rulesProtocolVersion=1 nativeCapabilities=cod4x.player.drop,cod4x.chat.public,cod4x.chat.private
+rulesProtocolVersion=1 nativeCapabilities=cod4x.player.drop,cod4x.chat.public,cod4x.chat.private,cod4x.chat.private.recipient,cod4x.chat.fragments
 ```
 
 Health also shows pending trigger/outcome/continuation counts. Confirm a fresh server status

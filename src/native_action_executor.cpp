@@ -1,4 +1,5 @@
 #include "portal_cod4x/native_action_executor.h"
+#include "portal_cod4x/chat_messages.h"
 #include "portal_cod4x/plugin_runtime.h"
 
 #include <algorithm>
@@ -39,6 +40,7 @@ NativeActionResult NativeActionExecutor::Execute(ICod4xHost& host, const NativeA
         return {"Stale", "Command expired"};
     }
 
+    const auto& deliveryTarget = action.RecipientTarget ? *action.RecipientTarget : action.Target;
     NativeActionResult result;
     if (!action.Enforce)
     {
@@ -48,14 +50,20 @@ NativeActionResult NativeActionExecutor::Execute(ICod4xHost& host, const NativeA
     {
         result = {"SkippedUnsupported", "Native effect is not supported by this plugin"};
     }
-    else if (action.Target.ConnectionId.empty() || action.Target.PlayerGuid.empty() || action.Target.Generation == 0 ||
-             action.Target != liveTarget || action.Target.SlotId < 0 || action.Target.SlotId >= host.GetSlotCount() ||
-             host.GetPlayerId(action.Target.SlotId) == 0 ||
-             std::to_string(host.GetPlayerId(action.Target.SlotId)) != action.Target.PlayerGuid)
+    else if (action.RecipientTarget && action.Effect != NativeEffect::PrivateMessage)
+    {
+        result = {"Failed", "Recipient target is only supported for private messages"};
+    }
+    else if (deliveryTarget.ConnectionId.empty() || deliveryTarget.PlayerGuid.empty() ||
+             deliveryTarget.Generation == 0 || deliveryTarget != liveTarget || deliveryTarget.SlotId < 0 ||
+             deliveryTarget.SlotId >= host.GetSlotCount() || host.GetPlayerId(deliveryTarget.SlotId) == 0 ||
+             std::to_string(host.GetPlayerId(deliveryTarget.SlotId)) != deliveryTarget.PlayerGuid)
     {
         result = {"Stale", "Connection no longer matches"};
     }
-    else if (action.Text.empty() || action.Text.size() > 256 ||
+    else if ((action.Effect != NativeEffect::Drop &&
+              (action.Text.size() > kChatPayloadBytes || !IsValidChatText(action.Text))) ||
+             action.Text.empty() || action.Text.size() > 256 ||
              std::any_of(action.Text.begin(), action.Text.end(), [](unsigned char c) { return c < 0x20 || c == 0x7f; }))
     {
         result = {"Failed", "Invalid native effect text"};
@@ -89,7 +97,7 @@ NativeActionResult NativeActionExecutor::Execute(ICod4xHost& host, const NativeA
         host.BroadcastChat(action.Text);
         break;
     case NativeEffect::PrivateMessage:
-        host.SendChat(action.Target.SlotId, action.Text);
+        host.SendChat(deliveryTarget.SlotId, action.Text);
         break;
     case NativeEffect::Unsupported:
         break;

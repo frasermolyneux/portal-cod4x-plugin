@@ -36,6 +36,7 @@ struct NativeAction
     std::string Text;
     std::int64_t ExpiresUnixTicks = 0;
     bool Enforce = false;
+    std::optional<NativeActionTarget> RecipientTarget;
 
     bool operator==(const NativeAction&) const = default;
 };

@@ -1,3 +1,4 @@
+#include "portal_cod4x/chat_messages.h"
 #include "portal_cod4x/plugin_runtime.h"
 #include "rules_json.h"
 
@@ -57,6 +58,7 @@ public:
     int OpenRequests = 0;
     std::function<portal_cod4x::HttpResponse(const RequestRecord&)> ResponseFactory;
     std::function<void(int)> OnDrop;
+    std::function<void(int)> OnChat;
 
     void BroadcastChat(std::string_view message) override
     {
@@ -66,6 +68,8 @@ public:
     void SendChat(int slot, std::string_view message) override
     {
         PrivateMessages.push_back(PrivateChatMessage{slot, std::string(message)});
+        if (OnChat)
+            OnChat(slot);
     }
 
     void Log(std::string_view message) override
@@ -2779,17 +2783,21 @@ RulesJson CommandForTrigger(const RulesJson& trigger, std::string_view type = "D
         ",\"connectionId\":" + trigger.Find("connectionId")->Dump() +
         ",\"featureId\":\"vpn-protection\",\"ruleId\":\"high-risk\"" +
         ",\"ruleSetRevision\":\"1\",\"actionId\":\"drop-player\"}";
-    return *RulesJsonReader::Parse("{\"protocolVersion\":1,\"executionId\":" + quote(executionId) +
-        ",\"actionId\":\"drop-player\",\"logicalEffectId\":" + quote(executionId) +
-        ",\"correlation\":" + correlation +
-        ",\"gameServerId\":" + trigger.Find("gameServerId")->Dump() +
-        ",\"slotId\":" + trigger.Find("slotId")->Dump() +
+    auto command = *RulesJsonReader::Parse(
+        "{\"protocolVersion\":1,\"executionId\":" + quote(executionId) +
+        ",\"actionId\":\"drop-player\",\"logicalEffectId\":" + quote(executionId) + ",\"correlation\":" + correlation +
+        ",\"gameServerId\":" + trigger.Find("gameServerId")->Dump() + ",\"slotId\":" + trigger.Find("slotId")->Dump() +
         ",\"playerGuid\":" + trigger.Find("playerGuid")->Dump() +
-        ",\"connectionId\":" + trigger.Find("connectionId")->Dump() +
-        ",\"connectionGeneration\":" + trigger.Find("connectionGeneration")->Dump() +
-        ",\"runtime\":" + trigger.Find("runtime")->Dump() +
-        ",\"expiresAtUtc\":\"1970-01-01T01:30:00Z\",\"mode\":\"Enforce\",\"effect\":{\"type\":" +
-        quote(type) + ",\"reason\":\"Rules kick\",\"message\":\"Rules message\"}}");
+        ",\"connectionId\":" + trigger.Find("connectionId")->Dump() + ",\"connectionGeneration\":" +
+        trigger.Find("connectionGeneration")->Dump() + ",\"runtime\":" + trigger.Find("runtime")->Dump() +
+        ",\"expiresAtUtc\":\"1970-01-01T01:30:00Z\",\"mode\":\"Enforce\",\"effect\":{\"type\":" + quote(type) +
+        ",\"reason\":\"Rules kick\",\"message\":\"Rules message\"}}");
+    if (type == "PrivateMessage")
+    {
+        command.Fields["deliveryIdentity"] = *RulesJsonReader::Parse(
+            "{\"parentLogicalEffectId\":\"" + std::string(64, 'a') + "\",\"messageIndex\":0,\"fragmentIndex\":0}");
+    }
+    return command;
 }
 
 void TickFrames(portal_cod4x::PluginRuntime& runtime, FakeHost& host, int frames = 8)
@@ -2829,12 +2837,12 @@ void Runtime_RulesTriggerCapabilitiesAndNativeEffects()
     });
     const auto trigger = *RulesJsonReader::Parse(evaluate->Body);
     Assert(trigger.Integer("protocolVersion") == 1 && trigger.String("triggerId") == "player.connected" &&
-        trigger.String("gameType") == "CallOfDuty4x" &&
-        trigger.String("observationId") == trigger.String("triggerOccurrenceId") &&
-        trigger.Find("runtime")->String("version") == "0.3.123" &&
-        trigger.Find("runtime")->String("identityModel") == "PluginRuntimeGeneration" &&
-        trigger.Find("runtime")->Find("capabilities")->Items.size() == 3,
-        "Trigger must report actual version, stable correlation and only real native capabilities");
+               trigger.String("gameType") == "CallOfDuty4x" &&
+               trigger.String("observationId") == trigger.String("triggerOccurrenceId") &&
+               trigger.Find("runtime")->String("version") == "0.3.123" &&
+               trigger.Find("runtime")->String("identityModel") == "PluginRuntimeGeneration" &&
+               trigger.Find("runtime")->Find("capabilities")->Items.size() == 5,
+           "Trigger must report actual version, stable correlation and only real native capabilities");
     const auto connect = std::find_if(host.Requests.begin(), host.Requests.end(), [](const auto& request) {
         return request.Url.ends_with("/events/player-connected");
     });
@@ -2849,6 +2857,149 @@ void Runtime_RulesTriggerCapabilitiesAndNativeEffects()
             request.Body.find("\"correlation\":") != std::string::npos;
     }) == 3, "Each native action must report a correlated unconfirmed dispatch outcome");
     RemoveTestConfig(config);
+}
+
+void ChatMessages_PreserveBoundariesAndRejectInvalidBatches()
+{
+    using portal_cod4x::PrepareChatMessages;
+    const auto exact = PrepareChatMessages({std::string(149, 'a')});
+    Assert(exact && exact->size() == 1 && exact->front().size() == 149, "Exact chat budget must not split");
+    const auto words = PrepareChatMessages({std::string(140, 'a') + " two words after", "last"});
+    Assert(words && *words == std::vector<std::string>{std::string(140, 'a') + " two ", "words after", "last"},
+           "Word splitting must preserve spaces and logical item order");
+    const std::string unicode = "\xf0\x9f\x98\x80";
+    const auto utf8 = PrepareChatMessages({std::string(148, 'a') + unicode});
+    Assert(utf8 && *utf8 == std::vector<std::string>{std::string(148, 'a'), unicode},
+           "UTF8 codepoints must never be split");
+    const auto colours = PrepareChatMessages({std::string(148, 'a') + "^1" + std::string(149, 'b')});
+    Assert(colours && *colours == std::vector<std::string>{std::string(148, 'a'), "^1" + std::string(147, 'b'), "^1bb"},
+           "Colour codes must be atomic and carried within budget");
+    const auto longWord = PrepareChatMessages({std::string(300, 'x')});
+    Assert(longWord && *longWord == std::vector<std::string>{std::string(149, 'x'), std::string(149, 'x'), "xx"},
+           "Unbroken text must split without loss or empty trailing fragments");
+    for (const auto& invalid : std::vector<std::string>{"", "bad\ntext", "bad\"text", std::string("bad\xed\xa0\x80"),
+                                                        std::string("bad\xc0\xaf"), std::string("bad\xf4\x90\x80\x80")})
+    {
+        Assert(!PrepareChatMessages({"valid", invalid}),
+               "Whole local batch must fail before any fragments are returned");
+    }
+}
+
+void Runtime_RulesRecipientMessagesSurviveTriggerDisconnect()
+{
+    for (int scenario = 0; scenario < 16; ++scenario)
+    {
+        const auto config = WriteRuntimeConfig("rules-recipient-" + std::to_string(scenario));
+        FakeHost host;
+        ConfigureTestPlayer(host);
+        host.PlayerIds[3] = 76561198000000002ULL;
+        host.PlayerNames[3] = "Recipient";
+        std::optional<RulesJson> recipient;
+        std::optional<RulesJson> original;
+        auto recipientCommand = [&](const RulesJson& trigger) {
+            auto command = CommandForTrigger(trigger,
+                                             scenario == 5   ? "DropPlayer"
+                                             : scenario == 6 ? "PublicMessage"
+                                                             : "PrivateMessage",
+                                             "aaaaaaaa-bbbb-cccc-dddd-000000000001");
+            auto addressed = *recipient;
+            if (scenario == 1)
+                addressed.Fields["connectionGeneration"] = *RulesJsonReader::Parse("999");
+            if (scenario == 2)
+                addressed.Fields["playerGuid"] = *RulesJsonReader::Parse("\"123\"");
+            if (scenario == 3)
+                addressed.Fields["gameServerId"] = *RulesJsonReader::Parse("\"00000000-2222-3333-4444-555555555555\"");
+            if (scenario == 4)
+                addressed.Fields["runtime"].Fields["instanceId"] =
+                    *RulesJsonReader::Parse("\"00000000-2222-3333-4444-555555555555\"");
+            if (scenario == 7)
+                addressed.Fields.erase("connectionGeneration");
+            command.Fields["recipientTarget"] = addressed;
+            command.Fields["deliveryIdentity"] =
+                *RulesJsonReader::Parse("{\"parentLogicalEffectId\":\"" + std::string(64, 'a') +
+                                        "\",\"messageIndex\":0,\"fragmentIndex\":0,"
+                                        "\"recipientConnectionId\":" +
+                                        recipient->Find("connectionId")->Dump() + "}");
+            if (scenario == 10)
+                command.Fields["expiresAtUtc"] = *RulesJsonReader::Parse("\"1970-01-01T01:00:00Z\"");
+            if (scenario == 11)
+                command.Fields["deliveryIdentity"].Fields["fragmentIndex"] = *RulesJsonReader::Parse("-1");
+            if (scenario == 12)
+                command.Fields["deliveryIdentity"].Fields["recipientConnectionId"] =
+                    *RulesJsonReader::Parse("\"00000000-2222-3333-4444-555555555555\"");
+            if (scenario == 13)
+                command.Fields["slotId"] = *RulesJsonReader::Parse("3");
+            if (scenario == 14)
+                command.Fields["effect"].Fields["message"] =
+                    *RulesJsonReader::Parse(RulesJson::Quote(std::string(150, 'x')));
+            if (scenario == 15)
+                command.Fields["deliveryIdentity"].Fields["parentLogicalEffectId"] =
+                    *RulesJsonReader::Parse("\"invalid-parent\"");
+            return command;
+        };
+        host.ResponseFactory = [&](const auto& request) -> portal_cod4x::HttpResponse {
+            if (request.Url.ends_with("/evaluate"))
+            {
+                const auto trigger = *RulesJsonReader::Parse(request.Body);
+                if (trigger.Integer("slotId") == 3)
+                {
+                    if (!recipient)
+                        recipient = trigger;
+                    return {200, RulesReply()};
+                }
+                original = trigger;
+                return {200, RulesReply(CommandForTrigger(trigger).Dump(), "\"aaaaaaaa-bbbb-cccc-dddd-000000000001\"")};
+            }
+            if (request.Url.ends_with("/poll") && original)
+            {
+                Assert(RulesJsonReader::Parse(request.Body)->Find("runtime") != nullptr,
+                       "Disconnected-trigger poll must include the current executor descriptor");
+                auto command = recipientCommand(*original);
+                std::string commands = command.Dump();
+                if (scenario == 9)
+                {
+                    command.Fields["logicalEffectId"] = *RulesJsonReader::Parse("\"second-fragment\"");
+                    command.Fields["deliveryIdentity"].Fields["fragmentIndex"] = *RulesJsonReader::Parse("1");
+                    commands += "," + command.Dump();
+                }
+                return {200, RulesReply(commands)};
+            }
+            return {200, RulesReply()};
+        };
+        portal_cod4x::PluginRuntime runtime(config.string());
+        runtime.Initialize(host, "0.3.0");
+        runtime.HandlePlayerConnect(host, 3, "198.51.100.11");
+        runtime.HandlePlayerConnected(host, 3);
+        TickFrames(runtime, host);
+        host.OnDrop = [&](int slot) {
+            runtime.HandlePlayerDisconnected(host, slot);
+            host.PlayerIds.erase(slot);
+            if (scenario == 8)
+            {
+                runtime.HandlePlayerDisconnected(host, 3);
+                runtime.HandlePlayerConnect(host, 3, "198.51.100.11");
+                runtime.HandlePlayerConnected(host, 3);
+            }
+        };
+        if (scenario == 9)
+        {
+            host.OnChat = [&](int slot) {
+                runtime.HandlePlayerDisconnected(host, slot);
+                host.PlayerIds.erase(slot);
+            };
+        }
+        runtime.HandlePlayerConnect(host, 2, "198.51.100.10");
+        runtime.HandlePlayerConnected(host, 2);
+        TickFrames(runtime, host);
+        host.CurrentTime += 2;
+        TickFrames(runtime, host, 20);
+        const auto expected = scenario == 0 || scenario == 9 ? 1U : 0U;
+        Assert(host.PrivateMessages.size() == expected && (expected == 0 || host.PrivateMessages.front().Slot == 3),
+               "Recipient fragments must verify their own connection after trigger disconnect and between fragments");
+        Assert(host.DroppedPlayers.size() == 1 && host.BroadcastMessages.size() == 1,
+               "Recipient metadata must never retarget moderation or broadcast effects");
+        RemoveTestConfig(config);
+    }
 }
 
 void Runtime_RulesRejectUnsafeOrStaleCommandsIndependently()
@@ -3641,20 +3792,21 @@ void NativeExecutor_PreventsDuplicateAndCapacityReplay()
             "Unsupported effects must not exhaust supported native effect capacity");
     }
     action.Effect = portal_cod4x::NativeEffect::PrivateMessage;
-    action.Text = std::string(256, 'x');
-    action.ExecutionId = "text-256";
+    action.Text = std::string(149, 'x');
+    action.ExecutionId = "text-149";
     Assert(independent.Execute(host, action, target).Outcome == "Dispatched",
-        "Exactly 256 UTF-8 bytes must be accepted");
-    action.ExecutionId = "text-257";
+           "Exactly 149 UTF-8 bytes must be accepted without re-splitting prepared commands");
+    action.ExecutionId = "text-150";
     action.Text += 'x';
     Assert(independent.Execute(host, action, target).Outcome == "Failed",
-        "257 UTF-8 bytes must be rejected before native invocation");
-    action.ExecutionId = "unicode-256";
+           "150 UTF-8 bytes must be rejected before native invocation");
+    action.ExecutionId = "unicode-148";
     action.Text.clear();
-    for (int i = 0; i < 128; ++i) action.Text += "\xc3\xa9";
+    for (int i = 0; i < 74; ++i)
+        action.Text += "\xc3\xa9";
     Assert(independent.Execute(host, action, target).Outcome == "Dispatched",
         "Text limit counts UTF-8 bytes, not codepoints");
-    action.ExecutionId = "unicode-258";
+    action.ExecutionId = "unicode-150";
     action.Text += "\xc3\xa9";
     Assert(independent.Execute(host, action, target).Outcome == "Failed",
         "Multibyte text above the byte bound must not reach native APIs");
@@ -3696,6 +3848,8 @@ int main()
     Runtime_DisconnectAfterLevelExitDoesNotReuseAnotherPlayersIdentity();
     Runtime_UnobservedConnectionIsNotAssignedAnAdmissionId();
     Runtime_RulesTriggerCapabilitiesAndNativeEffects();
+    ChatMessages_PreserveBoundariesAndRejectInvalidBatches();
+    Runtime_RulesRecipientMessagesSurviveTriggerDisconnect();
     Runtime_RulesRejectUnsafeOrStaleCommandsIndependently();
     Runtime_RulesRechecksConnectionAndSupportsReentrantDisconnect();
     Runtime_RulesOutcomesRetryAndCloudContinuationPolls();
