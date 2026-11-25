@@ -2887,7 +2887,7 @@ void ChatMessages_PreserveBoundariesAndRejectInvalidBatches()
 
 void Runtime_RulesRecipientMessagesSurviveTriggerDisconnect()
 {
-    for (int scenario = 0; scenario < 16; ++scenario)
+    for (int scenario = 0; scenario < 17; ++scenario)
     {
         const auto config = WriteRuntimeConfig("rules-recipient-" + std::to_string(scenario));
         FakeHost host;
@@ -2956,7 +2956,7 @@ void Runtime_RulesRecipientMessagesSurviveTriggerDisconnect()
                        "Disconnected-trigger poll must include the current executor descriptor");
                 auto command = recipientCommand(*original);
                 std::string commands = command.Dump();
-                if (scenario == 9)
+                if (scenario == 9 || scenario == 16)
                 {
                     command.Fields["logicalEffectId"] = *RulesJsonReader::Parse("\"second-fragment\"");
                     command.Fields["deliveryIdentity"].Fields["fragmentIndex"] = *RulesJsonReader::Parse("1");
@@ -2988,12 +2988,16 @@ void Runtime_RulesRecipientMessagesSurviveTriggerDisconnect()
                 host.PlayerIds.erase(slot);
             };
         }
+        if (scenario == 16)
+        {
+            host.OnChat = [&](int) { host.CurrentTime = 5400; };
+        }
         runtime.HandlePlayerConnect(host, 2, "198.51.100.10");
         runtime.HandlePlayerConnected(host, 2);
         TickFrames(runtime, host);
         host.CurrentTime += 2;
         TickFrames(runtime, host, 20);
-        const auto expected = scenario == 0 || scenario == 9 ? 1U : 0U;
+        const auto expected = scenario == 0 || scenario == 9 || scenario == 16 ? 1U : 0U;
         Assert(host.PrivateMessages.size() == expected && (expected == 0 || host.PrivateMessages.front().Slot == 3),
                "Recipient fragments must verify their own connection after trigger disconnect and between fragments");
         Assert(host.DroppedPlayers.size() == 1 && host.BroadcastMessages.size() == 1,
