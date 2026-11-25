@@ -401,6 +401,50 @@ bool PluginRuntime::CompleteRulesEvaluation(ICod4xHost& host, const HttpResponse
         }
         action.Text = effect->String(type == "DropPlayer" ? "reason" : "message").value_or("");
 
+        const auto* recipient = command.Find("recipientTarget");
+        const bool hasRecipient = recipient && recipient->Type != RulesJson::Kind::Null;
+        const auto* deliveryIdentity = command.Find("deliveryIdentity");
+        bool validDeliveryIdentity = true;
+        if (deliveryIdentity && deliveryIdentity->Type != RulesJson::Kind::Null)
+        {
+            const auto parent = deliveryIdentity->String("parentLogicalEffectId");
+            const auto messageIndex = deliveryIdentity->Integer("messageIndex");
+            const auto fragmentIndex = deliveryIdentity->Integer("fragmentIndex");
+            const auto* recipientId = deliveryIdentity->Find("recipientConnectionId");
+            validDeliveryIdentity =
+                (action.Effect == NativeEffect::PublicMessage || action.Effect == NativeEffect::PrivateMessage) &&
+                deliveryIdentity->Type == RulesJson::Kind::Object && parent && parent->size() == 64 &&
+                std::all_of(parent->begin(), parent->end(),
+                            [](unsigned char c) { return (c >= '0' && c <= '9') || (c >= 'a' && c <= 'f'); }) &&
+                messageIndex && *messageIndex >= 0 && *messageIndex <= std::numeric_limits<int>::max() &&
+                fragmentIndex && *fragmentIndex >= 0 && *fragmentIndex <= std::numeric_limits<int>::max() &&
+                (!recipientId || recipientId->Type == RulesJson::Kind::Null ||
+                 (recipientId->Type == RulesJson::Kind::String && IsUuid(recipientId->Scalar) &&
+                  action.Effect == NativeEffect::PrivateMessage &&
+                  (hasRecipient ? recipient->String("connectionId") : connectionId) == recipientId->Scalar));
+        }
+        bool validRecipient = !hasRecipient;
+        if (hasRecipient)
+        {
+            const auto recipientServer = recipient->String("gameServerId");
+            const auto recipientConnection = recipient->String("connectionId");
+            const auto recipientGuid = recipient->String("playerGuid");
+            const auto recipientSlot = recipient->Integer("slotId");
+            const auto recipientGeneration = recipient->Unsigned("connectionGeneration");
+            const auto* recipientRuntime = recipient->Find("runtime");
+            validRecipient =
+                recipient->Type == RulesJson::Kind::Object && action.Effect == NativeEffect::PrivateMessage &&
+                recipientServer && CanonicalId(*recipientServer) == CanonicalId(serverContext.GameServerId) &&
+                recipientConnection && IsUuid(*recipientConnection) && recipientGuid && !recipientGuid->empty() &&
+                recipientSlot && *recipientSlot >= 0 && *recipientSlot < host.GetSlotCount() && recipientGeneration &&
+                *recipientGeneration != 0 && recipientRuntime && runtime && recipientRuntime->Dump() == runtime->Dump();
+            if (validRecipient)
+            {
+                action.RecipientTarget = NativeActionTarget{*recipientGuid, CanonicalId(*recipientConnection),
+                                                            static_cast<int>(*recipientSlot), *recipientGeneration};
+            }
+        }
+
         NativeActionResult result;
         if (!mode || (*mode != "Enforce" && *mode != "DryRun") || !expiry)
         {
@@ -419,6 +463,10 @@ bool PluginRuntime::CompleteRulesEvaluation(ICod4xHost& host, const HttpResponse
         {
             result = {"Stale", "Command server no longer matches"};
         }
+        else if (!validRecipient || !validDeliveryIdentity)
+        {
+            result = {"Failed", "Invalid message recipient or delivery identity"};
+        }
         else if (const auto previous = nativeActionExecutor.PreviousResult(action))
         {
             result = *previous;
@@ -427,13 +475,15 @@ bool PluginRuntime::CompleteRulesEvaluation(ICod4xHost& host, const HttpResponse
                  *triggerId != target.TriggerId || CanonicalId(*occurrenceId) != CanonicalId(target.ObservationId) ||
                  action.Target.PlayerGuid != target.PlayerGuid || action.Target.SlotId != target.SlotId ||
                  action.Target.Generation != target.ConnectionGeneration ||
-                 action.Target.ConnectionId != CanonicalId(target.ConnectionId) || !IsCurrentRulesTarget(host, target))
+                 action.Target.ConnectionId != CanonicalId(target.ConnectionId) ||
+                 (!hasRecipient && !IsCurrentRulesTarget(host, target)))
         {
             result = {"Stale", "Command target or request connection no longer matches"};
         }
         else
         {
-            const auto player = connectedPlayers.find(action.Target.SlotId);
+            const auto& deliveryTarget = action.RecipientTarget ? *action.RecipientTarget : action.Target;
+            const auto player = connectedPlayers.find(deliveryTarget.SlotId);
             NativeActionTarget liveTarget;
             if (player != connectedPlayers.end())
             {
@@ -616,7 +666,8 @@ std::string PluginRuntime::BuildRulesRuntimeCapabilities() const
            ",\"protocolVersion\":1,\"identityModel\":\"PluginRuntimeGeneration\",\"instanceId\":" +
            RulesJson::Quote(producerEpoch) +
            ",\"startedAtUtc\":" + RulesJson::Quote(ToIso8601Utc(producerStartedUnixSeconds)) +
-           ",\"capabilities\":[\"cod4x.player.drop\",\"cod4x.chat.public\",\"cod4x.chat.private\"]}";
+           ",\"capabilities\":[\"cod4x.player.drop\",\"cod4x.chat.public\",\"cod4x.chat.private\","
+           "\"cod4x.chat.private.recipient\",\"cod4x.chat.fragments\"]}";
 }
 
 std::string PluginRuntime::BuildRulesSnapshotMetadata(std::int64_t nowUnixSeconds, const std::string& messageId,
@@ -645,7 +696,7 @@ std::string PluginRuntime::BuildRulesEvaluationPayload(const PendingRulesEvaluat
             }
             payload += RulesJson::Quote(trigger.ExecutionIds[i]);
         }
-        return payload + "]}";
+        return payload + "],\"runtime\":" + BuildRulesRuntimeCapabilities() + "}";
     }
     return payload + ",\"triggerId\":" + RulesJson::Quote(trigger.TriggerId) +
            ",\"triggerOccurrenceId\":" + RulesJson::Quote(trigger.ObservationId) +

@@ -3007,7 +3007,8 @@ std::vector<std::string> PluginRuntime::BuildPortalPluginHealthReportLines(std::
     }
 
     lines.push_back(std::move(identityLine));
-    lines.push_back("rulesProtocolVersion=1 nativeCapabilities=cod4x.player.drop,cod4x.chat.public,cod4x.chat.private");
+    lines.push_back("rulesProtocolVersion=1 nativeCapabilities=cod4x.player.drop,cod4x.chat.public,cod4x.chat.private,"
+                    "cod4x.chat.private.recipient,cod4x.chat.fragments");
     lines.push_back("rulesPendingTriggers=" + std::to_string(pendingRulesEvaluations.size()) +
         " rulesPendingOutcomes=" + std::to_string(pendingRulesOutcomes.size()) +
         " rulesPendingContinuations=" + std::to_string(pendingRulesPolls.size()));

@@ -244,6 +244,8 @@ int main()
     AssertTrue(initResult == 0, "OnInit should return success code.");
     AssertTrue(!g_chats.empty(), "OnInit should send at least one chat message.");
     AssertTrue(g_chats.front().slot == -1, "Startup broadcast should target all players with slot -1.");
+    AssertTrue(g_chats.front().message.front() == '\x15',
+        "Native chat must disable localization so a language key cannot expand beyond the prepared byte budget.");
     AssertTrue(g_chats.front().message.find("version") != std::string::npos, "Startup broadcast should contain a version string.");
     AssertTrue(!g_logs.empty(), "OnInit should emit at least one log message.");
 

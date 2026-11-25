@@ -1,5 +1,6 @@
 #include "cod4x_abi.h"
 
+#include "portal_cod4x/chat_messages.h"
 #include "portal_cod4x/plugin_runtime.h"
 #include "portal_cod4x/plugin_version.h"
 
@@ -131,8 +132,7 @@ class Cod4xHostAdapter final : public portal_cod4x::ICod4xHost
 public:
     void BroadcastChat(std::string_view message) override
     {
-        const std::string payload(message);
-        Plugin_ChatPrintf(kBroadcastSlot, "%s", payload.c_str());
+        DispatchChat(kBroadcastSlot, message);
     }
 
     void SendChat(int slot, std::string_view message) override
@@ -142,8 +142,23 @@ public:
             return;
         }
 
-        const std::string payload(message);
-        Plugin_ChatPrintf(slot, "%s", payload.c_str());
+        DispatchChat(slot, message);
+    }
+
+    void DispatchChat(int slot, std::string_view message)
+    {
+        const auto fragments = portal_cod4x::PrepareChatMessages({std::string(message)});
+        if (!fragments)
+        {
+            Log("Invalid local chat text; no fragments dispatched");
+            return;
+        }
+        for (const auto& fragment : *fragments)
+        {
+            // Disable client localization before its 150-byte chat-buffer copy.
+            const std::string payload = '\x15' + fragment;
+            Plugin_ChatPrintf(slot, "%s", payload.c_str());
+        }
     }
 
     void Log(std::string_view message) override
