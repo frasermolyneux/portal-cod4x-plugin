@@ -11,6 +11,7 @@
 #include <fstream>
 #include <iostream>
 #include <string>
+#include <string_view>
 #include <vector>
 
 namespace
@@ -620,7 +621,10 @@ int main()
     banInfo.steamid = authenticatedSteamId;
     char shortBanMessage[8] = {};
     OnPlayerGetBanStatus(&banInfo, shortBanMessage, sizeof(shortBanMessage));
-    AssertTrue(std::string(shortBanMessage) == "You are" && std::strlen(banInfo.message) > 7,
+    constexpr char expectedBanMessage[] = "You are banned from this server.";
+    AssertTrue(std::string(shortBanMessage) == "You are" &&
+        std::string_view(banInfo.message, sizeof(expectedBanMessage)) ==
+            std::string_view(expectedBanMessage, sizeof(expectedBanMessage)),
         "Ban-status hook must forward verified Steam ID and respect the output buffer bound.");
     banInfo.steamid = 0;
     clearedBanMessage[0] = '\0';

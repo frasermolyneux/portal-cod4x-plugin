@@ -106,7 +106,11 @@ ignores that pointer for Steam matching and reads the client's verified `steamid
 the engine populates from the verified identity. Enter-world, authorization and successful
 refresh enforcement read live slot identities, not a previous occupant's cached Steam ID.
 If Steam verification has not completed, existing player-ID behavior is preserved;
-authorization enforces the Steam ban once verified identity becomes available.
+authorization enforces the Steam ban when that callback arrives with verified identity.
+The reference callback ABI does not establish that every deployed engine emits a new
+authorization callback after late Steam verification. Without that callback, the next
+successful active-ban refresh still checks live verified identity; immediate late-auth
+callback delivery has not been validated on live servers in this workstream.
 
 The cache retains nullable `expires` UTC values (including zone-less SQL UTC date-times);
 temporary entries stop enforcing locally at expiry even while refresh is offline. Permanent
