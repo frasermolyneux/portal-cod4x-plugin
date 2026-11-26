@@ -3982,6 +3982,238 @@ void Runtime_PortalBanOverlapAcrossPagesAndElapsedRefresh()
     RemoveTestConfig(config);
 }
 
+void Runtime_SteamBanMatchingPreservesPlayerIdOwnership()
+{
+    const auto config = WriteRuntimeConfig("steam-ban-ownership");
+    FakeHost host;
+    host.CurrentTime = 5000;
+    const std::string url = "GET https://example.test/ingest/active-bans?gameType=CallOfDuty4x&skipEntries=0&takeEntries=200";
+    host.Responses[url] = {200, "{\"data\":{\"items\":["
+        "{\"Type\":\"Ban\",\"Player\":{\"Guid\":\"101\",\"SteamId\":\"76561198000000001\"}},"
+        "{\"type\":\"Ban\",\"player\":{\"guid\":\"102\",\"steamId\":\"76561198000000001\"}}]}}"};
+    portal_cod4x::PluginRuntime runtime(config.string(), [&] { return host.CurrentTime; });
+    runtime.Initialize(host, "0.3.0");
+    TickFrames(runtime, host);
+    std::string reason;
+    Assert(runtime.TryGetPlayerBanMessage(101, reason, 999) &&
+        runtime.TryGetAuthenticatedPlayerBanMessage(999, reason, 76561198000000001ULL) &&
+        runtime.TryGetPlayerBanMessage(0, reason, 76561198000000001ULL),
+        "Either player ID or verified Steam ID must independently match an active portal ban");
+    Assert(!runtime.TryGetPlayerBanMessage(999, reason, 0) &&
+        !runtime.TryGetAuthenticatedPlayerBanMessage(999, reason, 76561198000000002ULL),
+        "Missing or different Steam identity must not match another profile's ban");
+    runtime.HandlePlayerBanAdded(999, "Native reason", 0, "Native player", 5001);
+    Assert(runtime.TryGetPlayerBanMessage(999, reason, 76561198000000001ULL) && reason == "Native reason",
+        "Native player-ID ban must retain its existing reason before a separate Steam match");
+    host.CurrentTime = 5001;
+    Assert(runtime.TryGetPlayerBanMessage(999, reason, 76561198000000001ULL) &&
+        reason == "You are banned from this server.",
+        "Expired native player-ID ban must not hide an independent active portal Steam ban");
+    runtime.HandlePlayerBanRemoved(999);
+
+    runtime.HandlePlayerBanRemoved(101);
+    Assert(!runtime.TryGetPlayerBanMessage(101, reason) &&
+        runtime.TryGetPlayerBanMessage(101, reason, 76561198000000001ULL),
+        "Player-ID unban must retain another active profile ban sharing the Steam ID");
+    host.Responses[url] = {200, "{\"data\":{\"items\":["
+        "{\"type\":\"Ban\",\"player\":{\"guid\":\"102\",\"steamId\":\"76561198000000001\"}}]}}"};
+    TickFrames(runtime, host);
+    Assert(runtime.TryGetPlayerBanMessage(999, reason, 76561198000000001ULL),
+        "Refresh after a profile lift must preserve the independent shared-Steam ban");
+    host.Responses[url] = {200, "{\"data\":{\"items\":[]}}"};
+    host.CurrentTime += 121;
+    TickFrames(runtime, host);
+    Assert(!runtime.TryGetPlayerBanMessage(999, reason, 76561198000000001ULL),
+        "Removing the last profile ban must remove its Steam association");
+    Assert(std::find(host.ExecutedCommands.begin(), host.ExecutedCommands.end(), "unban 102") !=
+        host.ExecutedCommands.end() &&
+        std::none_of(host.ExecutedCommands.begin(), host.ExecutedCommands.end(), [](const auto& command) {
+            return command == "unban 76561198000000001";
+        }), "Reconciliation unban must remain keyed by player ID, never Steam ID");
+    runtime.Shutdown(host);
+    RemoveTestConfig(config);
+}
+
+void Runtime_SteamBanExpiryAndPaginationRetainIndependentAssociations()
+{
+    const auto config = WriteRuntimeConfig("steam-ban-expiry");
+    FakeHost host;
+    host.CurrentTime = 5000;
+    std::string items;
+    for (int i = 0; i < 200; ++i)
+    {
+        if (i) items += ',';
+        items += "{\"type\":\"TempBan\",\"expires\":\"1970-01-01T01:23:30.5000000Z\","
+            "\"player\":{\"guid\":\"101\",\"steamId\":\"76561198000000001\"}}";
+    }
+    const std::string url = "GET https://example.test/ingest/active-bans?gameType=CallOfDuty4x&skipEntries=";
+    host.Responses[url + "0&takeEntries=200"] = {200, "{\"data\":{\"items\":[" + items + "]}}"};
+    host.Responses[url + "200&takeEntries=200"] = {200, "{\"data\":{\"items\":["
+        "{\"type\":\"Ban\",\"player\":{\"guid\":\"101\",\"steamId\":\"76561198000000002\"}},"
+        "{\"type\":\"TempBan\",\"expires\":\"1970-01-01T01:23:40Z\","
+        "\"player\":{\"guid\":\"102\",\"steamId\":\"76561198000000001\"}}]}}"};
+    portal_cod4x::PluginRuntime runtime(config.string(), [&] { return host.CurrentTime; },
+        [&] { return host.GetUnixTime100Nanoseconds(); });
+    runtime.Initialize(host, "0.3.0");
+    TickFrames(runtime, host);
+    std::string reason;
+    runtime.HandlePlayerBanRemoved(102);
+    host.CurrentTime = 5010;
+    host.CurrentSubsecondTicks = 4999999;
+    Assert(runtime.TryGetAuthenticatedPlayerBanMessage(999, reason, 76561198000000001ULL),
+        "Paginated temporary Steam association must enforce one tick before expiry");
+    host.CurrentSubsecondTicks = 5000000;
+    Assert(!runtime.TryGetAuthenticatedPlayerBanMessage(999, reason, 76561198000000001ULL) &&
+        runtime.TryGetPlayerBanMessage(101, reason) &&
+        runtime.TryGetPlayerBanMessage(999, reason, 76561198000000002ULL),
+        "An expired Steam association must not inherit a different association's permanent expiry");
+    runtime.HandlePlayerBanRemoved(101);
+    Assert(!runtime.TryGetPlayerBanMessage(999, reason, 76561198000000002ULL),
+        "Removing the profile must remove all its paginated Steam associations");
+    runtime.Shutdown(host);
+    RemoveTestConfig(config);
+}
+
+void Runtime_SteamBanRefreshHandlesMissingAndInvalidIdentities()
+{
+    const auto config = WriteRuntimeConfig("steam-ban-invalid");
+    FakeHost host;
+    host.CurrentTime = 5000;
+    const std::string url = "GET https://example.test/ingest/active-bans?gameType=CallOfDuty4x&skipEntries=0&takeEntries=200";
+    host.Responses[url] = {200, "{\"data\":{\"items\":["
+        "{\"type\":\"Ban\",\"player\":{\"guid\":\"101\",\"steamId\":null}},"
+        "{\"type\":\"Ban\",\"player\":{\"guid\":\"102\",\"steamId\":\"\"}},"
+        "{\"type\":\"Ban\",\"player\":{\"guid\":\"103\",\"steamId\":\"0\"}},"
+        "{\"type\":\"Ban\",\"player\":{\"guid\":\"104\"}},"
+        "{\"type\":\"Ban\",\"player\":{\"guid\":\"105\",\"steamId\":\"76561198000000001\"}}]}}"};
+    portal_cod4x::PluginRuntime runtime(config.string(), [&] { return host.CurrentTime; });
+    runtime.Initialize(host, "0.3.0");
+    TickFrames(runtime, host);
+    std::string reason;
+    for (const auto playerId : {101ULL, 102ULL, 103ULL, 104ULL})
+        Assert(runtime.TryGetPlayerBanMessage(playerId, reason), "Absent Steam ID must preserve player-ID enforcement");
+    Assert(!runtime.TryGetPlayerBanMessage(999, reason) && !runtime.TryGetPlayerBanMessage(0, reason),
+        "Null, blank, omitted and zero Steam IDs must not create wildcard bans");
+    for (const auto* invalid : {"42", "\"-1\"", "\"76561198000000001x\"", "\"18446744073709551616\"",
+        "\"76561198000000002\",\"SteamId\":\"76561198000000003\""})
+    {
+        host.Responses[url] = {200, "{\"data\":{\"items\":["
+            "{\"type\":\"Ban\",\"player\":{\"guid\":\"106\",\"steamId\":" + std::string(invalid) + "}}]}}"};
+        host.CurrentTime += 121;
+        TickFrames(runtime, host);
+        Assert(runtime.TryGetPlayerBanMessage(999, reason, 76561198000000001ULL) &&
+            !runtime.TryGetPlayerBanMessage(106, reason),
+            "Malformed Steam identity must reject the entire refresh and retain the prior cache");
+    }
+    Assert(std::any_of(host.Logs.begin(), host.Logs.end(), [](const auto& log) {
+        return log.find("Invalid active-ban page or expiry") != std::string::npos;
+    }), "Invalid Steam identity must surface a refresh error");
+    runtime.Shutdown(host);
+    RemoveTestConfig(config);
+}
+
+void Runtime_SteamBansEnforceFreshVerifiedSlotIdentity()
+{
+    const auto config = WriteRuntimeConfig("steam-ban-live");
+    FakeHost host;
+    ConfigureTestPlayer(host);
+    host.PlayerSteamIds[2] = 76561198000000002ULL;
+    host.Responses["GET https://example.test/ingest/active-bans?gameType=CallOfDuty4x&skipEntries=0&takeEntries=200"] =
+        {200, "{\"data\":{\"items\":[{\"type\":\"Ban\","
+        "\"player\":{\"guid\":\"101\",\"steamId\":\"76561198000000001\"}}]}}"};
+    portal_cod4x::PluginRuntime runtime(config.string());
+    runtime.Initialize(host, "0.3.0");
+    runtime.HandlePlayerConnect(host, 2, "198.51.100.10");
+    runtime.HandlePlayerConnected(host, 2);
+    TickFrames(runtime, host);
+    Assert(host.DroppedPlayers.empty(), "Different verified Steam identity must not proactively drop");
+    host.PlayerSteamIds[2] = 76561198000000001ULL;
+    runtime.HandleClientAuthorized(host);
+    Assert(host.DroppedPlayers.size() == 1 && host.DroppedPlayers.back().Slot == 2,
+        "Late authorization must enforce newly verified Steam identity without awaiting refresh");
+    host.PlayerIds[2] = 999;
+    host.PlayerSteamIds[2] = 76561198000000002ULL;
+    runtime.HandleClientAuthorized(host);
+    Assert(host.DroppedPlayers.size() == 1, "Reused slot must not inherit the previous occupant's cached Steam identity");
+    host.PlayerSteamIds[2] = 76561198000000001ULL;
+    host.OnDrop = [&](int slot) { runtime.HandlePlayerDisconnected(host, slot); };
+    runtime.HandlePlayerConnected(host, 2);
+    Assert(host.DroppedPlayers.size() == 2, "Enter-world must enforce Steam bans and tolerate reentrant disconnect");
+    host.PlayerIds[3] = 0;
+    host.PlayerSteamIds[3] = 76561198000000001ULL;
+    host.CurrentTime += 121;
+    TickFrames(runtime, host);
+    Assert(std::any_of(host.DroppedPlayers.begin(), host.DroppedPlayers.end(), [](const auto& drop) {
+        return drop.Slot == 3;
+    }), "Successful refresh must enforce Steam-only identity even when player ID is zero");
+    runtime.Shutdown(host);
+    RemoveTestConfig(config);
+}
+
+void Runtime_LateSteamVerificationEnforcesOfflineWithoutAuthCallback()
+{
+    const auto config = WriteRuntimeConfig("steam-ban-late-offline");
+    FakeHost host;
+    ConfigureTestPlayer(host);
+    const std::string url = "GET https://example.test/ingest/active-bans?gameType=CallOfDuty4x&skipEntries=0&takeEntries=200";
+    host.Responses[url] = {200, "{\"data\":{\"items\":[{\"type\":\"Ban\","
+        "\"player\":{\"guid\":\"101\",\"steamId\":\"76561198000000002\"}}]}}"};
+    portal_cod4x::PluginRuntime runtime(config.string());
+    runtime.Initialize(host, "0.3.0");
+    runtime.HandlePlayerConnect(host, 2, "198.51.100.10");
+    runtime.HandlePlayerConnected(host, 2);
+    TickFrames(runtime, host);
+    Assert(host.DroppedPlayers.empty(), "Pending Steam verification must not cause a Steam-only drop");
+
+    host.Responses[url] = {503, ""};
+    host.CurrentTime += 121;
+    TickFrames(runtime, host);
+    host.PlayerSteamIds[2] = 76561198000000002ULL;
+    host.OnDrop = [&](int slot) { runtime.HandlePlayerDisconnected(host, slot); };
+    runtime.Tick(host);
+    Assert(host.DroppedPlayers.size() == 1 && host.DroppedPlayers.front().Slot == 2,
+        "The next frame must enforce newly verified Steam ID from existing cache during an API outage without auth callback");
+    TickFrames(runtime, host);
+    Assert(host.DroppedPlayers.size() == 1, "Unchanged identity must not repeat a drop every frame");
+    host.PlayerIds[2] = 999;
+    host.PlayerSteamIds[2] = 76561198000000003ULL;
+    TickFrames(runtime, host);
+    Assert(host.DroppedPlayers.size() == 1, "Slot reuse must not inherit a previous verified Steam identity");
+    host.PlayerSteamIds[2] = 76561198000000002ULL;
+    runtime.Tick(host);
+    Assert(host.DroppedPlayers.size() == 2, "A subsequent occupant's newly verified identity must be checked");
+    runtime.Shutdown(host);
+    RemoveTestConfig(config);
+}
+
+void Runtime_EnterWorldSteamEnforcementDoesNotRequireIngestGameType()
+{
+    for (const auto* gameType : {"", ",\"gameType\":\"\""})
+    {
+        const auto config = WriteRuntimeConfig("steam-ban-no-game-type");
+        {
+            std::ofstream output(config);
+            output << "{\"ingestBaseUrl\":\"https://example.test/ingest\","
+                "\"ingestSubscriptionKey\":\"sub-key-test\","
+                "\"gameServerId\":\"11111111-2222-3333-4444-555555555555\"" << gameType << "}";
+        }
+        FakeHost host;
+        ConfigureTestPlayer(host);
+        host.Responses["GET https://example.test/ingest/active-bans?gameType=CallOfDuty4x&skipEntries=0&takeEntries=200"] =
+            {200, "{\"data\":{\"items\":[{\"type\":\"Ban\","
+            "\"player\":{\"guid\":\"101\",\"steamId\":\"76561198000000002\"}}]}}"};
+        portal_cod4x::PluginRuntime runtime(config.string());
+        runtime.Initialize(host, "0.3.0");
+        TickFrames(runtime, host);
+        host.PlayerSteamIds[2] = 76561198000000002ULL;
+        runtime.HandlePlayerConnected(host, 2);
+        Assert(host.DroppedPlayers.size() == 1 && host.DroppedPlayers.front().Slot == 2,
+            "Enter-world must enforce cached Steam ban when gameType is omitted or blank");
+        runtime.Shutdown(host);
+        RemoveTestConfig(config);
+    }
+}
+
 void NativeExecutor_PreventsDuplicateAndCapacityReplay()
 {
     FakeHost host;
@@ -4043,6 +4275,12 @@ void NativeExecutor_PreventsDuplicateAndCapacityReplay()
 
 int main()
 {
+    Runtime_SteamBanMatchingPreservesPlayerIdOwnership();
+    Runtime_SteamBanExpiryAndPaginationRetainIndependentAssociations();
+    Runtime_SteamBanRefreshHandlesMissingAndInvalidIdentities();
+    Runtime_SteamBansEnforceFreshVerifiedSlotIdentity();
+    Runtime_LateSteamVerificationEnforcesOfflineWithoutAuthCallback();
+    Runtime_EnterWorldSteamEnforcementDoesNotRequireIngestGameType();
     BuildMessage_UsesPrefixAndVersion();
     BuildMessage_FallsBackWhenPrefixOrVersionMissing();
     Runtime_AgentNameControlsStartupAndRefreshesPresentationOnly();

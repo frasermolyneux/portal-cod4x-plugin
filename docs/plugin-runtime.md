@@ -91,10 +91,37 @@ The plugin registers two RCON ban-list commands at default power 30:
 Portalplugin itself enforces synchronized bans through `OnPlayerGetBanStatus`,
 `OnPlayerGotAuthInfo` and proactive drops after a successful active-ban refresh; this does not
 require simplebanlist. `/active-bans` passes through Repository `AdminActionDto` records.
+An active Portal profile ban matches either its CoD4x `player.guid` or its nonzero
+decimal `player.steamId` (the nullable string `PlayerDto.SteamId`). Missing, null, blank
+or zero Steam IDs do not match; malformed Steam IDs reject the refresh and retain the
+previous cache. Player-ID-only bans and native server-originated bans keep their existing
+behavior. Unban and agent reconciliation remain keyed by player ID: lifting one profile
+does not remove a separate active profile ban sharing its Steam ID. Diagnostic dumps
+retain their player-ID format.
+
+The reference [CoD4x auth hook](https://github.com/callofduty4x/CoD4x_Server/blob/0223d6f330521abfd88690c46117fa9b7185b439/src/sv_client.c)
+passes `steamidPending`, explicitly unverified in the callback declarations. The plugin
+ignores that pointer for Steam matching and reads the client's verified `steamid` through
+`Plugin_GetPlayerSteamID` instead. `OnPlayerGetBanStatus` uses `baninfo_t.steamid`, which
+the engine populates from the verified identity. Enter-world, authorization and successful
+refresh enforcement read live slot identities, not a previous occupant's cached Steam ID.
+If Steam verification has not completed, existing player-ID behavior is preserved;
+authorization enforces the Steam ban when that callback arrives with verified identity.
+The reference [`SAPI_SetEmuClientData`](https://github.com/callofduty4x/CoD4x_Server/blob/0223d6f330521abfd88690c46117fa9b7185b439/src/sapi.c#L677-L697)
+updates verified identities without dispatching authorization. `OnFrame`/`Tick` therefore
+detects live player-ID/Steam-ID changes and enforces the existing cache on the next frame,
+independently of callback delivery or API availability. Unchanged identities do not cause
+repeated frame-triggered drop attempts; successful refreshes still enforce newly added bans.
+Enter-world enforcement is independent of ingest configuration (`gameType` may be omitted
+or blank while active-ban fetches default to `CallOfDuty4x`). No live-server installation
+or settings changes were performed to validate this behavior.
+
 The cache retains nullable `expires` UTC values (including zone-less SQL UTC date-times);
 temporary entries stop enforcing locally at expiry even while refresh is offline. Permanent
 null/omitted expiry stays permanent. Overlapping records for one GUID merge with permanent
 taking precedence, otherwise the latest expiry, including across response pages.
+Each Steam association retains its own expiry, so another record for the same profile
+with a different Steam ID cannot extend an expired association.
 An elapsed record cannot trigger a proactive drop. Malformed temporary expiry or a malformed
 page rejects the refresh with a diagnostic and preserves the previous valid cache, rather than
 turning the entry into a permanent ban or clearing valid bans.

@@ -863,6 +863,8 @@ void PluginRuntime::Tick(ICod4xHost& host)
         RefreshChatPrefix(host, nowUnixSeconds);
     }
 
+    EnforceCachedBansForChangedIdentities(host);
+
     if (IsIngestConfigured() && nowUnixSeconds >= nextServerStatusUnixSeconds)
     {
         FlushServerStatusSnapshot(host, nowUnixSeconds);
@@ -901,6 +903,8 @@ void PluginRuntime::HandlePlayerConnect(ICod4xHost& host, int slot, std::string_
     {
         return;
     }
+
+    observedBanIdentitiesBySlot.erase(slot);
 
     auto prior = playersAtLevelExit.find(slot);
     if (prior != playersAtLevelExit.end())
@@ -963,7 +967,17 @@ void PluginRuntime::HandlePlayerConnect(ICod4xHost& host, int slot, std::string_
 
 void PluginRuntime::HandlePlayerConnected(ICod4xHost& host, int slot)
 {
-    if (!loadedConfig.has_value() || !IsIngestConfigured() || slot < 0)
+    if (!loadedConfig.has_value() || slot < 0 || slot >= host.GetSlotCount())
+    {
+        return;
+    }
+
+    if (EnforceCachedBanForPlayer(host, slot))
+    {
+        return;
+    }
+
+    if (!IsIngestConfigured())
     {
         return;
     }
@@ -1102,6 +1116,8 @@ void PluginRuntime::HandleClientAuthorized(ICod4xHost& host)
     {
         return;
     }
+
+    EnforceCachedBansForConnectedPlayers(host);
 
     const std::int64_t nowUnixSeconds = host.GetUnixTimeSeconds();
     for (auto& [slot, state] : connectedPlayers)
@@ -1589,19 +1605,20 @@ void PluginRuntime::HandlePlayerBanRemoved(std::uint64_t playerId)
     nextBanSyncUnixSeconds.store(0, std::memory_order_relaxed);
 }
 
-bool PluginRuntime::TryFindPlayerBanMessage(std::uint64_t playerId, std::string& message) const
+bool PluginRuntime::TryFindPlayerBanMessage(std::uint64_t playerId, std::string& message, std::uint64_t steamId) const
 {
     const std::string playerGuid = BuildPlayerGuidKey(playerId);
-    if (playerGuid.empty())
+    if (playerGuid.empty() && steamId == 0)
     {
         return false;
     }
 
     std::lock_guard<std::mutex> guard(activeBanCacheMutex);
+    const auto nowTicks = utcTicksClock();
 
     const auto portalIt = activeBanMessagesByPlayerGuid.find(playerGuid);
     if (portalIt != activeBanMessagesByPlayerGuid.end() &&
-        (!portalIt->second.ExpiresUnixTicks || *portalIt->second.ExpiresUnixTicks > utcTicksClock()))
+        (!portalIt->second.ExpiresUnixTicks || *portalIt->second.ExpiresUnixTicks > nowTicks))
     {
         message = portalIt->second.Message.empty() ? std::string(kDefaultBanMessage) : portalIt->second.Message;
         return true;
@@ -1615,44 +1632,52 @@ bool PluginRuntime::TryFindPlayerBanMessage(std::uint64_t playerId, std::string&
         // An expired temporary server-side ban must stop being enforced (the native ban has already
         // lapsed); it is pruned lazily by RenderServerBanListDump / evicted on portal import.
         const std::int64_t nowUnixSeconds = utcClock();
-        if (serverBan.ExpireUnixSeconds > 0 && serverBan.ExpireUnixSeconds <= nowUnixSeconds)
+        if (serverBan.ExpireUnixSeconds <= 0 || serverBan.ExpireUnixSeconds > nowUnixSeconds)
         {
-            return false;
+            message = serverBan.Reason.empty() ? std::string(kDefaultBanMessage) : serverBan.Reason;
+            return true;
         }
+    }
 
-        message = serverBan.Reason.empty() ? std::string(kDefaultBanMessage) : serverBan.Reason;
-        return true;
+    if (steamId != 0)
+    {
+        for (const auto& entry : activeBanMessagesByPlayerGuid)
+        {
+            const auto& ban = entry.second;
+            const auto match = ban.SteamIdExpiries.find(steamId);
+            if (match != ban.SteamIdExpiries.end() && (!match->second || *match->second > nowTicks))
+            {
+                message = ban.Message.empty() ? std::string(kDefaultBanMessage) : ban.Message;
+                return true;
+            }
+        }
     }
 
     return false;
 }
 
-bool PluginRuntime::TryGetPlayerBanMessage(std::uint64_t playerId, std::string& message) const
+bool PluginRuntime::TryGetPlayerBanMessage(std::uint64_t playerId, std::string& message, std::uint64_t steamId) const
 {
     banStatusCheckCount.fetch_add(1, std::memory_order_relaxed);
     if (playerId == 0)
     {
         banStatusZeroPlayerIdCount.fetch_add(1, std::memory_order_relaxed);
-        banStatusMissCount.fetch_add(1, std::memory_order_relaxed);
-        return false;
     }
 
-    const bool found = TryFindPlayerBanMessage(playerId, message);
+    const bool found = TryFindPlayerBanMessage(playerId, message, steamId);
     (found ? banStatusHitCount : banStatusMissCount).fetch_add(1, std::memory_order_relaxed);
     return found;
 }
 
-bool PluginRuntime::TryGetAuthenticatedPlayerBanMessage(std::uint64_t playerId, std::string& message) const
+bool PluginRuntime::TryGetAuthenticatedPlayerBanMessage(std::uint64_t playerId, std::string& message, std::uint64_t steamId) const
 {
     authenticatedBanCheckCount.fetch_add(1, std::memory_order_relaxed);
     if (playerId == 0)
     {
         authenticatedBanZeroPlayerIdCount.fetch_add(1, std::memory_order_relaxed);
-        authenticatedBanMissCount.fetch_add(1, std::memory_order_relaxed);
-        return false;
     }
 
-    const bool found = TryFindPlayerBanMessage(playerId, message);
+    const bool found = TryFindPlayerBanMessage(playerId, message, steamId);
     (found ? authenticatedBanHitCount : authenticatedBanMissCount).fetch_add(1, std::memory_order_relaxed);
     return found;
 }
@@ -2252,23 +2277,43 @@ void PluginRuntime::EnforceCachedBansForConnectedPlayers(ICod4xHost& host)
     const int slotCount = host.GetSlotCount();
     for (int slot = 0; slot < slotCount; ++slot)
     {
-        const std::uint64_t playerId = host.GetPlayerId(slot);
-        if (playerId == 0)
-        {
-            continue;
-        }
-
-        std::string banMessage;
-        if (!TryFindPlayerBanMessage(playerId, banMessage))
-        {
-            continue;
-        }
-
-        host.DropPlayer(slot, banMessage);
-        proactiveBanDropAttemptCount.fetch_add(1, std::memory_order_relaxed);
-        LogInfo(host, "requested proactive drop for cached-banned player " + std::to_string(playerId) +
-            " from slot " + std::to_string(slot));
+        EnforceCachedBanForPlayer(host, slot);
     }
+}
+
+void PluginRuntime::EnforceCachedBansForChangedIdentities(ICod4xHost& host)
+{
+    const int slotCount = host.GetSlotCount();
+    for (int slot = 0; slot < slotCount; ++slot)
+    {
+        const std::pair identity{host.GetPlayerId(slot), host.GetPlayerSteamId(slot)};
+        const auto [it, inserted] = observedBanIdentitiesBySlot.emplace(slot, identity);
+        if (!inserted && it->second == identity)
+        {
+            continue;
+        }
+
+        // Record before dropping: host callbacks can reenter the runtime.
+        it->second = identity;
+        EnforceCachedBanForPlayer(host, slot);
+    }
+}
+
+bool PluginRuntime::EnforceCachedBanForPlayer(ICod4xHost& host, int slot)
+{
+    const auto playerId = host.GetPlayerId(slot);
+    const auto steamId = host.GetPlayerSteamId(slot);
+    std::string banMessage;
+    if (!TryFindPlayerBanMessage(playerId, banMessage, steamId))
+    {
+        return false;
+    }
+
+    host.DropPlayer(slot, banMessage);
+    proactiveBanDropAttemptCount.fetch_add(1, std::memory_order_relaxed);
+    LogInfo(host, "requested proactive drop for cached-banned player " + std::to_string(playerId) +
+        " from slot " + std::to_string(slot));
+    return true;
 }
 
 bool PluginRuntime::StartActiveBanFetchRequest(ICod4xHost& host, std::int64_t nowUnixSeconds, int skipEntries)
@@ -2352,7 +2397,7 @@ std::optional<PluginRuntime::ActiveBanPage> PluginRuntime::ParseActiveBans(const
         if ((!temporary && !permanent) || !guid || guid->Type != RulesJson::Kind::String ||
             Trim(guid->Scalar).empty()) return std::nullopt;
         const auto* expires = field(item, "expires");
-        PortalBan ban{std::string(kDefaultBanMessage), std::nullopt};
+        PortalBan ban{std::string(kDefaultBanMessage), std::nullopt, {}};
         if (expires && expires->Type != RulesJson::Kind::Null)
         {
             // Repository SQL DateTime values without a zone are UTC, never machine-local time.
@@ -2361,6 +2406,15 @@ std::optional<PluginRuntime::ActiveBanPage> PluginRuntime::ParseActiveBans(const
             if (!ban.ExpiresUnixTicks) return std::nullopt;
         }
         else if (temporary) return std::nullopt;
+        const auto* steam = field(*player, "steamId");
+        if (steam && steam->Type != RulesJson::Kind::Null)
+        {
+            if (steam->Type != RulesJson::Kind::String) return std::nullopt;
+            const auto value = Trim(steam->Scalar);
+            std::uint64_t steamId = 0;
+            if (!value.empty() && !TryParseUint64(value, steamId)) return std::nullopt;
+            if (steamId != 0) ban.SteamIdExpiries.emplace(steamId, ban.ExpiresUnixTicks);
+        }
         if (ban.ExpiresUnixTicks && *ban.ExpiresUnixTicks <= now) continue;
         const auto [it, inserted] = page.Bans.emplace(Trim(guid->Scalar), ban);
         if (!inserted) it->second.Merge(ban);
@@ -3295,14 +3349,14 @@ void NotifyPlayerBanRemoved(std::uint64_t playerId)
     g_runtime.HandlePlayerBanRemoved(playerId);
 }
 
-bool TryGetPlayerBanMessage(std::uint64_t playerId, std::string& message)
+bool TryGetPlayerBanMessage(std::uint64_t playerId, std::string& message, std::uint64_t steamId)
 {
-    return g_runtime.TryGetPlayerBanMessage(playerId, message);
+    return g_runtime.TryGetPlayerBanMessage(playerId, message, steamId);
 }
 
-bool TryGetAuthenticatedPlayerBanMessage(std::uint64_t playerId, std::string& message)
+bool TryGetAuthenticatedPlayerBanMessage(std::uint64_t playerId, std::string& message, std::uint64_t steamId)
 {
-    return g_runtime.TryGetAuthenticatedPlayerBanMessage(playerId, message);
+    return g_runtime.TryGetAuthenticatedPlayerBanMessage(playerId, message, steamId);
 }
 
 std::string RenderServerBanListDump()

@@ -12,6 +12,7 @@
 #include <string_view>
 #include <unordered_map>
 #include <unordered_set>
+#include <utility>
 #include <vector>
 
 namespace portal_cod4x
@@ -123,8 +124,8 @@ public:
         std::string_view playerName = {},
         std::int64_t expireUnixSeconds = -1);
     void HandlePlayerBanRemoved(std::uint64_t playerId);
-    bool TryGetPlayerBanMessage(std::uint64_t playerId, std::string& message) const;
-    bool TryGetAuthenticatedPlayerBanMessage(std::uint64_t playerId, std::string& message) const;
+    bool TryGetPlayerBanMessage(std::uint64_t playerId, std::string& message, std::uint64_t steamId = 0) const;
+    bool TryGetAuthenticatedPlayerBanMessage(std::uint64_t playerId, std::string& message, std::uint64_t steamId = 0) const;
     // Renders the pending server-originated ban list in the cod4x `dumpbanlist` output format so
     // the agent's RCON reconcile can import bans created directly on the server. Prunes expired
     // temporary bans as a side effect.
@@ -198,13 +199,24 @@ private:
     {
         std::string Message;
         std::optional<std::int64_t> ExpiresUnixTicks;
+        // Keep each Steam association owned by its player-ID ban, with its own expiry.
+        std::unordered_map<std::uint64_t, std::optional<std::int64_t>> SteamIdExpiries;
 
         void Merge(const PortalBan& other)
         {
+            for (const auto& [steamId, expiry] : other.SteamIdExpiries)
+            {
+                const auto [it, inserted] = SteamIdExpiries.emplace(steamId, expiry);
+                if (!inserted && it->second && (!expiry || *expiry > *it->second))
+                {
+                    it->second = expiry;
+                }
+            }
             if (ExpiresUnixTicks &&
                 (!other.ExpiresUnixTicks || *other.ExpiresUnixTicks > *ExpiresUnixTicks))
             {
-                *this = other;
+                Message = other.Message;
+                ExpiresUnixTicks = other.ExpiresUnixTicks;
             }
         }
     };
@@ -306,6 +318,7 @@ private:
     bool repositoryConfigWarningLogged = false;
     std::unordered_map<std::string, PortalBan> pendingActiveBanMessagesByPlayerGuid;
     std::unordered_map<std::string, PortalBan> activeBanMessagesByPlayerGuid;
+    std::unordered_map<int, std::pair<std::uint64_t, std::uint64_t>> observedBanIdentitiesBySlot;
     // Bans created directly on the server (native permban/tempban, observed via OnPlayerAddBan).
     // Held durably here — separate from the portal-synced cache, which is replaced wholesale on
     // each sync — so they survive until the agent imports them into the portal (confirmed when the
@@ -350,7 +363,9 @@ private:
     bool StartActiveBanFetchRequest(ICod4xHost& host, std::int64_t nowUnixSeconds, int skipEntries);
     void AbortBanSync(ICod4xHost& host, std::int64_t nowUnixSeconds, std::string_view reason);
     void EnforceCachedBansForConnectedPlayers(ICod4xHost& host);
-    bool TryFindPlayerBanMessage(std::uint64_t playerId, std::string& message) const;
+    void EnforceCachedBansForChangedIdentities(ICod4xHost& host);
+    bool EnforceCachedBanForPlayer(ICod4xHost& host, int slot);
+    bool TryFindPlayerBanMessage(std::uint64_t playerId, std::string& message, std::uint64_t steamId = 0) const;
     // Normalises a ban player id to the canonical PUID the portal keys bans on. cod4x's ban hooks
     // (OnPlayerAddBan/RemoveBan) can deliver the legacy short id, whereas the portal and the agent
     // reconcile use the canonical PUID; resolve via the connected roster so the two agree.
@@ -456,8 +471,8 @@ void NotifyPlayerBanAdded(
     std::string_view playerName = {},
     std::int64_t expireUnixSeconds = -1);
 void NotifyPlayerBanRemoved(std::uint64_t playerId);
-bool TryGetPlayerBanMessage(std::uint64_t playerId, std::string& message);
-bool TryGetAuthenticatedPlayerBanMessage(std::uint64_t playerId, std::string& message);
+bool TryGetPlayerBanMessage(std::uint64_t playerId, std::string& message, std::uint64_t steamId = 0);
+bool TryGetAuthenticatedPlayerBanMessage(std::uint64_t playerId, std::string& message, std::uint64_t steamId = 0);
 std::string RenderServerBanListDump();
 std::string RenderPortalBanListDump();
 const EffectiveServerContext& GetServerContext();

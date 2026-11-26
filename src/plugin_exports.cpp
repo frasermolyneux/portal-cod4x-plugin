@@ -550,15 +550,19 @@ PCL void COD4X_CALL OnPlayerGotAuthInfo(
     std::uint64_t*,
     char* rejectMessage,
     qboolean*,
-    client_t*)
+    client_t* client)
 {
-    if (playerId == nullptr || rejectMessage == nullptr || rejectMessage[0] != '\0')
+    if (rejectMessage == nullptr || rejectMessage[0] != '\0')
     {
         return;
     }
 
+    // The hook's Steam ID pointer is steamidPending, not a verified identity.
+    const int slot = ClientPointerToSlot(client);
+    const auto steamId = slot >= 0 && slot < Plugin_GetSlotCount()
+        ? Plugin_GetPlayerSteamID(static_cast<unsigned int>(slot)) : 0;
     std::string banMessage;
-    if (!portal_cod4x::TryGetAuthenticatedPlayerBanMessage(*playerId, banMessage))
+    if (!portal_cod4x::TryGetAuthenticatedPlayerBanMessage(playerId ? *playerId : 0, banMessage, steamId))
     {
         return;
     }
@@ -590,7 +594,7 @@ PCL void COD4X_CALL OnPlayerGetBanStatus(baninfo_t* baninfo, char* message, int 
     }
 
     std::string banMessage;
-    if (!portal_cod4x::TryGetPlayerBanMessage(baninfo->playerid, banMessage))
+    if (!portal_cod4x::TryGetPlayerBanMessage(baninfo->playerid, banMessage, baninfo->steamid))
     {
         return;
     }
