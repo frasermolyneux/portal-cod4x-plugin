@@ -4030,7 +4030,7 @@ void Runtime_SteamBanMatchingPreservesPlayerIdOwnership()
     host.Responses[url] = {200, "{\"data\":{\"items\":[]}}"};
     host.CurrentTime += 121;
     TickFrames(runtime, host);
-    Assert(!runtime.TryGetPlayerBanMessage(999, reason, 76561198000000001ULL),
+    Assert(!runtime.TryGetPlayerBanMessage(999, reason, 76561198000000002ULL),
         "Removing the last profile ban must remove its Steam association");
     Assert(std::find(host.ExecutedCommands.begin(), host.ExecutedCommands.end(), "unban 102") !=
         host.ExecutedCommands.end() &&
