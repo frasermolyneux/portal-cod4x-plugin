@@ -4150,6 +4150,70 @@ void Runtime_SteamBansEnforceFreshVerifiedSlotIdentity()
     RemoveTestConfig(config);
 }
 
+void Runtime_LateSteamVerificationEnforcesOfflineWithoutAuthCallback()
+{
+    const auto config = WriteRuntimeConfig("steam-ban-late-offline");
+    FakeHost host;
+    ConfigureTestPlayer(host);
+    const std::string url = "GET https://example.test/ingest/active-bans?gameType=CallOfDuty4x&skipEntries=0&takeEntries=200";
+    host.Responses[url] = {200, "{\"data\":{\"items\":[{\"type\":\"Ban\","
+        "\"player\":{\"guid\":\"101\",\"steamId\":\"76561198000000002\"}}]}}"};
+    portal_cod4x::PluginRuntime runtime(config.string());
+    runtime.Initialize(host, "0.3.0");
+    runtime.HandlePlayerConnect(host, 2, "198.51.100.10");
+    runtime.HandlePlayerConnected(host, 2);
+    TickFrames(runtime, host);
+    Assert(host.DroppedPlayers.empty(), "Pending Steam verification must not cause a Steam-only drop");
+
+    host.Responses[url] = {503, ""};
+    host.CurrentTime += 121;
+    TickFrames(runtime, host);
+    host.PlayerSteamIds[2] = 76561198000000002ULL;
+    host.OnDrop = [&](int slot) { runtime.HandlePlayerDisconnected(host, slot); };
+    runtime.Tick(host);
+    Assert(host.DroppedPlayers.size() == 1 && host.DroppedPlayers.front().Slot == 2,
+        "The next frame must enforce newly verified Steam ID from existing cache during an API outage without auth callback");
+    TickFrames(runtime, host);
+    Assert(host.DroppedPlayers.size() == 1, "Unchanged identity must not repeat a drop every frame");
+    host.PlayerIds[2] = 999;
+    host.PlayerSteamIds[2] = 76561198000000003ULL;
+    TickFrames(runtime, host);
+    Assert(host.DroppedPlayers.size() == 1, "Slot reuse must not inherit a previous verified Steam identity");
+    host.PlayerSteamIds[2] = 76561198000000002ULL;
+    runtime.Tick(host);
+    Assert(host.DroppedPlayers.size() == 2, "A subsequent occupant's newly verified identity must be checked");
+    runtime.Shutdown(host);
+    RemoveTestConfig(config);
+}
+
+void Runtime_EnterWorldSteamEnforcementDoesNotRequireIngestGameType()
+{
+    for (const auto* gameType : {"", ",\"gameType\":\"\""})
+    {
+        const auto config = WriteRuntimeConfig("steam-ban-no-game-type");
+        {
+            std::ofstream output(config);
+            output << "{\"ingestBaseUrl\":\"https://example.test/ingest\","
+                "\"ingestSubscriptionKey\":\"sub-key-test\","
+                "\"gameServerId\":\"11111111-2222-3333-4444-555555555555\"" << gameType << "}";
+        }
+        FakeHost host;
+        ConfigureTestPlayer(host);
+        host.Responses["GET https://example.test/ingest/active-bans?gameType=CallOfDuty4x&skipEntries=0&takeEntries=200"] =
+            {200, "{\"data\":{\"items\":[{\"type\":\"Ban\","
+            "\"player\":{\"guid\":\"101\",\"steamId\":\"76561198000000002\"}}]}}"};
+        portal_cod4x::PluginRuntime runtime(config.string());
+        runtime.Initialize(host, "0.3.0");
+        TickFrames(runtime, host);
+        host.PlayerSteamIds[2] = 76561198000000002ULL;
+        runtime.HandlePlayerConnected(host, 2);
+        Assert(host.DroppedPlayers.size() == 1 && host.DroppedPlayers.front().Slot == 2,
+            "Enter-world must enforce cached Steam ban when gameType is omitted or blank");
+        runtime.Shutdown(host);
+        RemoveTestConfig(config);
+    }
+}
+
 void NativeExecutor_PreventsDuplicateAndCapacityReplay()
 {
     FakeHost host;
@@ -4215,6 +4279,8 @@ int main()
     Runtime_SteamBanExpiryAndPaginationRetainIndependentAssociations();
     Runtime_SteamBanRefreshHandlesMissingAndInvalidIdentities();
     Runtime_SteamBansEnforceFreshVerifiedSlotIdentity();
+    Runtime_LateSteamVerificationEnforcesOfflineWithoutAuthCallback();
+    Runtime_EnterWorldSteamEnforcementDoesNotRequireIngestGameType();
     BuildMessage_UsesPrefixAndVersion();
     BuildMessage_FallsBackWhenPrefixOrVersionMissing();
     Runtime_AgentNameControlsStartupAndRefreshesPresentationOnly();

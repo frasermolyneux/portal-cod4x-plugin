@@ -12,6 +12,7 @@
 #include <string_view>
 #include <unordered_map>
 #include <unordered_set>
+#include <utility>
 #include <vector>
 
 namespace portal_cod4x
@@ -317,6 +318,7 @@ private:
     bool repositoryConfigWarningLogged = false;
     std::unordered_map<std::string, PortalBan> pendingActiveBanMessagesByPlayerGuid;
     std::unordered_map<std::string, PortalBan> activeBanMessagesByPlayerGuid;
+    std::unordered_map<int, std::pair<std::uint64_t, std::uint64_t>> observedBanIdentitiesBySlot;
     // Bans created directly on the server (native permban/tempban, observed via OnPlayerAddBan).
     // Held durably here — separate from the portal-synced cache, which is replaced wholesale on
     // each sync — so they survive until the agent imports them into the portal (confirmed when the
@@ -361,6 +363,7 @@ private:
     bool StartActiveBanFetchRequest(ICod4xHost& host, std::int64_t nowUnixSeconds, int skipEntries);
     void AbortBanSync(ICod4xHost& host, std::int64_t nowUnixSeconds, std::string_view reason);
     void EnforceCachedBansForConnectedPlayers(ICod4xHost& host);
+    void EnforceCachedBansForChangedIdentities(ICod4xHost& host);
     bool EnforceCachedBanForPlayer(ICod4xHost& host, int slot);
     bool TryFindPlayerBanMessage(std::uint64_t playerId, std::string& message, std::uint64_t steamId = 0) const;
     // Normalises a ban player id to the canonical PUID the portal keys bans on. cod4x's ban hooks

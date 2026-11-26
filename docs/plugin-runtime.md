@@ -107,10 +107,14 @@ the engine populates from the verified identity. Enter-world, authorization and 
 refresh enforcement read live slot identities, not a previous occupant's cached Steam ID.
 If Steam verification has not completed, existing player-ID behavior is preserved;
 authorization enforces the Steam ban when that callback arrives with verified identity.
-The reference callback ABI does not establish that every deployed engine emits a new
-authorization callback after late Steam verification. Without that callback, the next
-successful active-ban refresh still checks live verified identity; immediate late-auth
-callback delivery has not been validated on live servers in this workstream.
+The reference [`SAPI_SetEmuClientData`](https://github.com/callofduty4x/CoD4x_Server/blob/0223d6f330521abfd88690c46117fa9b7185b439/src/sapi.c#L677-L697)
+updates verified identities without dispatching authorization. `OnFrame`/`Tick` therefore
+detects live player-ID/Steam-ID changes and enforces the existing cache on the next frame,
+independently of callback delivery or API availability. Unchanged identities do not cause
+repeated frame-triggered drop attempts; successful refreshes still enforce newly added bans.
+Enter-world enforcement is independent of ingest configuration (`gameType` may be omitted
+or blank while active-ban fetches default to `CallOfDuty4x`). No live-server installation
+or settings changes were performed to validate this behavior.
 
 The cache retains nullable `expires` UTC values (including zone-less SQL UTC date-times);
 temporary entries stop enforcing locally at expiry even while refresh is offline. Permanent

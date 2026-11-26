@@ -863,6 +863,8 @@ void PluginRuntime::Tick(ICod4xHost& host)
         RefreshChatPrefix(host, nowUnixSeconds);
     }
 
+    EnforceCachedBansForChangedIdentities(host);
+
     if (IsIngestConfigured() && nowUnixSeconds >= nextServerStatusUnixSeconds)
     {
         FlushServerStatusSnapshot(host, nowUnixSeconds);
@@ -901,6 +903,8 @@ void PluginRuntime::HandlePlayerConnect(ICod4xHost& host, int slot, std::string_
     {
         return;
     }
+
+    observedBanIdentitiesBySlot.erase(slot);
 
     auto prior = playersAtLevelExit.find(slot);
     if (prior != playersAtLevelExit.end())
@@ -963,12 +967,17 @@ void PluginRuntime::HandlePlayerConnect(ICod4xHost& host, int slot, std::string_
 
 void PluginRuntime::HandlePlayerConnected(ICod4xHost& host, int slot)
 {
-    if (!loadedConfig.has_value() || !IsIngestConfigured() || slot < 0)
+    if (!loadedConfig.has_value() || slot < 0 || slot >= host.GetSlotCount())
     {
         return;
     }
 
     if (EnforceCachedBanForPlayer(host, slot))
+    {
+        return;
+    }
+
+    if (!IsIngestConfigured())
     {
         return;
     }
@@ -2268,6 +2277,24 @@ void PluginRuntime::EnforceCachedBansForConnectedPlayers(ICod4xHost& host)
     const int slotCount = host.GetSlotCount();
     for (int slot = 0; slot < slotCount; ++slot)
     {
+        EnforceCachedBanForPlayer(host, slot);
+    }
+}
+
+void PluginRuntime::EnforceCachedBansForChangedIdentities(ICod4xHost& host)
+{
+    const int slotCount = host.GetSlotCount();
+    for (int slot = 0; slot < slotCount; ++slot)
+    {
+        const std::pair identity{host.GetPlayerId(slot), host.GetPlayerSteamId(slot)};
+        const auto [it, inserted] = observedBanIdentitiesBySlot.emplace(slot, identity);
+        if (!inserted && it->second == identity)
+        {
+            continue;
+        }
+
+        // Record before dropping: host callbacks can reenter the runtime.
+        it->second = identity;
         EnforceCachedBanForPlayer(host, slot);
     }
 }
