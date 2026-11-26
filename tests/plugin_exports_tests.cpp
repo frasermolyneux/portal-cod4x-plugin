@@ -608,6 +608,20 @@ int main()
         authenticatedRejectMessage, &returnNow, &fakeClient);
     AssertTrue(authenticatedRejectMessage[0] == '\0',
         "Auth hook must never reject solely on the unverified steamidPending pointer.");
+    g_player_id = 0;
+    authenticatedPlayerId = 101;
+    OnPlayerGotAuthInfo(&playerAddress, &authenticatedPlayerId, &authenticatedSteamId,
+        authenticatedRejectMessage, &returnNow, &fakeClient);
+    AssertTrue(authenticatedRejectMessage[0] == '\0',
+        "Pending Steam ID substituted into callback playerId must not match a Portal GUID when both engine IDs are zero.");
+    g_player_id = 101;
+    authenticatedPlayerId = 999;
+    OnPlayerGotAuthInfo(&playerAddress, &authenticatedPlayerId, nullptr,
+        authenticatedRejectMessage, &returnNow, &fakeClient);
+    AssertTrue(authenticatedRejectMessage[0] != '\0',
+        "Auth hook must preserve genuine engine player-ID matching instead of trusting the callback's substituted ID.");
+    g_player_id = 999;
+    authenticatedRejectMessage[0] = '\0';
     g_player_steam_id = authenticatedSteamId;
     OnPlayerGotAuthInfo(&playerAddress, &authenticatedPlayerId, nullptr,
         authenticatedRejectMessage, &returnNow, &fakeClient);

@@ -318,6 +318,7 @@ private:
     bool repositoryConfigWarningLogged = false;
     std::unordered_map<std::string, PortalBan> pendingActiveBanMessagesByPlayerGuid;
     std::unordered_map<std::string, PortalBan> activeBanMessagesByPlayerGuid;
+    std::unordered_map<std::uint64_t, std::unordered_map<std::string, std::optional<std::int64_t>>> activeBanExpiriesBySteamId;
     std::unordered_map<int, std::pair<std::uint64_t, std::uint64_t>> observedBanIdentitiesBySlot;
     // Bans created directly on the server (native permban/tempban, observed via OnPlayerAddBan).
     // Held durably here — separate from the portal-synced cache, which is replaced wholesale on

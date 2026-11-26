@@ -4020,10 +4020,17 @@ void Runtime_SteamBanMatchingPreservesPlayerIdOwnership()
     TickFrames(runtime, host);
     Assert(runtime.TryGetPlayerBanMessage(999, reason, 76561198000000001ULL),
         "Refresh after a profile lift must preserve the independent shared-Steam ban");
+    host.Responses[url] = {200, "{\"data\":{\"items\":["
+        "{\"type\":\"Ban\",\"player\":{\"guid\":\"102\",\"steamId\":\"76561198000000002\"}}]}}"};
+    host.CurrentTime += 121;
+    TickFrames(runtime, host);
+    Assert(!runtime.TryGetPlayerBanMessage(999, reason, 76561198000000001ULL) &&
+        runtime.TryGetPlayerBanMessage(999, reason, 76561198000000002ULL),
+        "Atomic refresh must remove stale reverse associations and publish the replacement Steam identity");
     host.Responses[url] = {200, "{\"data\":{\"items\":[]}}"};
     host.CurrentTime += 121;
     TickFrames(runtime, host);
-    Assert(!runtime.TryGetPlayerBanMessage(999, reason, 76561198000000001ULL),
+    Assert(!runtime.TryGetPlayerBanMessage(999, reason, 76561198000000002ULL),
         "Removing the last profile ban must remove its Steam association");
     Assert(std::find(host.ExecutedCommands.begin(), host.ExecutedCommands.end(), "unban 102") !=
         host.ExecutedCommands.end() &&
