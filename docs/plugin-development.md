@@ -12,9 +12,14 @@ The plugin runtime now includes:
 
 Startup broadcast details:
 
-- Prefix: `^4[^1XI-BOT^4]^7`
+- Prefix: effective `agentName` (already rendered), or `^4[^1XI-BOT^4]^7` for older configs
 - Message: `Portal Plugin is online (version <version>)`
 - Broadcast target slot: `-1` (all players)
+
+Plugin-owned private replies prepend `^5(PM)^7 ` before the bot prefix. Headers are applied
+before splitting and appear only in the first fragment. The optional non-sensitive
+`portal-cod4x-plugin.agent-name.json` sidecar updates the name every 60 seconds without
+rewriting credentials; see [Plugin Runtime](plugin-runtime.md) for the config contract.
 
 Runtime logic is isolated in `plugin_runtime` and `plugin_exports` modules with unit-test coverage for runtime behavior and callback bridging.
 `rules_adapter` handles the versioned cloud protocol and non-blocking continuation transport;

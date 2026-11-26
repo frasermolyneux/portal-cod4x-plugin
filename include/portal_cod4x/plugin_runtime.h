@@ -113,6 +113,7 @@ public:
     void HandleChatMessage(ICod4xHost& host, int slot, std::string_view message, bool teamMessage);
     void HandleClientCommand(ICod4xHost& host, int slot, std::string_view command, bool fromChatMessage = false);
     void HandlePortalPluginHealthCommand(ICod4xHost& host, int invokerSlot);
+    void SendPrivateChat(ICod4xHost& host, int slot, std::string_view message) const;
     void HandleServerSpawned(ICod4xHost& host);
     void HandleServerExited(ICod4xHost& host);
     void HandlePlayerBanAdded(
@@ -239,10 +240,12 @@ private:
     };
 
     std::string configPath;
+    std::string agentNameConfigPath;
     std::function<std::int64_t()> utcClock;
     std::function<std::int64_t()> utcTicksClock;
     std::string pluginVersion = "0.0.0-unknown";
     std::string chatPrefix = std::string(kDefaultBotPrefix);
+    std::string fallbackChatPrefix = std::string(kDefaultBotPrefix);
     std::string lastHandledCommandToken;
     int lastHandledCommandSlot = -1;
     std::int64_t lastHandledCommandUnixSeconds = 0;
@@ -252,6 +255,8 @@ private:
     std::int64_t lastTickUnixSeconds = 0;
     std::int64_t nextConfigLoadAttemptUnixSeconds = 0;
     std::string lastConfigLoadError;
+    std::int64_t nextChatPrefixRefreshUnixSeconds = 0;
+    std::string lastChatPrefixConfigError;
 
     IngestStage ingestStage = IngestStage::Idle;
     HttpRequestHandle ingestRequest = nullptr;
@@ -412,7 +417,9 @@ private:
     static std::string NormalizeIpAddress(std::string ipAddress);
     static std::string Trim(std::string value);
     std::string BuildPrefixedChatMessage(std::string_view message) const;
-    void SendPrivateChat(ICod4xHost& host, int slot, std::string_view message) const;
+    void UpdateChatPrefix(ICod4xHost& host, std::string_view configJson, bool isRuntimeConfig);
+    void RefreshChatPrefix(ICod4xHost& host, std::int64_t nowUnixSeconds);
+    void LogChatPrefixConfigIssue(ICod4xHost& host, std::string_view issue);
     bool ShouldLog(LogLevel level) const;
     void LogDebug(ICod4xHost& host, std::string_view message) const;
     void LogInfo(ICod4xHost& host, std::string_view message) const;
@@ -437,6 +444,7 @@ void NotifyClientCommand(ICod4xHost& host, int slot, std::string_view command);
 void NotifyServerSpawned(ICod4xHost& host);
 void NotifyServerExited(ICod4xHost& host);
 void NotifyPortalPluginHealthCommand(ICod4xHost& host, int slot);
+void SendPluginPrivateChat(ICod4xHost& host, int slot, std::string_view message);
 bool TrySetPluginLogLevel(ICod4xHost& host, int levelValue, bool announce = true);
 bool TrySetPluginLogLevel(ICod4xHost& host, std::string_view levelToken, bool announce = true);
 int GetPluginLogLevelValue();

@@ -1,4 +1,5 @@
 #include "portal_cod4x/plugin_runtime.h"
+#include "portal_cod4x/chat_messages.h"
 #include "rules_json.h"
 
 #include <algorithm>
@@ -6,6 +7,7 @@
 #include <cctype>
 #include <chrono>
 #include <ctime>
+#include <filesystem>
 #include <fstream>
 #include <iomanip>
 #include <limits>
@@ -24,6 +26,8 @@ namespace
 constexpr std::int64_t kIngestRequestDeadlineSeconds = 60;
 constexpr std::int64_t kBanSyncRequestDeadlineSeconds = 20;
 constexpr std::int64_t kServerStatusIntervalSeconds = 60;
+constexpr std::int64_t kChatPrefixRefreshIntervalSeconds = 60;
+constexpr std::string_view kPrivateMessagePrefix = "^5(PM)^7 ";
 constexpr std::int64_t kMaxBufferedEventAgeSeconds = 15 * 60;
 constexpr std::size_t kMaxBufferedEventAttempts = 8;
 constexpr std::int64_t kDefaultBanSyncIntervalSeconds = 60;
@@ -597,6 +601,9 @@ PluginRuntime::PluginRuntime(std::string configPath, std::function<std::int64_t(
               return std::chrono::duration_cast<Ticks>(std::chrono::system_clock::now().time_since_epoch()).count();
           }))
 {
+    const std::size_t suffixLength = this->configPath.ends_with(".config.json") ? 12 :
+        this->configPath.ends_with(".json") ? 5 : 0;
+    agentNameConfigPath = this->configPath.substr(0, this->configPath.size() - suffixLength) + ".agent-name.json";
 }
 
 std::string PluginRuntime::BuildPrefixedChatMessage(std::string_view message) const
@@ -621,7 +628,64 @@ void PluginRuntime::SendPrivateChat(ICod4xHost& host, int slot, std::string_view
         return;
     }
 
-    host.SendChat(slot, BuildPrefixedChatMessage(message));
+    host.SendChat(slot, std::string(kPrivateMessagePrefix) + BuildPrefixedChatMessage(message));
+}
+
+void PluginRuntime::LogChatPrefixConfigIssue(ICod4xHost& host, std::string_view issue)
+{
+    if (issue != lastChatPrefixConfigError)
+    {
+        LogError(host, issue);
+        lastChatPrefixConfigError = issue;
+    }
+}
+
+void PluginRuntime::UpdateChatPrefix(ICod4xHost& host, std::string_view configJson, bool isRuntimeConfig)
+{
+    const auto document = RulesJsonReader::Parse(configJson);
+    const auto serverId = document ? document->String("gameServerId") : std::nullopt;
+    if (!document || !serverId || Trim(*serverId) != serverContext.GameServerId ||
+        (isRuntimeConfig && (!document->String("ingestBaseUrl") || !document->String("ingestSubscriptionKey"))))
+    {
+        LogChatPrefixConfigIssue(host, "Plugin chat prefix config is invalid or belongs to another server; keeping current prefix");
+        return;
+    }
+
+    const auto* value = document->Find("agentName");
+    if ((!isRuntimeConfig && !value) ||
+        (value && value->Type != RulesJson::Kind::Null && value->Type != RulesJson::Kind::String))
+    {
+        LogChatPrefixConfigIssue(host, "Plugin agentName must be present in the name file and be a string or null; keeping current prefix");
+        return;
+    }
+
+    const std::string prefix = value && value->Type == RulesJson::Kind::String ? Trim(value->Scalar) : std::string();
+    if (!prefix.empty() &&
+        (!IsValidChatText(prefix) || prefix.size() + kPrivateMessagePrefix.size() + 1 > kChatPayloadBytes))
+    {
+        LogChatPrefixConfigIssue(host, "Plugin agentName must be valid native chat text of at most 139 UTF-8 bytes; keeping current prefix");
+        return;
+    }
+
+    chatPrefix = prefix.empty() ? fallbackChatPrefix : prefix;
+    lastChatPrefixConfigError.clear();
+}
+
+void PluginRuntime::RefreshChatPrefix(ICod4xHost& host, std::int64_t nowUnixSeconds)
+{
+    nextChatPrefixRefreshUnixSeconds = nowUnixSeconds + kChatPrefixRefreshIntervalSeconds;
+    std::string configJson;
+    if (!TryReadFile(agentNameConfigPath, configJson))
+    {
+        std::error_code error;
+        if (std::filesystem::exists(agentNameConfigPath, error) || error)
+        {
+            LogChatPrefixConfigIssue(host, "Plugin chat prefix config could not be read; keeping current prefix");
+        }
+        return;
+    }
+
+    UpdateChatPrefix(host, configJson, false);
 }
 
 bool PluginRuntime::ShouldLog(LogLevel level) const
@@ -715,14 +779,14 @@ std::string PluginRuntime::GetLogLevelName() const
 
 int PluginRuntime::Initialize(ICod4xHost& host, std::string_view version, std::string_view prefix)
 {
-    const std::string onlineMessage = BuildOnlineBroadcastMessage(prefix, version);
     const std::string normalizedVersion = version.empty() ? "0.0.0-unknown" : std::string(version);
     chatPrefix = prefix.empty() ? std::string(kDefaultBotPrefix) : std::string(prefix);
+    fallbackChatPrefix = chatPrefix;
+    lastChatPrefixConfigError.clear();
     pluginVersion = normalizedVersion;
     producerEpoch = GenerateMessageId();
 
     LogInfo(host, "Portal Plugin is online (version " + normalizedVersion + ")");
-    host.BroadcastChat(onlineMessage);
 
     const std::int64_t nowUnixSeconds = host.GetUnixTimeSeconds();
     producerStartedUnixSeconds = nowUnixSeconds;
@@ -730,6 +794,7 @@ int PluginRuntime::Initialize(ICod4xHost& host, std::string_view version, std::s
     droppedPlaytimeAttempts = 0;
     droppedPlaytimeAge = 0;
     TryLoadConfig(host, nowUnixSeconds);
+    host.BroadcastChat(BuildOnlineBroadcastMessage(chatPrefix, version));
     nextServerStatusUnixSeconds = nowUnixSeconds + kServerStatusIntervalSeconds;
 
     return 0;
@@ -753,6 +818,11 @@ void PluginRuntime::Tick(ICod4xHost& host)
         }
 
         nextServerStatusUnixSeconds = nowUnixSeconds + kServerStatusIntervalSeconds;
+    }
+
+    if (nowUnixSeconds >= nextChatPrefixRefreshUnixSeconds)
+    {
+        RefreshChatPrefix(host, nowUnixSeconds);
     }
 
     if (IsIngestConfigured() && nowUnixSeconds >= nextServerStatusUnixSeconds)
@@ -1304,9 +1374,8 @@ void PluginRuntime::HandlePortalPluginHealthCommand(ICod4xHost& host, int invoke
         host.ExecuteServerCommand("consay " + commandText);
     }
 
-    host.ExecuteServerCommand(
-        "tell " + std::to_string(invokerSlot) +
-        " Portal plugin health written to console output. Open your console for full details.");
+    SendPrivateChat(host, invokerSlot,
+        "Portal plugin health written to console output. Open your console for full details.");
 }
 
 void PluginRuntime::HandleServerSpawned(ICod4xHost& host)
@@ -1689,6 +1758,8 @@ bool PluginRuntime::TryLoadConfig(ICod4xHost& host, std::int64_t nowUnixSeconds)
     nextConfigLoadAttemptUnixSeconds = nowUnixSeconds;
     nextBanSyncUnixSeconds.store(nowUnixSeconds, std::memory_order_relaxed);
     repositoryConfigWarningLogged = false;
+    UpdateChatPrefix(host, configJson, true);
+    RefreshChatPrefix(host, nowUnixSeconds);
     LogInfo(host, "plugin config loaded for gameServerId " + loadedConfig->GameServerId);
     return true;
 }
@@ -3144,6 +3215,11 @@ void NotifyServerExited(ICod4xHost& host)
 void NotifyPortalPluginHealthCommand(ICod4xHost& host, int slot)
 {
     g_runtime.HandlePortalPluginHealthCommand(host, slot);
+}
+
+void SendPluginPrivateChat(ICod4xHost& host, int slot, std::string_view message)
+{
+    g_runtime.SendPrivateChat(host, slot, message);
 }
 
 bool TrySetPluginLogLevel(ICod4xHost& host, int level, bool announce)

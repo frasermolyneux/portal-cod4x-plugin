@@ -409,7 +409,7 @@ void COD4X_CALL CmdPortalPluginLogLevel()
         host.Log(summary);
         if (invokerSlot >= 0)
         {
-            host.SendChat(invokerSlot, summary);
+            portal_cod4x::SendPluginPrivateChat(host, invokerSlot, summary);
         }
     };
 
@@ -419,7 +419,7 @@ void COD4X_CALL CmdPortalPluginLogLevel()
         host.Log("usage: " + std::string(kPortalPluginLogLevelUsage));
         if (invokerSlot >= 0)
         {
-            host.SendChat(invokerSlot, "Usage: " + std::string(kPortalPluginLogLevelUsage));
+            portal_cod4x::SendPluginPrivateChat(host, invokerSlot, "Usage: " + std::string(kPortalPluginLogLevelUsage));
         }
 
         return;
@@ -431,7 +431,7 @@ void COD4X_CALL CmdPortalPluginLogLevel()
         host.Log("usage: " + std::string(kPortalPluginLogLevelUsage));
         if (invokerSlot >= 0)
         {
-            host.SendChat(invokerSlot, "Too many arguments. Usage: " + std::string(kPortalPluginLogLevelUsage));
+            portal_cod4x::SendPluginPrivateChat(host, invokerSlot, "Too many arguments. Usage: " + std::string(kPortalPluginLogLevelUsage));
         }
 
         return;
@@ -445,7 +445,7 @@ void COD4X_CALL CmdPortalPluginLogLevel()
         host.Log("usage: " + std::string(kPortalPluginLogLevelUsage));
         if (invokerSlot >= 0)
         {
-            host.SendChat(invokerSlot, "Invalid log level. Usage: " + std::string(kPortalPluginLogLevelUsage));
+            portal_cod4x::SendPluginPrivateChat(host, invokerSlot, "Invalid log level. Usage: " + std::string(kPortalPluginLogLevelUsage));
         }
 
         return;
@@ -453,8 +453,8 @@ void COD4X_CALL CmdPortalPluginLogLevel()
 
     if (invokerSlot >= 0)
     {
-        host.SendChat(
-            invokerSlot,
+        portal_cod4x::SendPluginPrivateChat(
+            host, invokerSlot,
             "plugin log level set to " +
                 portal_cod4x::GetPluginLogLevelName() +
                 " (" + std::to_string(portal_cod4x::GetPluginLogLevelValue()) + ")");
