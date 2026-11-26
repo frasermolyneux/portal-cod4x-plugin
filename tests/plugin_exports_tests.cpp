@@ -7,6 +7,8 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <filesystem>
+#include <fstream>
 #include <iostream>
 #include <string>
 #include <vector>
@@ -35,6 +37,8 @@ std::vector<std::string> g_command_arguments;
 std::string g_empty_command_argument;
 std::string g_player_name = "TestPlayer";
 std::uint64_t g_player_id = 76561198000000001ULL;
+std::uint64_t g_player_steam_id = 76561198000000001ULL;
+std::string g_active_bans_response;
 int g_command_invoker_slot = 0;
 
 void AssertTrue(bool condition, const char* failureMessage)
@@ -111,22 +115,34 @@ extern "C" qboolean COD4X_CALL Plugin_CanPlayerUseCommand(int, const char*)
 }
 
 extern "C" ftRequest_t* COD4X_CALL Plugin_HTTP_MakeHttpRequest(
-    const char*,
+    const char* url,
     const char*,
     byte*,
     int,
     const char*)
 {
+    if (!g_active_bans_response.empty() && url != nullptr &&
+        std::string_view(url).find("/active-bans?") != std::string_view::npos)
+    {
+        auto* request = new ftRequest_t{};
+        request->code = 200;
+        request->extrecvmsg = new msg_t{};
+        request->extrecvmsg->data = reinterpret_cast<byte*>(g_active_bans_response.data());
+        request->extrecvmsg->cursize = static_cast<int>(g_active_bans_response.size());
+        return request;
+    }
     return nullptr;
 }
 
-extern "C" int COD4X_CALL Plugin_HTTP_SendReceiveData(ftRequest_t*)
+extern "C" int COD4X_CALL Plugin_HTTP_SendReceiveData(ftRequest_t* request)
 {
-    return -1;
+    return request ? 1 : -1;
 }
 
-extern "C" void COD4X_CALL Plugin_HTTP_FreeObj(ftRequest_t*)
+extern "C" void COD4X_CALL Plugin_HTTP_FreeObj(ftRequest_t* request)
 {
+    delete request->extrecvmsg;
+    delete request;
 }
 
 extern "C" int COD4X_CALL Plugin_GetSlotCount()
@@ -146,7 +162,7 @@ extern "C" std::uint64_t COD4X_CALL Plugin_GetPlayerID(unsigned int)
 
 extern "C" std::uint64_t COD4X_CALL Plugin_GetPlayerSteamID(unsigned int)
 {
-    return g_player_id;
+    return g_player_steam_id;
 }
 
 extern "C" unsigned int COD4X_CALL Plugin_GetClientNumForClient(client_t*)
@@ -204,6 +220,7 @@ extern "C" void COD4X_CALL Plugin_Cvar_VariableStringBuffer(const char* cvarname
 extern "C"
 {
 int OnInit();
+void OnTerminate();
 void OnFrame();
 void OnClientAuthorized();
 void OnPlayerGotAuthInfo(netadr_t* from, std::uint64_t* playerid, std::uint64_t* steamid, char* rejectmsg, qboolean* returnNow, client_t* client);
@@ -567,6 +584,57 @@ int main()
         std::strlen(clearedBanMessage) == 0,
         "OnPlayerGetBanStatus should not return a ban message after OnPlayerRemoveBan clears the cache.");
 
+    OnTerminate();
+    const std::filesystem::path configPath = "portal-cod4x-plugin.config.json";
+    AssertTrue(!std::filesystem::exists(configPath), "Export test must not overwrite an existing runtime config.");
+    {
+        std::ofstream config(configPath);
+        config << "{\"ingestBaseUrl\":\"https://example.test/ingest\","
+            "\"ingestSubscriptionKey\":\"sub-key-test\","
+            "\"gameServerId\":\"11111111-2222-3333-4444-555555555555\"}";
+    }
+    g_active_bans_response = "{\"data\":{\"items\":[{\"type\":\"Ban\","
+        "\"player\":{\"guid\":\"101\",\"steamId\":\"76561198000000002\"}}]}}";
+    g_player_id = 999;
+    g_player_steam_id = 0;
+    AssertTrue(OnInit() == 0, "Configured export runtime must initialize.");
+    OnFrame();
+    OnFrame();
+    authenticatedPlayerId = 999;
+    authenticatedSteamId = 76561198000000002ULL;
+    authenticatedRejectMessage[0] = '\0';
+    OnPlayerGotAuthInfo(&playerAddress, &authenticatedPlayerId, &authenticatedSteamId,
+        authenticatedRejectMessage, &returnNow, &fakeClient);
+    AssertTrue(authenticatedRejectMessage[0] == '\0',
+        "Auth hook must never reject solely on the unverified steamidPending pointer.");
+    g_player_steam_id = authenticatedSteamId;
+    OnPlayerGotAuthInfo(&playerAddress, &authenticatedPlayerId, nullptr,
+        authenticatedRejectMessage, &returnNow, &fakeClient);
+    AssertTrue(authenticatedRejectMessage[0] != '\0' && returnNow == qfalse,
+        "Auth hook must reject on verified engine Steam ID even with a different player ID.");
+    char existingRejection[1024] = "Prior rejection";
+    OnPlayerGotAuthInfo(&playerAddress, &authenticatedPlayerId, &authenticatedSteamId,
+        existingRejection, &returnNow, &fakeClient);
+    AssertTrue(std::string(existingRejection) == "Prior rejection", "Auth hook must preserve another hook's rejection.");
+    banInfo.playerid = 999;
+    banInfo.steamid = authenticatedSteamId;
+    char shortBanMessage[8] = {};
+    OnPlayerGetBanStatus(&banInfo, shortBanMessage, sizeof(shortBanMessage));
+    AssertTrue(std::string(shortBanMessage) == "You are" && std::strlen(banInfo.message) > 7,
+        "Ban-status hook must forward verified Steam ID and respect the output buffer bound.");
+    banInfo.steamid = 0;
+    clearedBanMessage[0] = '\0';
+    OnPlayerGetBanStatus(&banInfo, clearedBanMessage, sizeof(clearedBanMessage));
+    AssertTrue(clearedBanMessage[0] == '\0', "Zero Steam ID must not match a different player-ID ban.");
+    authenticatedRejectMessage[0] = '\0';
+    OnPlayerGotAuthInfo(&playerAddress, nullptr, nullptr, authenticatedRejectMessage, &returnNow, &fakeClient);
+    AssertTrue(authenticatedRejectMessage[0] != '\0', "Verified Steam identity alone must support auth rejection.");
+    authenticatedRejectMessage[0] = '\0';
+    OnPlayerGotAuthInfo(&playerAddress, &authenticatedPlayerId, &authenticatedSteamId,
+        authenticatedRejectMessage, &returnNow, nullptr);
+    AssertTrue(authenticatedRejectMessage[0] == '\0', "Null client must not promote pending Steam identity.");
+    OnTerminate();
+    std::filesystem::remove(configPath);
     std::cout << "All plugin export tests passed.\n";
     return 0;
 }
