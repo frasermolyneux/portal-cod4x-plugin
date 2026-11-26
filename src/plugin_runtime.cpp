@@ -27,6 +27,7 @@ constexpr std::int64_t kIngestRequestDeadlineSeconds = 60;
 constexpr std::int64_t kBanSyncRequestDeadlineSeconds = 20;
 constexpr std::int64_t kServerStatusIntervalSeconds = 60;
 constexpr std::int64_t kChatPrefixRefreshIntervalSeconds = 60;
+constexpr std::size_t kMaxChatPrefixConfigBytes = 200 * 1024;
 constexpr std::string_view kPrivateMessagePrefix = "^5(PM)^7 ";
 constexpr std::int64_t kMaxBufferedEventAgeSeconds = 15 * 60;
 constexpr std::size_t kMaxBufferedEventAttempts = 8;
@@ -117,6 +118,39 @@ bool TryReadFile(const std::string& path, std::string& content)
 
     content.assign(std::istreambuf_iterator<char>(file), std::istreambuf_iterator<char>());
     return true;
+}
+
+enum class ChatPrefixFileReadResult
+{
+    Success,
+    Missing,
+    Failed,
+    TooLarge
+};
+
+ChatPrefixFileReadResult ReadChatPrefixFile(const std::string& path, std::string& content)
+{
+    std::ifstream file(path, std::ios::in | std::ios::binary);
+    if (!file.is_open())
+    {
+        std::error_code error;
+        const bool exists = std::filesystem::exists(path, error);
+        return !exists && !error ? ChatPrefixFileReadResult::Missing : ChatPrefixFileReadResult::Failed;
+    }
+
+    content.resize(kMaxChatPrefixConfigBytes + 1);
+    file.read(content.data(), static_cast<std::streamsize>(content.size()));
+    const auto bytesRead = static_cast<std::size_t>(file.gcount());
+    if (file.bad() || (file.fail() && !file.eof()))
+    {
+        return ChatPrefixFileReadResult::Failed;
+    }
+    if (bytesRead > kMaxChatPrefixConfigBytes)
+    {
+        return ChatPrefixFileReadResult::TooLarge;
+    }
+    content.resize(bytesRead);
+    return ChatPrefixFileReadResult::Success;
 }
 
 // Appends a Unicode code point to the buffer encoded as UTF-8.
@@ -642,7 +676,7 @@ void PluginRuntime::LogChatPrefixConfigIssue(ICod4xHost& host, std::string_view 
 
 void PluginRuntime::UpdateChatPrefix(ICod4xHost& host, std::string_view configJson, bool isRuntimeConfig)
 {
-    const auto document = RulesJsonReader::Parse(configJson);
+    const auto document = RulesJsonReader::Parse(configJson, kMaxChatPrefixConfigBytes);
     const auto serverId = document ? document->String("gameServerId") : std::nullopt;
     if (!document || !serverId || Trim(*serverId) != serverContext.GameServerId ||
         (isRuntimeConfig && (!document->String("ingestBaseUrl") || !document->String("ingestSubscriptionKey"))))
@@ -675,14 +709,18 @@ void PluginRuntime::RefreshChatPrefix(ICod4xHost& host, std::int64_t nowUnixSeco
 {
     nextChatPrefixRefreshUnixSeconds = nowUnixSeconds + kChatPrefixRefreshIntervalSeconds;
     std::string configJson;
-    if (!TryReadFile(agentNameConfigPath, configJson))
+    switch (ReadChatPrefixFile(agentNameConfigPath, configJson))
     {
-        std::error_code error;
-        if (std::filesystem::exists(agentNameConfigPath, error) || error)
-        {
-            LogChatPrefixConfigIssue(host, "Plugin chat prefix config could not be read; keeping current prefix");
-        }
+    case ChatPrefixFileReadResult::Missing:
         return;
+    case ChatPrefixFileReadResult::Failed:
+        LogChatPrefixConfigIssue(host, "Plugin chat prefix config could not be read; keeping current prefix");
+        return;
+    case ChatPrefixFileReadResult::TooLarge:
+        LogChatPrefixConfigIssue(host, "Plugin chat prefix config exceeds 200 KiB; keeping current prefix");
+        return;
+    case ChatPrefixFileReadResult::Success:
+        break;
     }
 
     UpdateChatPrefix(host, configJson, false);

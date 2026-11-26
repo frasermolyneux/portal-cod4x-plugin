@@ -361,6 +361,20 @@ void Runtime_AgentNameRejectsUnsafeOrIncompleteRefreshes()
     portal_cod4x::PluginRuntime runtime(config.string());
     runtime.Initialize(host, "0.3.123");
 
+    auto atLimit = good;
+    atLimit.Fields["agentName"].Scalar = "^2[At Limit]^7";
+    std::string atLimitJson = atLimit.Dump();
+    atLimitJson.append(200 * 1024 - atLimitJson.size(), ' ');
+    { std::ofstream output(nameFile, std::ios::binary); output << atLimitJson; }
+    host.CurrentTime += 60;
+    runtime.Tick(host);
+    runtime.SendPrivateChat(host, 2, "boundary");
+    Assert(host.PrivateMessages.back().Message == "^5(PM)^7 ^2[At Limit]^7 boundary",
+        "A valid sidecar at the 200 KiB limit must still be read and applied");
+    { std::ofstream output(nameFile, std::ios::binary); output << goodJson; }
+    host.CurrentTime += 60;
+    runtime.Tick(host);
+
     std::vector<std::string> invalidJson{"{", goodJson.substr(0, goodJson.size() - 1)};
     for (const auto& name : std::vector<std::string>{
         std::string(140, 'x'), "bad\"prefix", "bad\nprefix", std::string("bad\xed\xa0\x80")})
@@ -379,6 +393,7 @@ void Runtime_AgentNameRejectsUnsafeOrIncompleteRefreshes()
     document.Fields.erase("agentName");
     invalidJson.push_back(document.Dump());
     invalidJson.push_back(goodJson.substr(0, goodJson.size() - 1) + ",\"agentName\":\"duplicate\"}");
+    invalidJson.push_back(std::string(200 * 1024 + 1, ' '));
     for (const auto& json : invalidJson)
     {
         { std::ofstream output(nameFile, std::ios::binary); output << json; }

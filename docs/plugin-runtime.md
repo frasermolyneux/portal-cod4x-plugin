@@ -39,7 +39,8 @@ The plugin reads a valid name file before the startup broadcast, overriding the 
 config's optional prefix, and checks it every 60 seconds thereafter. It does not reread or
 rewrite the credential-bearing runtime config, server identity or in-flight requests.
 
-Name updates require complete JSON, a matching `gameServerId` and a present `agentName`.
+Name updates require complete JSON no larger than 200 KiB, a matching `gameServerId` and
+a present `agentName`. Sidecar reads are bounded before parsing on the game thread.
 A missing file is normal for older agents and retains the current prefix; malformed,
 unsafe, unreadable or wrong-server replacements retain the last good prefix and emit a
 deduplicated diagnostic. Explicit null/blank values restore the legacy default.
