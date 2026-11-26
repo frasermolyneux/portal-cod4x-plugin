@@ -23,6 +23,43 @@ The plugin authenticates to APIM with the short `ingestSubscriptionKey` (sent as
 
 An example file is provided at `portal-cod4x-plugin.config.example.json`.
 
+### Optional bot prefix
+
+The existing agent installer/config writer supplies `agentName` after resolving the
+effective server-over-global Agent Name. It is a complete rendered prefix, for example
+`^4[^1>XI< BOT^4]^7`, not a plain display name. The plugin uses it verbatim and puts
+`^5(PM)^7 ` before it for private replies. The header appears only on the first fragment.
+
+Older agents/configs can omit the field; the plugin retains `^4[^1XI-BOT^4]^7`.
+Null or blank values also select that default. Configured prefixes must be native-safe
+UTF-8 text without quotes/control bytes and no more than 139 UTF-8 bytes.
+
+Upload the config before plugin load for a matching startup broadcast. For live renames,
+do not overwrite the credential-bearing config: upload the optional sibling
+`portal-cod4x-plugin.agent-name.json` with this non-sensitive content instead:
+
+```json
+{
+    "gameServerId": "11111111-2222-3333-4444-555555555555",
+    "agentName": "^4[^1>XI< BOT^4]^7"
+}
+```
+
+The plugin reads a valid name file at startup and checks it every 60 seconds without
+reloading credentials/server identity. Missing files retain the current name for older
+agents; invalid/incomplete refreshes retain the last good name and log a diagnostic.
+Explicit null/blank `agentName` resets the legacy default. Retry failed uploads; a bad
+name file cannot corrupt auth, and an invalid name file at restart falls back to the
+main config's optional value.
+
+Before every agent-managed load/restart/rollback, republish the current effective name
+file, regardless of the name cache. Do not load an abandoned old sidecar after a failed
+publication; retry through the existing lifecycle.
+
+The additive main field and name file can be deployed by the agent before the plugin
+release: older plugins ignore both. Verify the actual loaded plugin version, startup
+prefix and a private command reply after the normal installer rollout.
+
 ## Source of truth from Azure
 
 Values are sourced from `portal-environments` Terraform outputs and shared Key Vault secrets:

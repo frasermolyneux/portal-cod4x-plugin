@@ -267,11 +267,11 @@ int main()
     AssertTrue(registeredLogLevelCommand->Handler != nullptr, "portalpluginloglevel command handler should be registered.");
 
     const std::size_t commandsBeforeHealth = g_commands.size();
+    const std::size_t chatsBeforeHealth = g_chats.size();
     g_command_invoker_slot = 0;
     registeredHealthCommand->Handler();
 
     bool foundConsay = false;
-    bool foundTell = false;
     for (std::size_t i = commandsBeforeHealth; i < g_commands.size(); ++i)
     {
         if (g_commands[i].rfind("consay ", 0) == 0)
@@ -279,14 +279,12 @@ int main()
             foundConsay = true;
         }
 
-        if (g_commands[i].find("tell 0 ") != std::string::npos)
-        {
-            foundTell = true;
-        }
     }
 
     AssertTrue(foundConsay, "portalpluginhealth should emit console output through consay when invoked by a player.");
-    AssertTrue(foundTell, "portalpluginhealth should notify the invoker via tell to review console output.");
+    AssertTrue(g_chats.size() == chatsBeforeHealth + 1 && g_chats.back().slot == 0 &&
+        g_chats.back().message.starts_with("\x15^5(PM)^7 ^4[^1XI-BOT^4]^7 "),
+        "portalpluginhealth should notify the invoker through prefixed native private chat.");
 
     const std::size_t commandCountAfterPlayerInvoke = g_commands.size();
     const std::size_t logCountBeforeRconInvoke = g_logs.size();
@@ -423,6 +421,24 @@ int main()
     }
 
     AssertTrue(foundNumericSetLog, "portalpluginloglevel numeric input should map to known levels.");
+
+    for (const auto& arguments : std::vector<std::vector<std::string>>{
+        {"portalpluginloglevel"}, {"portalpluginloglevel", "debug"},
+        {"portalpluginloglevel", "info", "extra"}, {"portalpluginloglevel", "banana"}})
+    {
+        g_command_invoker_slot = 0;
+        g_command_arguments = arguments;
+        const auto before = g_chats.size();
+        registeredLogLevelCommand->Handler();
+        AssertTrue(g_chats.size() > before, "Every player log-level response must produce chat.");
+        for (auto i = before; i < g_chats.size(); ++i)
+        {
+            AssertTrue(g_chats[i].slot == 0 &&
+                g_chats[i].message.starts_with("\x15^5(PM)^7 ^4[^1XI-BOT^4]^7 ") &&
+                g_chats[i].message.size() <= 150,
+                "Every log-level response must carry the private header and literal framing within the byte limit.");
+        }
+    }
 
     const std::size_t logCountAfterInit = g_logs.size();
     const std::size_t chatCountBeforeNoopCallbacks = g_chats.size();

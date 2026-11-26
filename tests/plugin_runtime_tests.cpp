@@ -219,7 +219,8 @@ void Assert(bool condition, const char* message)
     }
 }
 
-std::filesystem::path WriteRuntimeConfig(std::string_view testName)
+std::filesystem::path WriteRuntimeConfig(std::string_view testName,
+    std::optional<std::string_view> agentName = std::nullopt)
 {
     const std::filesystem::path configPath = std::filesystem::temp_directory_path() /
         ("portal-cod4x-plugin.runtime." + std::string(testName) + ".json");
@@ -230,8 +231,12 @@ std::filesystem::path WriteRuntimeConfig(std::string_view testName)
         << "\"ingestSubscriptionKey\":\"sub-key-test\","
         << "\"gameServerId\":\"11111111-2222-3333-4444-555555555555\","
         << "\"gameType\":\"CallOfDuty4x\","
-        << "\"refreshIntervalSeconds\":120"
-        << "}";
+        << "\"refreshIntervalSeconds\":120";
+    if (agentName)
+    {
+        configFile << ",\"agentName\":" << portal_cod4x::RulesJson::Quote(*agentName);
+    }
+    configFile << "}";
     return configPath;
 }
 
@@ -265,6 +270,231 @@ void BuildMessage_FallsBackWhenPrefixOrVersionMissing()
     Assert(message.find("XI-BOT") != std::string::npos, "Expected default XI-BOT prefix when prefix is empty");
     Assert(message.find("Portal Plugin is online") != std::string::npos, "Expected startup wording in fallback message");
     Assert(message.find("0.0.0-unknown") != std::string::npos, "Expected fallback version when version is empty");
+}
+
+void Runtime_AgentNameControlsStartupAndRefreshesPresentationOnly()
+{
+    const auto config = WriteRuntimeConfig("agent-name", "  ^1[Server Override]^7  ");
+    auto nameFile = config;
+    nameFile.replace_extension(".agent-name.json");
+    RemoveTestConfig(nameFile);
+    FakeHost host;
+    ConfigureTestPlayer(host);
+    portal_cod4x::PluginRuntime runtime(config.string());
+    runtime.Initialize(host, "0.3.123");
+    Assert(host.BroadcastMessages.front() ==
+        "^1[Server Override]^7 Portal Plugin is online (version 0.3.123)",
+        "Startup must use the trimmed, already-rendered agentName without wrapping it again");
+    runtime.SendPrivateChat(host, 2, "first");
+    Assert(host.PrivateMessages.back().Message == "^5(PM)^7 ^1[Server Override]^7 first",
+        "Private messages must place the coloured PM marker before the configured prefix");
+
+    std::ifstream input(config);
+    const std::string originalJson{std::istreambuf_iterator<char>(input), std::istreambuf_iterator<char>()};
+    input.close();
+    auto document = *portal_cod4x::RulesJsonReader::Parse(originalJson);
+    document.Fields["agentName"].Scalar = "^4[Renamed]^7";
+    document.Fields["ingestBaseUrl"].Scalar = "https://replacement.test/ingest";
+    document.Fields["ingestSubscriptionKey"].Scalar = "replacement-key";
+    { std::ofstream output(config); output << document.Dump(); }
+    auto nameDocument = *portal_cod4x::RulesJsonReader::Parse(
+        "{\"gameServerId\":\"11111111-2222-3333-4444-555555555555\",\"agentName\":\"^4[Renamed]^7\"}");
+    { std::ofstream output(nameFile); output << nameDocument.Dump(); }
+
+    host.CurrentTime = 5059;
+    runtime.Tick(host);
+    runtime.SendPrivateChat(host, 2, "before refresh");
+    Assert(host.PrivateMessages.back().Message.starts_with("^5(PM)^7 ^1[Server Override]^7 "),
+        "Config must not be read on every frame");
+    host.CurrentTime = 5060;
+    runtime.Tick(host);
+    runtime.SendPrivateChat(host, 2, "after refresh");
+    Assert(host.PrivateMessages.back().Message == "^5(PM)^7 ^4[Renamed]^7 after refresh",
+        "A running plugin must adopt a valid name update at the refresh boundary");
+
+    runtime.HandlePlayerConnect(host, 2, "198.51.100.10");
+    runtime.HandlePlayerConnected(host, 2);
+    for (int i = 0; i < 12; ++i)
+        runtime.Tick(host);
+    Assert(!host.Requests.empty() &&
+        std::all_of(host.Requests.begin(), host.Requests.end(), [](const auto& request) {
+            return request.Url.starts_with("https://example.test/ingest") &&
+                request.Headers.find("sub-key-test") != std::string::npos;
+        }), "Name refresh must not replace loaded request endpoints or credentials");
+
+    for (const auto value : {"null", "\"  \""})
+    {
+        nameDocument.Fields["agentName"] = *portal_cod4x::RulesJsonReader::Parse(value);
+        { std::ofstream output(nameFile); output << nameDocument.Dump(); }
+        host.CurrentTime += 60;
+        runtime.Tick(host);
+        runtime.SendPrivateChat(host, 2, "fallback");
+        Assert(host.PrivateMessages.back().Message ==
+            "^5(PM)^7 " + std::string(portal_cod4x::kDefaultBotPrefix) + " fallback",
+            "Explicit null and blank agentName must restore legacy default behavior");
+    }
+    Assert(host.BroadcastMessages.size() == 1, "Name refresh must not repeat the startup announcement");
+    runtime.Shutdown(host);
+    nameDocument.Fields["agentName"] = *portal_cod4x::RulesJsonReader::Parse("\"^2[Persisted]^7\"");
+    { std::ofstream output(nameFile); output << nameDocument.Dump(); }
+    portal_cod4x::PluginRuntime restarted(config.string());
+    restarted.Initialize(host, "0.3.123");
+    Assert(host.BroadcastMessages.back().starts_with("^2[Persisted]^7 "),
+        "A valid persisted name file must override the main config at the next startup");
+    restarted.Shutdown(host);
+    RemoveTestConfig(nameFile);
+    RemoveTestConfig(config);
+}
+
+void Runtime_AgentNameRejectsUnsafeOrIncompleteRefreshes()
+{
+    const auto config = WriteRuntimeConfig("agent-name-invalid", "^1[Good]^7");
+    auto nameFile = config;
+    nameFile.replace_extension(".agent-name.json");
+    RemoveTestConfig(nameFile);
+    std::ifstream input(config);
+    const std::string goodJson{std::istreambuf_iterator<char>(input), std::istreambuf_iterator<char>()};
+    input.close();
+    const auto good = *portal_cod4x::RulesJsonReader::Parse(goodJson);
+    FakeHost host;
+    host.CurrentTime = 5000;
+    portal_cod4x::PluginRuntime runtime(config.string());
+    runtime.Initialize(host, "0.3.123");
+
+    auto atLimit = good;
+    atLimit.Fields["agentName"].Scalar = "^2[At Limit]^7";
+    std::string atLimitJson = atLimit.Dump();
+    atLimitJson.append(200 * 1024 - atLimitJson.size(), ' ');
+    { std::ofstream output(nameFile, std::ios::binary); output << atLimitJson; }
+    host.CurrentTime += 60;
+    runtime.Tick(host);
+    runtime.SendPrivateChat(host, 2, "boundary");
+    Assert(host.PrivateMessages.back().Message == "^5(PM)^7 ^2[At Limit]^7 boundary",
+        "A valid sidecar at the 200 KiB limit must still be read and applied");
+    { std::ofstream output(nameFile, std::ios::binary); output << goodJson; }
+    host.CurrentTime += 60;
+    runtime.Tick(host);
+
+    std::vector<std::string> invalidJson{"{", goodJson.substr(0, goodJson.size() - 1)};
+    for (const auto& name : std::vector<std::string>{
+        std::string(140, 'x'), "bad\"prefix", "bad\nprefix", std::string("bad\xed\xa0\x80")})
+    {
+        auto document = good;
+        document.Fields["agentName"].Scalar = name;
+        invalidJson.push_back(document.Dump());
+    }
+    auto document = good;
+    document.Fields["agentName"] = *portal_cod4x::RulesJsonReader::Parse("false");
+    invalidJson.push_back(document.Dump());
+    document = good;
+    document.Fields["gameServerId"].Scalar = "another-server";
+    invalidJson.push_back(document.Dump());
+    document = good;
+    document.Fields.erase("agentName");
+    invalidJson.push_back(document.Dump());
+    invalidJson.push_back(goodJson.substr(0, goodJson.size() - 1) + ",\"agentName\":\"duplicate\"}");
+    invalidJson.push_back(std::string(200 * 1024 + 1, ' '));
+    for (const auto& json : invalidJson)
+    {
+        { std::ofstream output(nameFile, std::ios::binary); output << json; }
+        host.CurrentTime += 60;
+        runtime.Tick(host);
+        runtime.SendPrivateChat(host, 2, "retained");
+        Assert(host.PrivateMessages.back().Message == "^5(PM)^7 ^1[Good]^7 retained",
+            "Malformed, unsafe or wrong-server refreshes must retain the last good prefix");
+    }
+    const auto prefixErrorCount = [&]() {
+        return std::count_if(host.Logs.begin(), host.Logs.end(), [](const auto& line) {
+            return line.starts_with("Plugin chat prefix config");
+        });
+    };
+    const auto logsBeforeRepeat = prefixErrorCount();
+    host.CurrentTime += 60;
+    runtime.Tick(host);
+    Assert(prefixErrorCount() == logsBeforeRepeat, "Repeated name refresh errors must not flood logs");
+    Assert(runtime.GetServerContext().GameServerId == "11111111-2222-3333-4444-555555555555",
+        "Name refresh must not change loaded server identity");
+    RemoveTestConfig(nameFile);
+    host.CurrentTime += 60;
+    runtime.Tick(host);
+    runtime.SendPrivateChat(host, 2, "missing file");
+    Assert(host.PrivateMessages.back().Message == "^5(PM)^7 ^1[Good]^7 missing file",
+        "A missing replacement file must not clear a working prefix");
+    runtime.Shutdown(host);
+
+    WriteRuntimeConfig("agent-name-invalid", std::string(140, 'x'));
+    portal_cod4x::PluginRuntime invalidStartup(config.string());
+    invalidStartup.Initialize(host, "0.3.123");
+    Assert(host.BroadcastMessages.back().starts_with(std::string(portal_cod4x::kDefaultBotPrefix) + " "),
+        "An unsafe initial name must not prevent the legacy startup announcement");
+    invalidStartup.Shutdown(host);
+    RemoveTestConfig(config);
+}
+
+void Runtime_LocalHeadersAppearOnlyInFirstFragment()
+{
+    const std::string prefix = std::string(135, 'N') + "\xc3\xa9^7";
+    const auto config = WriteRuntimeConfig("agent-name-fragments", prefix);
+    FakeHost host;
+    portal_cod4x::PluginRuntime runtime(config.string());
+    runtime.Initialize(host, "0.3.123");
+    std::string message;
+    for (int i = 0; i < 80; ++i)
+        message += "\xf0\x9f\x98\x80";
+    runtime.SendPrivateChat(host, 2, message);
+    const auto privateFragments = portal_cod4x::PrepareChatMessages({host.PrivateMessages.back().Message});
+    const auto publicFragments = portal_cod4x::PrepareChatMessages({host.BroadcastMessages.front()});
+    Assert(privateFragments && privateFragments->size() > 1 &&
+        privateFragments->front() == "^5(PM)^7 " + prefix + " " &&
+        privateFragments->front().size() == portal_cod4x::kChatPayloadBytes,
+        "The maximum allowed prefix and PM marker must fit intact in the first fragment");
+    Assert(publicFragments && publicFragments->size() > 1 && publicFragments->front().starts_with(prefix + " "),
+        "Public startup must include the configured header only before splitting");
+    for (const auto* fragments : {&*privateFragments, &*publicFragments})
+    {
+        for (std::size_t i = 0; i < fragments->size(); ++i)
+        {
+            Assert((*fragments)[i].size() <= portal_cod4x::kChatPayloadBytes &&
+                portal_cod4x::IsValidChatText((*fragments)[i]), "Fragments must respect UTF-8 and native byte limits");
+            if (i > 0)
+                Assert((*fragments)[i].find(prefix) == std::string::npos &&
+                    (*fragments)[i].find("(PM)") == std::string::npos,
+                    "Continuation fragments must not repeat bot or private-message headers");
+        }
+    }
+    runtime.Shutdown(host);
+    RemoveTestConfig(config);
+}
+
+void Runtime_AgentNameStartupRejectsStaleOrInvalidSidecars()
+{
+    const auto config = WriteRuntimeConfig("agent-name-startup", "^1[Current Install]^7");
+    auto nameFile = config;
+    nameFile.replace_extension(".agent-name.json");
+    for (const auto json : {
+        "{\"gameServerId\":\"previous-server\",\"agentName\":\"^2[Stale]^7\"}",
+        "{\"gameServerId\":\"11111111-2222-3333-4444-555555555555\",\"agentName\":"})
+    {
+        { std::ofstream output(nameFile); output << json; }
+        FakeHost host;
+        portal_cod4x::PluginRuntime runtime(config.string());
+        runtime.Initialize(host, "0.3.123");
+        Assert(host.BroadcastMessages.front().starts_with("^1[Current Install]^7 "),
+            "A stale-server or incomplete sidecar must not override the installed config at startup");
+        Assert(std::any_of(host.Logs.begin(), host.Logs.end(), [](const auto& line) {
+            return line.starts_with("Plugin chat prefix config");
+        }), "Invalid startup sidecars must emit an explicit diagnostic");
+        runtime.Shutdown(host);
+    }
+    RemoveTestConfig(nameFile);
+    WriteRuntimeConfig("agent-name-startup");
+    FakeHost olderAgent;
+    portal_cod4x::PluginRuntime compatible(config.string());
+    compatible.Initialize(olderAgent, "0.3.123");
+    Assert(olderAgent.BroadcastMessages.front().starts_with(std::string(portal_cod4x::kDefaultBotPrefix) + " "),
+        "Older agents with neither optional field nor name file must retain the original startup prefix");
+    compatible.Shutdown(olderAgent);
+    RemoveTestConfig(config);
 }
 
 void Runtime_LoadsConfigAndStoresServerContext()
@@ -1644,19 +1874,13 @@ void Runtime_HandleClientCommand_DedupesCrossCallbackPath()
     host.CurrentTime = 100;
     runtime.HandleClientCommand(host, 3, "!portalpluginhealth");
 
-    const std::size_t tellMessageCount = std::count_if(
-        host.ExecutedCommands.begin(),
-        host.ExecutedCommands.end(),
-        [](const std::string& command) { return command.find("tell 3 ") != std::string::npos; });
+    const std::size_t tellMessageCount = host.PrivateMessages.size();
     Assert(tellMessageCount == 1, "Cross-callback duplicate command response should be suppressed");
 
     host.CurrentTime = 101;
     runtime.HandleClientCommand(host, 3, "!portalpluginhealth");
 
-    const std::size_t tellMessageCountAfterSecondInvoke = std::count_if(
-        host.ExecutedCommands.begin(),
-        host.ExecutedCommands.end(),
-        [](const std::string& command) { return command.find("tell 3 ") != std::string::npos; });
+    const std::size_t tellMessageCountAfterSecondInvoke = host.PrivateMessages.size();
     Assert(tellMessageCountAfterSecondInvoke == 2, "Later command should be handled outside cross-callback dedupe window");
 }
 
@@ -1673,7 +1897,6 @@ void Runtime_HandleClientCommand_PortalPluginHealth_UsesConsoleAndTellFlow()
     runtime.HandleClientCommand(host, 7, "!portalpluginhealth");
 
     bool hasConsay = false;
-    bool hasTell = false;
     for (const auto& command : host.ExecutedCommands)
     {
         if (command.rfind("consay ", 0) == 0)
@@ -1681,14 +1904,12 @@ void Runtime_HandleClientCommand_PortalPluginHealth_UsesConsoleAndTellFlow()
             hasConsay = true;
         }
 
-        if (command.find("tell 7 ") != std::string::npos)
-        {
-            hasTell = true;
-        }
     }
 
     Assert(hasConsay, "Expected !portalpluginhealth to emit consay console output for player invocations");
-    Assert(hasTell, "Expected !portalpluginhealth to send tell guidance to the requesting player");
+    Assert(host.PrivateMessages.size() == 1 && host.PrivateMessages.front().Slot == 7 &&
+        host.PrivateMessages.front().Message.starts_with("^5(PM)^7 " + std::string(portal_cod4x::kDefaultBotPrefix) + " "),
+        "Expected health guidance to use prefixed private native chat");
 
     bool hasHealthLogLine = false;
     for (const auto& line : host.Logs)
@@ -1718,7 +1939,8 @@ void Runtime_HandleClientCommand_PortalPluginHealth_RespectsCommandAuthorization
     bool hasDenyMessage = false;
     for (const auto& message : host.PrivateMessages)
     {
-        if (message.Slot == 8 && message.Message.find("not authorized") != std::string::npos)
+        if (message.Slot == 8 && message.Message.starts_with("^5(PM)^7 " +
+            std::string(portal_cod4x::kDefaultBotPrefix) + " ") && message.Message.find("not authorized") != std::string::npos)
         {
             hasDenyMessage = true;
             break;
@@ -1757,7 +1979,8 @@ void Runtime_HandleClientCommand_PortalPluginHealth_RespectsPortalEnabledFlag()
     bool hasDisabledMessage = false;
     for (const auto& message : host.PrivateMessages)
     {
-        if (message.Slot == 8 && message.Message.find("currently disabled") != std::string::npos)
+        if (message.Slot == 8 && message.Message.starts_with("^5(PM)^7 " +
+            std::string(portal_cod4x::kDefaultBotPrefix) + " ") && message.Message.find("currently disabled") != std::string::npos)
         {
             hasDisabledMessage = true;
             break;
@@ -2807,7 +3030,7 @@ void TickFrames(portal_cod4x::PluginRuntime& runtime, FakeHost& host, int frames
 
 void Runtime_RulesTriggerCapabilitiesAndNativeEffects()
 {
-    const auto config = WriteRuntimeConfig("rules-native");
+    const auto config = WriteRuntimeConfig("rules-native", "^4[Local Only]^7");
     FakeHost host;
     ConfigureTestPlayer(host);
     host.ResponseFactory = [](const auto& request) -> portal_cod4x::HttpResponse {
@@ -2829,8 +3052,9 @@ void Runtime_RulesTriggerCapabilitiesAndNativeEffects()
     Assert(host.DroppedPlayers.size() == 1 && host.DroppedPlayers[0].Slot == 2 &&
         host.DroppedPlayers[0].Reason == "Rules kick", "Typed drop must use direct native API");
     Assert(host.BroadcastMessages.back() == "Rules message" &&
-        host.PrivateMessages.size() == 1 && host.PrivateMessages[0].Slot == 2,
-        "Public and private messages must use typed native chat APIs");
+        host.PrivateMessages.size() == 1 && host.PrivateMessages[0].Slot == 2 &&
+        host.PrivateMessages[0].Message == "Rules message",
+        "Native rule messages must remain unchanged even when a local agentName is configured");
     Assert(host.ExecutedCommands.empty(), "Rules effects must never enqueue server command text");
     const auto evaluate = std::find_if(host.Requests.begin(), host.Requests.end(), [](const auto& request) {
         return request.Url.ends_with("/rules/evaluate");
@@ -3821,6 +4045,10 @@ int main()
 {
     BuildMessage_UsesPrefixAndVersion();
     BuildMessage_FallsBackWhenPrefixOrVersionMissing();
+    Runtime_AgentNameControlsStartupAndRefreshesPresentationOnly();
+    Runtime_AgentNameRejectsUnsafeOrIncompleteRefreshes();
+    Runtime_LocalHeadersAppearOnlyInFirstFragment();
+    Runtime_AgentNameStartupRejectsStaleOrInvalidSidecars();
     Runtime_LoadsConfigAndStoresServerContext();
     Runtime_EmitsAndFlushesPlayerConnectedEvent();
     Runtime_EmitsPlayerConnectedOncePerConnection();

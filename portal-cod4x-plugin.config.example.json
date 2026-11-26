@@ -3,5 +3,6 @@
     "ingestSubscriptionKey": "replace-with-key-vault-secret-value",
     "gameServerId": "11111111-2222-3333-4444-555555555555",
     "gameType": "CallOfDuty4x",
-    "refreshIntervalSeconds": 120
+    "refreshIntervalSeconds": 120,
+    "agentName": "^4[^1>XI< BOT^4]^7"
 }

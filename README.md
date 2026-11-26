@@ -14,7 +14,7 @@
 * [Plugin Runtime](/docs/plugin-runtime.md) - CoD4x ABI exports, startup message format, and version metadata flow
 
 ## Overview
-portal-cod4x-plugin is an initial C++ CoD4x plugin skeleton for the XtremeIdiots portal estate. On plugin load, it pushes a color-coded [XI-BOT] online broadcast into server chat and includes the plugin version in that message. The repository includes a small unit test suite around runtime messaging behavior and CoD4x ABI export wiring (`OnInfoRequest`, `OnInit`, `OnTerminate`). Version metadata is sourced from `version.json` and injected into the runtime broadcast via CMake compile definitions.
+portal-cod4x-plugin is an initial C++ CoD4x plugin skeleton for the XtremeIdiots portal estate. On plugin load, it pushes an online broadcast with the effective Agent Name prefix and plugin version into server chat; older configs retain the color-coded [XI-BOT] default. Plugin-owned private replies add a color-coded (PM) before the bot prefix, with headers only on the first fragment. The repository includes a small unit test suite around runtime messaging behavior and CoD4x ABI export wiring (`OnInfoRequest`, `OnInit`, `OnTerminate`). Version metadata is sourced from `version.json` and injected into the runtime broadcast via CMake compile definitions.
 
 ## Contributing
 Please read the [contributing](CONTRIBUTING.md) guidance; this is a learning and development project.
