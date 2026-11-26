@@ -546,7 +546,7 @@ PCL void COD4X_CALL OnClientAuthorized()
 
 PCL void COD4X_CALL OnPlayerGotAuthInfo(
     netadr_t*,
-    std::uint64_t* playerId,
+    std::uint64_t*,
     std::uint64_t*,
     char* rejectMessage,
     qboolean*,
@@ -557,12 +557,13 @@ PCL void COD4X_CALL OnPlayerGotAuthInfo(
         return;
     }
 
-    // The hook's Steam ID pointer is steamidPending, not a verified identity.
+    // Either hook ID can contain steamidPending when the engine player ID is zero.
     const int slot = ClientPointerToSlot(client);
-    const auto steamId = slot >= 0 && slot < Plugin_GetSlotCount()
-        ? Plugin_GetPlayerSteamID(static_cast<unsigned int>(slot)) : 0;
+    const bool validSlot = slot >= 0 && slot < Plugin_GetSlotCount();
+    const auto playerId = validSlot ? Plugin_GetPlayerID(static_cast<unsigned int>(slot)) : 0;
+    const auto steamId = validSlot ? Plugin_GetPlayerSteamID(static_cast<unsigned int>(slot)) : 0;
     std::string banMessage;
-    if (!portal_cod4x::TryGetAuthenticatedPlayerBanMessage(playerId ? *playerId : 0, banMessage, steamId))
+    if (!portal_cod4x::TryGetAuthenticatedPlayerBanMessage(playerId, banMessage, steamId))
     {
         return;
     }

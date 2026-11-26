@@ -102,7 +102,11 @@ retain their player-ID format.
 The reference [CoD4x auth hook](https://github.com/callofduty4x/CoD4x_Server/blob/0223d6f330521abfd88690c46117fa9b7185b439/src/sv_client.c)
 passes `steamidPending`, explicitly unverified in the callback declarations. The plugin
 ignores that pointer for Steam matching and reads the client's verified `steamid` through
-`Plugin_GetPlayerSteamID` instead. `OnPlayerGetBanStatus` uses `baninfo_t.steamid`, which
+`Plugin_GetPlayerSteamID` instead. When the engine player ID is zero, the callback's
+player-ID argument is also substituted with `steamidPending`; auth GUID matching therefore
+reads `Plugin_GetPlayerID` from the same valid slot rather than trusting either callback
+ID pointer. A missing/invalid client slot supplies no trusted identity for auth enforcement.
+`OnPlayerGetBanStatus` uses `baninfo_t.steamid`, which
 the engine populates from the verified identity. Enter-world, authorization and successful
 refresh enforcement read live slot identities, not a previous occupant's cached Steam ID.
 If Steam verification has not completed, existing player-ID behavior is preserved;
@@ -122,6 +126,9 @@ null/omitted expiry stays permanent. Overlapping records for one GUID merge with
 taking precedence, otherwise the latest expiry, including across response pages.
 Each Steam association retains its own expiry, so another record for the same profile
 with a different Steam ID cannot extend an expired association.
+Steam lookups use a reverse index of Steam ID to owning player GUIDs and individual
+expiries, not a full-cache scan under the mutex. Both indexes are published together after
+the final valid page; a player-ID unban removes only that owner's reverse associations.
 An elapsed record cannot trigger a proactive drop. Malformed temporary expiry or a malformed
 page rejects the refresh with a diagnostic and preserves the previous valid cache, rather than
 turning the entry into a permanent ban or clearing valid bans.

@@ -1598,6 +1598,19 @@ void PluginRuntime::HandlePlayerBanRemoved(std::uint64_t playerId)
 
     {
         std::lock_guard<std::mutex> guard(activeBanCacheMutex);
+        const auto portalBan = activeBanMessagesByPlayerGuid.find(playerGuid);
+        if (portalBan != activeBanMessagesByPlayerGuid.end())
+        {
+            for (const auto& association : portalBan->second.SteamIdExpiries)
+            {
+                auto steamBan = activeBanExpiriesBySteamId.find(association.first);
+                if (steamBan != activeBanExpiriesBySteamId.end())
+                {
+                    steamBan->second.erase(playerGuid);
+                    if (steamBan->second.empty()) activeBanExpiriesBySteamId.erase(steamBan);
+                }
+            }
+        }
         activeBanMessagesByPlayerGuid.erase(playerGuid);
         serverOriginatedBansByPlayerGuid.erase(playerGuid);
     }
@@ -1641,14 +1654,17 @@ bool PluginRuntime::TryFindPlayerBanMessage(std::uint64_t playerId, std::string&
 
     if (steamId != 0)
     {
-        for (const auto& entry : activeBanMessagesByPlayerGuid)
+        const auto steamBan = activeBanExpiriesBySteamId.find(steamId);
+        if (steamBan != activeBanExpiriesBySteamId.end())
         {
-            const auto& ban = entry.second;
-            const auto match = ban.SteamIdExpiries.find(steamId);
-            if (match != ban.SteamIdExpiries.end() && (!match->second || *match->second > nowTicks))
+            for (const auto& [ownerGuid, expiry] : steamBan->second)
             {
-                message = ban.Message.empty() ? std::string(kDefaultBanMessage) : ban.Message;
-                return true;
+                if (!expiry || *expiry > nowTicks)
+                {
+                    const auto& ban = activeBanMessagesByPlayerGuid.at(ownerGuid);
+                    message = ban.Message.empty() ? std::string(kDefaultBanMessage) : ban.Message;
+                    return true;
+                }
             }
         }
     }
@@ -2172,6 +2188,15 @@ void PluginRuntime::AdvanceBanSync(ICod4xHost& host, std::int64_t nowUnixSeconds
                 return;
             }
 
+            // Build off-lock, then publish both indexes together after the final valid page.
+            decltype(activeBanExpiriesBySteamId) refreshedSteamBans;
+            for (const auto& [playerGuid, ban] : pendingActiveBanMessagesByPlayerGuid)
+            {
+                for (const auto& [steamId, expiry] : ban.SteamIdExpiries)
+                {
+                    refreshedSteamBans[steamId].emplace(playerGuid, expiry);
+                }
+            }
             std::vector<std::string> liftedBanGuids;
             {
                 std::lock_guard<std::mutex> guard(activeBanCacheMutex);
@@ -2186,6 +2211,7 @@ void PluginRuntime::AdvanceBanSync(ICod4xHost& host, std::int64_t nowUnixSeconds
                 }
 
                 activeBanMessagesByPlayerGuid = std::move(pendingActiveBanMessagesByPlayerGuid);
+                activeBanExpiriesBySteamId = std::move(refreshedSteamBans);
 
                 // Drop any server-originated pending ban the portal now reports as active — it has
                 // been imported by the agent's reconcile, so it no longer needs surfacing via
